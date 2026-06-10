@@ -12,6 +12,19 @@ from fusion_memory.eval.beam_adapter import BeamAdapter
 
 
 class BeamAdapterTests(unittest.TestCase):
+    def test_beam_adapter_loads_official_chat_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset = _write_official_beam_fixture(Path(tmp))
+            adapter = BeamAdapter(MemoryService(), Scope(workspace_id="w", user_id="u", agent_id="a"), split="small")
+
+            ingest = adapter.ingest_dataset(dataset, split="small")
+            queries = adapter.build_queries(dataset, split="small")
+
+            self.assertEqual(ingest["documents"], 2)
+            self.assertEqual(len(queries), 2)
+            self.assertEqual(queries[0].category, "information_extraction")
+            self.assertIn("Qdrant", queries[0].gold_answers[0])
+
     def test_beam_adapter_runs_split_and_records_answer_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             dataset = _write_beam_fixture(Path(tmp), split="small")
@@ -87,6 +100,57 @@ def _write_beam_fixture(base: Path, split: str) -> Path:
             }
         )
         + "\n",
+        encoding="utf-8",
+    )
+    return base
+
+
+def _write_official_beam_fixture(base: Path) -> Path:
+    chat_dir = base / "chats" / "100K" / "1"
+    questions_dir = chat_dir / "probing_questions"
+    questions_dir.mkdir(parents=True)
+    (chat_dir / "chat.json").write_text(
+        json.dumps(
+            [
+                {
+                    "batch_number": 1,
+                    "turns": [
+                        [
+                            {
+                                "role": "user",
+                                "id": 1,
+                                "time_anchor": "March-15-2024",
+                                "content": "I prefer Qdrant for Atlas retrieval.",
+                            },
+                            {
+                                "role": "assistant",
+                                "id": 2,
+                                "content": "Noted that Atlas retrieval should use Qdrant.",
+                            },
+                        ]
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (questions_dir / "probing_questions.json").write_text(
+        json.dumps(
+            {
+                "information_extraction": [
+                    {
+                        "question": "What does Atlas retrieval use?",
+                        "answer": "Qdrant",
+                    }
+                ],
+                "abstention": [
+                    {
+                        "question": "What database was never mentioned?",
+                        "ideal_response": "The chat does not mention that database.",
+                    }
+                ],
+            }
+        ),
         encoding="utf-8",
     )
     return base
