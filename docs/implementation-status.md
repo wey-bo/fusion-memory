@@ -93,7 +93,7 @@ production implementation described in the architecture document.
 - Layer 8 Benchmark/Product Integration
   - Minimal retrieval-match benchmark adapter.
   - BEAM-specific adapter and `run-beam` CLI with split tracking.
-  - LongMemEval-specific adapter and `run-longmemeval` CLI with question-scoped haystack ingestion, answer-session hit/recall metrics, and abstention accuracy.
+  - LongMemEval-specific adapter retained for internal validation; CLI exposure is currently disabled while benchmark work is narrowed to BEAM.
   - JSON/JSONL dataset loader.
   - Local extractive answer model and lexical judge skeleton.
   - Optional OpenAI-compatible answer model and semantic judge model adapters for benchmark runs.
@@ -104,7 +104,7 @@ production implementation described in the architecture document.
   - L0/L0+L1/L0+L1+L2/Full source-component ablation report.
   - Benchmark report includes encoding/profile coverage reports.
   - CLI for local add/search/answer-context/get/history/debug-trace/audit/timeline/views/profiles/report.
-  - CLI `run-benchmark`, `run-beam`, and `run-longmemeval` accept answer/judge model endpoint options.
+  - CLI `run-beam` accepts answer/judge model endpoint options.
   - CLI `audit` command for operation audit events.
   - CLI `tasks` command for listing and processing background tasks.
   - Persistent stdlib HTTP service wrapper with `/health`, `/add`, `/search`, and `/answer-context`.

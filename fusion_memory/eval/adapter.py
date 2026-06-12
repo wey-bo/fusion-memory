@@ -27,6 +27,7 @@ class EvalQuery:
     query: str
     gold_answers: list[str]
     category: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -49,6 +50,9 @@ class EvalResult:
     tokens_query: int = 0
     retrieval_latency_ms: float = 0.0
     llm_calls: int = 0
+    score: float | None = None
+    judge_reason: str = ""
+    answer_failed: bool = False
 
 
 class LocalExtractiveAnswerModel:
@@ -289,6 +293,7 @@ def _to_query(item: dict[str, Any]) -> EvalQuery:
         query=str(item.get("query") or item.get("question") or ""),
         gold_answers=[str(answer) for answer in gold],
         category=category,
+        metadata=item.get("meta") if isinstance(item.get("meta"), dict) else {},
     )
 
 
@@ -302,6 +307,8 @@ def _pack_summary(pack: EvidencePack) -> dict[str, Any]:
         "event_count": len(pack.events),
         "source_span_count": len(pack.source_spans),
         "source_span_ids": [span["id"] for span in pack.source_spans],
+        "temporal_mention_count": sum(len(span.get("temporal_mentions", [])) for span in pack.source_spans),
+        "temporal_roles": sorted({role for span in pack.source_spans for role in span.get("temporal_roles", [])}),
     }
 
 

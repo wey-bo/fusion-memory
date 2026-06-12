@@ -4,6 +4,7 @@ import unittest
 from datetime import datetime, timezone
 
 from fusion_memory import MemoryService, Scope
+from fusion_memory.core.text import extract_entities
 from fusion_memory.ingestion.temporal_normalizer import TemporalNormalizer
 from fusion_memory.retrieval.query_planner import QueryPlanner
 
@@ -55,6 +56,31 @@ class TemporalNormalizerTests(unittest.TestCase):
         constraints = {item["text"] for item in plan.time_constraints}
         self.assertIn("next month", constraints)
         self.assertIn("this friday", constraints)
+
+        duration_plan = QueryPlanner().plan(
+            "How many weeks do I have between finishing the feature work and the final deployment deadline?"
+        )
+        self.assertEqual(duration_plan.query_type, "temporal_lookup")
+
+    def test_query_planner_recognizes_order_in_which_queries(self) -> None:
+        plan = QueryPlanner().plan(
+            "Can you list the order in which I brought up different aspects of developing my personal budget tracker throughout our conversations, in order?"
+        )
+        self.assertEqual(plan.query_type, "event_ordering")
+        self.assertEqual(plan.speaker_focus, "user")
+        self.assertIn("budget", plan.retrieval_hints)
+        self.assertIn("tracker", plan.retrieval_hints)
+
+    def test_extract_entities_filters_question_boilerplate(self) -> None:
+        entities = extract_entities(
+            "Can you list the order in which I brought up Flask, SQLite, and Bootstrap? Mention ONLY three items."
+        )
+        self.assertIn("Flask", entities)
+        self.assertIn("SQLite", entities)
+        self.assertIn("Bootstrap", entities)
+        self.assertNotIn("Can", entities)
+        self.assertNotIn("Mention", entities)
+        self.assertNotIn("ONLY", entities)
 
     def test_service_events_use_extended_temporal_rules(self) -> None:
         memory = MemoryService()

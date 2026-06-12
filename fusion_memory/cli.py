@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from datetime import datetime, timezone
 
 from fusion_memory import MemoryService, Scope
 from fusion_memory.core.config import DEFAULT_CONFIG
 from fusion_memory.core.llm import OpenAICompatibleLLMClient
 from fusion_memory.core.runtime_config import memory_service_from_env
-from fusion_memory.eval.adapter import BenchmarkAdapter
 from fusion_memory.eval.beam_adapter import BEAM_SPLITS, BeamAdapter
-from fusion_memory.eval.longmemeval_adapter import LONGMEMEVAL_SPLITS, LongMemEvalAdapter
 from fusion_memory.eval.model_adapters import OpenAICompatibleAnswerModel, OpenAICompatibleJudgeModel
 from fusion_memory.storage.postgres_store import PostgresMigrationRunner
 from fusion_memory.storage.postgres_verifier import verify_postgres_backend
@@ -88,23 +87,11 @@ def main() -> None:
     train = sub.add_parser("train-utility", help="Train the local retrieval utility scorer from collected weak labels")
     train.add_argument("--save-model", default=None)
 
-    bench = sub.add_parser("run-benchmark", help="Run a local retrieval benchmark dataset")
-    bench.add_argument("dataset_path")
-    bench.add_argument("--split", default=None)
-    bench.add_argument("--ablate", action="store_true", help="Also report Fast/Balanced/Benchmark mode ablations")
-    _add_eval_model_args(bench)
-
     beam = sub.add_parser("run-beam", help="Run a BEAM-style local benchmark split")
     beam.add_argument("dataset_path")
     beam.add_argument("--split", default="small", choices=sorted(BEAM_SPLITS))
     beam.add_argument("--ablate", action="store_true", help="Also report retrieval-mode and component ablations")
     _add_eval_model_args(beam)
-
-    longmem = sub.add_parser("run-longmemeval", help="Run a LongMemEval-style local benchmark split")
-    longmem.add_argument("dataset_path")
-    longmem.add_argument("--split", default="dev", choices=sorted(LONGMEMEVAL_SPLITS))
-    longmem.add_argument("--ablate", action="store_true", help="Also report retrieval-mode and component ablations")
-    _add_eval_model_args(longmem)
 
     pg = sub.add_parser("migrate-postgres", help="Apply the Postgres/pgvector production schema")
     pg.add_argument("dsn", help="Postgres DSN, for example postgresql://user:pass@localhost:5432/fusion_memory")
@@ -190,27 +177,9 @@ def main() -> None:
             if args.save_model:
                 service.save_utility_scorer(args.save_model)
             print(json.dumps(_jsonable(report), ensure_ascii=False, indent=2))
-        elif args.command == "run-benchmark":
-            answer_model, judge_model = _build_eval_models(args)
-            adapter = BenchmarkAdapter(service, scope, answer_model=answer_model, judge_model=judge_model)
-            ingest = adapter.ingest_dataset(args.dataset_path, split=args.split)
-            queries = adapter.build_queries(args.dataset_path, split=args.split)
-            results = adapter.run_queries(queries)
-            output = {"ingest": ingest, "report": adapter.report(results)}
-            if args.ablate:
-                output["ablation"] = {
-                    "retrieval_modes": adapter.run_ablation(queries),
-                    "components": adapter.run_component_ablation(queries),
-                }
-            print(json.dumps(output, ensure_ascii=False, indent=2))
         elif args.command == "run-beam":
             answer_model, judge_model = _build_eval_models(args)
             adapter = BeamAdapter(service, scope, split=args.split, answer_model=answer_model, judge_model=judge_model)
-            output = adapter.run_dataset(args.dataset_path, split=args.split, ablate=args.ablate)
-            print(json.dumps(output, ensure_ascii=False, indent=2))
-        elif args.command == "run-longmemeval":
-            answer_model, judge_model = _build_eval_models(args)
-            adapter = LongMemEvalAdapter(service, scope, split=args.split, answer_model=answer_model, judge_model=judge_model)
             output = adapter.run_dataset(args.dataset_path, split=args.split, ablate=args.ablate)
             print(json.dumps(output, ensure_ascii=False, indent=2))
     finally:
@@ -231,35 +200,87 @@ def _jsonable(value):
 
 def _add_eval_model_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--answer-endpoint", default=None, help="OpenAI-compatible chat/completions endpoint for benchmark answers")
-    parser.add_argument("--answer-model", default="eval-answer", help="Model name sent to --answer-endpoint")
+    parser.add_argument("--answer-model", default=None, help="Model name sent to --answer-endpoint")
     parser.add_argument("--answer-api-key", default=None, help="Bearer token for --answer-endpoint")
     parser.add_argument("--judge-endpoint", default=None, help="OpenAI-compatible chat/completions endpoint for semantic judging")
-    parser.add_argument("--judge-model", default="eval-judge", help="Model name sent to --judge-endpoint")
+    parser.add_argument("--judge-model", default=None, help="Model name sent to --judge-endpoint")
     parser.add_argument("--judge-api-key", default=None, help="Bearer token for --judge-endpoint")
     parser.add_argument("--model-api-key", default=None, help="Shared fallback Bearer token for answer/judge endpoints")
-    parser.add_argument("--model-timeout-seconds", type=float, default=30.0, help="HTTP timeout for answer/judge model calls")
+    parser.add_argument("--model-timeout-seconds", type=float, default=None, help="HTTP timeout for answer/judge model calls")
 
 
 def _build_eval_models(args: argparse.Namespace):
     answer_model = None
     judge_model = None
-    if getattr(args, "answer_endpoint", None):
+    shared_endpoint = _env_endpoint("FUSION_MEMORY_EVAL_ENDPOINT", "FUSION_MEMORY_EVAL_BASE_URL")
+    answer_endpoint = (
+        getattr(args, "answer_endpoint", None)
+        or _env_endpoint("FUSION_MEMORY_EVAL_ANSWER_ENDPOINT", "FUSION_MEMORY_EVAL_ANSWER_BASE_URL")
+        or shared_endpoint
+    )
+    judge_endpoint = (
+        getattr(args, "judge_endpoint", None)
+        or _env_endpoint("FUSION_MEMORY_EVAL_JUDGE_ENDPOINT", "FUSION_MEMORY_EVAL_JUDGE_BASE_URL")
+        or shared_endpoint
+    )
+    shared_api_key = getattr(args, "model_api_key", None) or os.getenv("FUSION_MEMORY_EVAL_MODEL_API_KEY")
+    timeout_seconds = getattr(args, "model_timeout_seconds", None) or _float_env("FUSION_MEMORY_EVAL_TIMEOUT_SECONDS", 30.0)
+    retry_attempts = _int_env("FUSION_MEMORY_EVAL_RETRY_ATTEMPTS", 5)
+    retry_backoff_seconds = _float_env("FUSION_MEMORY_EVAL_RETRY_BACKOFF_SECONDS", 2.0)
+    retry_max_backoff_seconds = _float_env("FUSION_MEMORY_EVAL_RETRY_MAX_BACKOFF_SECONDS", 60.0)
+    min_interval_seconds = _float_env("FUSION_MEMORY_EVAL_MIN_INTERVAL_SECONDS", 1.0)
+    if answer_endpoint:
         answer_client = OpenAICompatibleLLMClient(
-            args.answer_endpoint,
-            api_key=args.answer_api_key or args.model_api_key,
-            model=args.answer_model,
-            timeout_seconds=args.model_timeout_seconds,
+            answer_endpoint,
+            api_key=getattr(args, "answer_api_key", None) or os.getenv("FUSION_MEMORY_EVAL_ANSWER_API_KEY") or shared_api_key,
+            model=getattr(args, "answer_model", None) or os.getenv("FUSION_MEMORY_EVAL_ANSWER_MODEL") or os.getenv("FUSION_MEMORY_EVAL_MODEL") or "eval-answer",
+            timeout_seconds=timeout_seconds,
+            retry_attempts=retry_attempts,
+            retry_backoff_seconds=retry_backoff_seconds,
+            retry_max_backoff_seconds=retry_max_backoff_seconds,
+            min_interval_seconds=min_interval_seconds,
         )
         answer_model = OpenAICompatibleAnswerModel(answer_client)
-    if getattr(args, "judge_endpoint", None):
+    if judge_endpoint:
         judge_client = OpenAICompatibleLLMClient(
-            args.judge_endpoint,
-            api_key=args.judge_api_key or args.model_api_key,
-            model=args.judge_model,
-            timeout_seconds=args.model_timeout_seconds,
+            judge_endpoint,
+            api_key=getattr(args, "judge_api_key", None) or os.getenv("FUSION_MEMORY_EVAL_JUDGE_API_KEY") or shared_api_key,
+            model=getattr(args, "judge_model", None) or os.getenv("FUSION_MEMORY_EVAL_JUDGE_MODEL") or os.getenv("FUSION_MEMORY_EVAL_MODEL") or "eval-judge",
+            timeout_seconds=timeout_seconds,
+            retry_attempts=retry_attempts,
+            retry_backoff_seconds=retry_backoff_seconds,
+            retry_max_backoff_seconds=retry_max_backoff_seconds,
+            min_interval_seconds=min_interval_seconds,
         )
         judge_model = OpenAICompatibleJudgeModel(judge_client)
     return answer_model, judge_model
+
+
+def _env_endpoint(endpoint_name: str, base_url_name: str) -> str | None:
+    endpoint = os.getenv(endpoint_name)
+    if endpoint:
+        return endpoint
+    base_url = os.getenv(base_url_name)
+    if not base_url:
+        return None
+    base_url = base_url.rstrip("/")
+    if base_url.endswith("/chat/completions"):
+        return base_url
+    return f"{base_url}/chat/completions"
+
+
+def _float_env(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return float(value)
+
+
+def _int_env(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return int(value)
 
 
 if __name__ == "__main__":

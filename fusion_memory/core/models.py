@@ -209,6 +209,7 @@ class QueryPlan:
     query_type: str
     entities: list[str]
     time_constraints: list[dict[str, Any]]
+    retrieval_hints: list[str] = field(default_factory=list)
     speaker_focus: str = "any"
     needs_current_state: bool = False
     needs_source_evidence: bool = True

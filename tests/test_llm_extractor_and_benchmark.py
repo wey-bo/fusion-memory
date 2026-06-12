@@ -62,6 +62,36 @@ class LLMExtractorAndBenchmarkTests(unittest.TestCase):
         fact = memory.get(result.accepted_fact_ids[0], "fact")
         self.assertEqual(fact.source_span_ids, result.span_ids)
 
+    def test_structured_llm_extractor_uses_rule_event_fallback(self) -> None:
+        class FactOnlyClient:
+            def structured(self, prompt, schema, input):
+                span_id = input["spans"][0]["span_id"]
+                return {
+                    "facts": [
+                        {
+                            "text": "User planned Core functionality.",
+                            "subject": "user",
+                            "predicate": "planned",
+                            "object": "Core functionality",
+                            "category": "project_state",
+                            "confidence": 0.91,
+                            "salience": 0.84,
+                            "source_span_ids": [span_id],
+                        }
+                    ],
+                    "events": [],
+                }
+
+        extractor = StructuredLLMExtractor(FactOnlyClient())
+        memory = MemoryService(extractor=extractor)
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a")
+        result = memory.add("I planned Core functionality for the tracker.", scope, datetime(2026, 6, 1, tzinfo=timezone.utc))
+
+        self.assertTrue(result.accepted_event_ids)
+        event = memory.store.list_events(scope)[0]
+        self.assertEqual(event.event_type, "milestone")
+        self.assertIn("Core functionality", event.description)
+
     def test_dataset_loader_and_benchmark_report_from_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "dataset.json"
@@ -103,17 +133,8 @@ class LLMExtractorAndBenchmarkTests(unittest.TestCase):
     def test_cli_run_benchmark_smoke(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            dataset = tmp_path / "dataset.json"
+            dataset = _write_official_beam_fixture(tmp_path)
             db = tmp_path / "fm.sqlite3"
-            dataset.write_text(
-                json.dumps(
-                    {
-                        "documents": [{"id": "doc1", "content": "User prefers Qdrant for Atlas.", "speaker": "user"}],
-                        "queries": [{"id": "q1", "query": "What does user prefer for Atlas?", "gold_answers": ["Qdrant"]}],
-                    }
-                ),
-                encoding="utf-8",
-            )
             proc = subprocess.run(
                 [
                     sys.executable,
@@ -127,8 +148,10 @@ class LLMExtractorAndBenchmarkTests(unittest.TestCase):
                     "u",
                     "--agent-id",
                     "a",
-                    "run-benchmark",
+                    "run-beam",
                     str(dataset),
+                    "--split",
+                    "small",
                 ],
                 cwd=Path(__file__).resolve().parents[1],
                 check=True,
@@ -136,7 +159,49 @@ class LLMExtractorAndBenchmarkTests(unittest.TestCase):
                 capture_output=True,
             )
             data = json.loads(proc.stdout)
-            self.assertEqual(data["report"]["retrieval_match_rate"], 1.0)
+            self.assertIn("accuracy", data["report"])
+            self.assertEqual(data["report"]["split"], "small")
+
+
+def _write_official_beam_fixture(base: Path) -> Path:
+    chat_dir = base / "chats" / "100K" / "1"
+    questions_dir = chat_dir / "probing_questions"
+    questions_dir.mkdir(parents=True)
+    (chat_dir / "chat.json").write_text(
+        json.dumps(
+            [
+                {
+                    "batch_number": 1,
+                    "turns": [
+                        [
+                            {
+                                "role": "user",
+                                "id": 1,
+                                "time_anchor": "March-15-2024",
+                                "content": "User prefers Qdrant for Atlas.",
+                            }
+                        ]
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (questions_dir / "probing_questions.json").write_text(
+        json.dumps(
+            {
+                "information_extraction": [
+                    {
+                        "question": "What does user prefer for Atlas?",
+                        "answer": "Qdrant",
+                        "rubric": ["LLM response should contain: Qdrant"],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    return base
 
 
 if __name__ == "__main__":

@@ -134,11 +134,13 @@ class Qwen3Reranker:
 
 def rerank_candidates(query: str, candidates: list[Candidate], reranker: Reranker) -> list[Candidate]:
     rerank_scores = reranker.score(query, [candidate.text for candidate in candidates])
+    normalized_scores = _normalize_scores(rerank_scores)
     out: list[Candidate] = []
-    for candidate, rerank_score in zip(candidates, rerank_scores):
+    for candidate, rerank_score, rerank_score_normalized in zip(candidates, rerank_scores, normalized_scores):
         scores = dict(candidate.scores)
         scores["rerank_score"] = rerank_score
-        scores["utility_score"] = 0.65 * scores.get("utility_score", 0.0) + 0.35 * rerank_score
+        scores["rerank_score_normalized"] = rerank_score_normalized
+        scores["utility_score"] = 0.70 * scores.get("utility_score", 0.0) + 0.30 * rerank_score_normalized
         out.append(
             Candidate(
                 id=candidate.id,
@@ -150,8 +152,25 @@ def rerank_candidates(query: str, candidates: list[Candidate], reranker: Reranke
                 metadata=candidate.metadata,
             )
         )
-    out.sort(key=lambda candidate: (candidate.scores.get("utility_score", 0.0), candidate.scores.get("rerank_score", 0.0)), reverse=True)
+    out.sort(
+        key=lambda candidate: (
+            candidate.scores.get("utility_score", 0.0),
+            candidate.scores.get("rerank_score_normalized", 0.0),
+            candidate.scores.get("rerank_score", 0.0),
+        ),
+        reverse=True,
+    )
     return out
+
+
+def _normalize_scores(scores: list[float]) -> list[float]:
+    if not scores:
+        return []
+    low = min(scores)
+    high = max(scores)
+    if high - low < 1e-9:
+        return [0.5 for _ in scores]
+    return [(score - low) / (high - low) for score in scores]
 
 
 def _post_json(endpoint: str, payload: dict, *, api_key: str | None, timeout_seconds: float) -> dict:

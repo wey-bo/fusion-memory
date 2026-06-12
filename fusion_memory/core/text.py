@@ -7,6 +7,41 @@ from collections import Counter
 
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_\-\u4e00-\u9fff]+")
+ENTITY_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "can",
+    "could",
+    "did",
+    "do",
+    "does",
+    "for",
+    "from",
+    "how",
+    "in",
+    "list",
+    "me",
+    "mention",
+    "only",
+    "or",
+    "order",
+    "please",
+    "show",
+    "tell",
+    "the",
+    "through",
+    "walk",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "with",
+    "would",
+}
 
 
 def stable_hash(text: str) -> str:
@@ -21,8 +56,14 @@ def extract_entities(text: str) -> list[str]:
     entities: list[str] = []
     for match in re.finditer(r"\b[A-Z][A-Za-z0-9_\-]{2,}\b", text):
         value = match.group(0)
-        if value.lower() not in {"user", "assistant", "agent"}:
-            entities.append(value)
+        normalized = value.lower()
+        if normalized in {"user", "assistant", "agent"}:
+            continue
+        if normalized in ENTITY_STOPWORDS:
+            continue
+        if value.isupper() and len(value) <= 8:
+            continue
+        entities.append(value)
     seen: set[str] = set()
     out: list[str] = []
     for entity in entities:
@@ -63,4 +104,3 @@ def compact_summary(text: str, limit: int = 360) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[: limit - 3].rstrip() + "..."
-

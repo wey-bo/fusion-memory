@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 from fusion_memory import MemoryService, Scope
-from fusion_memory.eval.beam_adapter import BeamAdapter
+from fusion_memory.eval.beam_adapter import BeamAdapter, _event_ordering_score
 
 
 class BeamAdapterTests(unittest.TestCase):
@@ -21,13 +21,16 @@ class BeamAdapterTests(unittest.TestCase):
             queries = adapter.build_queries(dataset, split="small")
 
             self.assertEqual(ingest["documents"], 2)
-            self.assertEqual(len(queries), 2)
+            self.assertEqual(len(queries), 3)
             self.assertEqual(queries[0].category, "information_extraction")
             self.assertIn("Qdrant", queries[0].gold_answers[0])
+            instruction_query = next(query for query in queries if query.category == "instruction_following")
+            self.assertTrue(instruction_query.gold_answers)
+            self.assertIn("syntax highlighting", instruction_query.gold_answers[0])
 
     def test_beam_adapter_runs_split_and_records_answer_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            dataset = _write_beam_fixture(Path(tmp), split="small")
+            dataset = _write_official_beam_fixture(Path(tmp))
             service = MemoryService()
             scope = Scope(workspace_id="w", user_id="u", agent_id="a")
             adapter = BeamAdapter(service, scope, split="small")
@@ -38,16 +41,108 @@ class BeamAdapterTests(unittest.TestCase):
             self.assertEqual(output["ingest"]["benchmark"], "BEAM")
             self.assertEqual(report["benchmark"], "BEAM")
             self.assertEqual(report["split"], "small")
-            self.assertEqual(report["answer_match_rate"], 1.0)
-            self.assertIn("factual_exact", report["query_type_mapping"])
+            self.assertIn("scoring", report)
+            self.assertIn("judge_failures", report)
+            self.assertIn("information_extraction", report["query_type_mapping"])
             self.assertEqual(report["evidence_pack_trace_coverage"], 1.0)
             self.assertTrue(report["answers"][0]["evidence_pack"]["source_span_ids"])
-            self.assertEqual(set(output["ablation"]), {"retrieval_modes", "components"})
+            self.assertEqual(set(output["ablation"]), {"retrieval_modes"})
+
+    def test_beam_adapter_passes_category_context_to_answer_model(self) -> None:
+        class ContextAnswer:
+            version = "context-answer"
+
+            def __init__(self) -> None:
+                self.calls = []
+
+            def answer_with_context(self, query, pack, *, benchmark=None, category=None, metadata=None):
+                self.calls.append({"benchmark": benchmark, "category": category, "metadata": metadata})
+                return "Qdrant"
+
+        class AlwaysMatchJudge:
+            version = "always-match"
+
+            def score(self, answer, gold_answers):
+                return True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset = _write_official_beam_fixture(Path(tmp))
+            answer_model = ContextAnswer()
+            service = MemoryService()
+            scope = Scope(workspace_id="w", user_id="u", agent_id="a")
+            adapter = BeamAdapter(service, scope, split="small", answer_model=answer_model, judge_model=AlwaysMatchJudge())
+            adapter.ingest_dataset(dataset, split="small")
+            query = next(item for item in adapter.build_queries(dataset, split="small") if item.category == "instruction_following")
+
+            adapter.answer_query(query)
+
+        self.assertEqual(answer_model.calls[0]["benchmark"], "BEAM")
+        self.assertEqual(answer_model.calls[0]["category"], "instruction_following")
+        self.assertEqual(answer_model.calls[0]["metadata"], {})
+
+    def test_beam_adapter_reports_answer_model_failures(self) -> None:
+        class FailingAnswer:
+            version = "failing-answer"
+
+            def answer_with_context(self, query, pack, *, benchmark=None, category=None, metadata=None):
+                raise RuntimeError("LLM endpoint returned HTTP 429: rate limited")
+
+        class NeverCalledJudge:
+            version = "never-called"
+
+            def rubric_score(self, query, answer, rubric_item):
+                raise AssertionError("judge should not be called when answer generation fails")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset = _write_official_beam_fixture(Path(tmp))
+            service = MemoryService()
+            scope = Scope(workspace_id="w", user_id="u", agent_id="a")
+            adapter = BeamAdapter(service, scope, split="small", answer_model=FailingAnswer(), judge_model=NeverCalledJudge())
+            adapter.ingest_dataset(dataset, split="small")
+            query = adapter.build_queries(dataset, split="small")[0]
+
+            result = adapter.answer_query(query)
+            report = adapter.report([result])
+
+        self.assertTrue(result.answer_failed)
+        self.assertEqual(result.score, 0.0)
+        self.assertFalse(result.matched_gold)
+        self.assertIn("answer generation failed", result.judge_reason)
+        self.assertEqual(report["answer_failures"]["count"], 1)
+        self.assertEqual(report["judge_failures"]["count"], 0)
+
+    def test_event_ordering_score_aligns_ordinals_and_descriptive_items(self) -> None:
+        reference = [
+            "1st: Core functionality",
+            "2nd: Transaction error handling",
+            "3rd: Security and deployment",
+        ]
+        system = [
+            "Core functionality: planning the Flask app and SQLite schema.",
+            "Transaction error handling: implementing validation and error handling.",
+            "Security and deployment: adding password hashing before deployment.",
+        ]
+
+        self.assertEqual(_event_ordering_score(reference, system), 1.0)
+
+    def test_event_ordering_score_does_not_overmatch_short_labels(self) -> None:
+        reference = [
+            "1st: Core functionality",
+            "2nd: Transaction error handling",
+            "3rd: Security and deployment",
+        ]
+        system = [
+            "Core functionality",
+            "Transaction error handling",
+            "Security",
+        ]
+
+        self.assertLess(_event_ordering_score(reference, system), 1.0)
 
     def test_cli_run_beam_smoke(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            dataset = _write_beam_fixture(tmp_path, split="dev")
+            dataset = _write_official_beam_fixture(tmp_path)
             db = tmp_path / "fm.sqlite3"
             proc = subprocess.run(
                 [
@@ -65,7 +160,7 @@ class BeamAdapterTests(unittest.TestCase):
                     "run-beam",
                     str(dataset),
                     "--split",
-                    "dev",
+                    "small",
                 ],
                 cwd=Path(__file__).resolve().parents[1],
                 check=True,
@@ -74,35 +169,9 @@ class BeamAdapterTests(unittest.TestCase):
             )
             data = json.loads(proc.stdout)
             self.assertEqual(data["report"]["benchmark"], "BEAM")
-            self.assertEqual(data["report"]["split"], "dev")
-            self.assertEqual(data["report"]["retrieval_match_rate"], 1.0)
-
-
-def _write_beam_fixture(base: Path, split: str) -> Path:
-    split_dir = base / split
-    split_dir.mkdir(parents=True)
-    (split_dir / "documents.jsonl").write_text(
-        "\n".join(
-            [
-                json.dumps({"id": "doc1", "content": "User said Atlas retrieval now uses Qdrant.", "speaker": "user"}),
-                json.dumps({"id": "doc2", "content": "Atlas retrieval backend is Qdrant in the BEAM fixture.", "speaker": "user"}),
-            ]
-        ),
-        encoding="utf-8",
-    )
-    (split_dir / "queries.jsonl").write_text(
-        json.dumps(
-            {
-                "id": "q1",
-                "query": "What does Atlas retrieval use?",
-                "gold_answers": ["Qdrant"],
-                "category": "factual_exact",
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    return base
+            self.assertEqual(data["report"]["split"], "small")
+            self.assertIn("accuracy", data["report"])
+            self.assertNotIn("retrieval_match_rate", data["report"])
 
 
 def _write_official_beam_fixture(base: Path) -> Path:
@@ -147,6 +216,18 @@ def _write_official_beam_fixture(base: Path) -> Path:
                     {
                         "question": "What database was never mentioned?",
                         "ideal_response": "The chat does not mention that database.",
+                        "rubric": [
+                            "LLM response should contain: The chat does not mention that database."
+                        ],
+                    }
+                ],
+                "instruction_following": [
+                    {
+                        "question": "Could you show me how to implement a login feature?",
+                        "instruction_being_tested": "Always format all code snippets with syntax highlighting when I ask about implementation details.",
+                        "rubric": [
+                            "LLM response should contain: code blocks with syntax highlighting"
+                        ],
                     }
                 ],
             }

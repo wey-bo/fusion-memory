@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -48,39 +46,6 @@ class LongMemEvalAdapterTests(unittest.TestCase):
             items = load_longmemeval_dataset(path, split="dev")
             self.assertEqual(len(items), 1)
             self.assertEqual(items[0].haystack_session_ids, ["s_answer", "s_distractor"])
-
-    def test_cli_run_longmemeval_smoke(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            dataset = _write_longmemeval_fixture(tmp_path, split="dev")
-            db = tmp_path / "fm.sqlite3"
-            proc = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "fusion_memory.cli",
-                    "--db",
-                    str(db),
-                    "--workspace-id",
-                    "w",
-                    "--user-id",
-                    "u",
-                    "--agent-id",
-                    "a",
-                    "run-longmemeval",
-                    str(dataset),
-                    "--split",
-                    "dev",
-                ],
-                cwd=Path(__file__).resolve().parents[1],
-                check=True,
-                text=True,
-                capture_output=True,
-            )
-            data = json.loads(proc.stdout)
-            self.assertEqual(data["report"]["benchmark"], "LongMemEval")
-            self.assertEqual(data["report"]["split"], "dev")
-            self.assertGreaterEqual(data["report"]["answer_session_hit_rate"], 0.5)
 
     def test_longmemeval_reports_injected_model_calls(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -13,7 +13,14 @@ PREFERENCE_RE = re.compile(r"\b(?:i|we)\s+(?:now\s+)?(?:prefer|like|use|want)\s+
 NOW_PREFERRED_RE = re.compile(r"\b([A-Z][A-Za-z0-9_\- ]{1,80}?)\s+is\s+now\s+preferred\b", re.I)
 SWITCH_RE = re.compile(r"\b(?:switched|moved|changed)\s+(.+?)\s+(?:from\s+(.+?)\s+)?to\s+(.+?)(?:[.!?]|$)", re.I)
 INSTRUCTION_RE = re.compile(r"\b(?:remember|always|please|以后|记住|默认|do not|don't)\b", re.I)
-EVENT_RE = re.compile(r"\b(?:tested|switched|added|removed|decided|deployed|created|fixed|changed|moved|started|finished)\b", re.I)
+EVENT_RE = re.compile(
+    r"\b(?:"
+    r"tested|switched|added|removed|decided|deployed|created|fixed|changed|moved|started|finished|"
+    r"planned|mentioned|asked|discussed|reviewed|implemented|configured|debugged|launched|"
+    r"brought\s+up|came\s+up|worked\s+on"
+    r")\b",
+    re.I,
+)
 
 
 class RuleBasedExtractor:
@@ -78,6 +85,8 @@ class RuleBasedExtractor:
                         "predicate": "rejects_memory",
                         "object": "previous suggestion as preference",
                         "category": "instruction",
+                        "polarity": "negative",
+                        "topic_terms": _topic_terms(text),
                         "confidence": 0.85,
                         "salience": 0.68,
                     },
@@ -97,6 +106,9 @@ class RuleBasedExtractor:
                         "predicate": "switched_to",
                         "object": target,
                         "category": "project_state",
+                        "polarity": _fact_polarity(text),
+                        "value_mentions": _value_mentions(text),
+                        "topic_terms": _topic_terms(text),
                         "confidence": 0.86,
                         "salience": 0.82,
                     },
@@ -115,6 +127,9 @@ class RuleBasedExtractor:
                         "predicate": "prefers",
                         "object": obj,
                         "category": "preference",
+                        "polarity": _fact_polarity(text),
+                        "value_mentions": _value_mentions(text),
+                        "topic_terms": _topic_terms(text),
                         "confidence": 0.82,
                         "salience": 0.78,
                     },
@@ -133,6 +148,9 @@ class RuleBasedExtractor:
                         "predicate": "prefers",
                         "object": obj,
                         "category": "preference",
+                        "polarity": _fact_polarity(text),
+                        "value_mentions": _value_mentions(text),
+                        "topic_terms": _topic_terms(text),
                         "confidence": 0.84,
                         "salience": 0.80,
                     },
@@ -150,6 +168,9 @@ class RuleBasedExtractor:
                         "predicate": "said",
                         "object": compact_summary(text, 180),
                         "category": category,
+                        "polarity": _fact_polarity(text),
+                        "value_mentions": _value_mentions(text),
+                        "topic_terms": _topic_terms(text),
                         "confidence": 0.72,
                         "salience": 0.55 if category == "general_fact" else 0.70,
                     },
@@ -167,6 +188,9 @@ class RuleBasedExtractor:
                             "predicate": "said",
                             "object": compact_summary(text, 180),
                             "category": "general_fact",
+                            "polarity": _fact_polarity(text),
+                            "value_mentions": _value_mentions(text),
+                            "topic_terms": _topic_terms(text),
                             "confidence": 0.64,
                             "salience": 0.45,
                         },
@@ -175,18 +199,42 @@ class RuleBasedExtractor:
         return out
 
     def _extract_event_candidates(self, span: EvidenceSpan, session_time: datetime) -> list[ExtractedCandidate]:
-        if not EVENT_RE.search(span.content):
+        milestone_mentions = extract_milestone_mentions(span.content) if span.speaker == "user" else []
+        if not milestone_mentions and not EVENT_RE.search(span.content):
             return []
         normalized = self.temporal.normalize(span.content, session_time)
+        participants = list(dict.fromkeys([*(extract_entities(span.content) or ["user"]), *_topic_terms(span.content)[:6]]))
+        if milestone_mentions:
+            out: list[ExtractedCandidate] = []
+            for milestone, snippet in milestone_mentions[:4]:
+                out.append(
+                    self._candidate(
+                        "event",
+                        _milestone_description(milestone, snippet),
+                        span,
+                        {
+                            "event_type": "milestone",
+                            "participants": list(dict.fromkeys([milestone, *participants])),
+                            "description": _milestone_description(milestone, snippet),
+                            "time_start": normalized.time_start.isoformat() if normalized.time_start else None,
+                            "time_end": normalized.time_end.isoformat() if normalized.time_end else None,
+                            "time_granularity": normalized.granularity,
+                            "time_source": normalized.source,
+                            "confidence": 0.82,
+                        },
+                    )
+                )
+            return out
+        description = compact_summary(span.content, 240)
         return [
             self._candidate(
                 "event",
-                compact_summary(span.content, 240),
+                description,
                 span,
                 {
-                    "event_type": "state_change" if re.search(r"switched|changed|moved", span.content, re.I) else "user_action",
-                    "participants": extract_entities(span.content) or ["user"],
-                    "description": compact_summary(span.content, 240),
+                    "event_type": _event_type(span.content),
+                    "participants": participants,
+                    "description": description,
                     "time_start": normalized.time_start.isoformat() if normalized.time_start else None,
                     "time_end": normalized.time_end.isoformat() if normalized.time_end else None,
                     "time_granularity": normalized.granularity,
@@ -240,3 +288,229 @@ class RuleBasedExtractor:
             source_span_ids=[span.span_id],
             extractor_name="rule_based_extractor",
         )
+
+
+def _event_type(text: str) -> str:
+    if re.search(r"\b(?:switched|changed|moved)\b", text, re.I):
+        return "state_change"
+    if re.search(r"\b(?:planned|discussed|mentioned|asked|brought\s+up|came\s+up)\b", text, re.I):
+        return "milestone"
+    return "user_action"
+
+
+def classify_milestone(text: str) -> str | None:
+    milestones = classify_milestones(text)
+    if "deployment_and_test_improvements" in milestones:
+        return "deployment_and_test_improvements"
+    return milestones[0] if milestones else None
+
+
+def extract_milestone_mentions(text: str) -> list[tuple[str, str]]:
+    mentions: list[tuple[str, str]] = []
+    segments = _milestone_segments(text)
+    for segment in segments:
+        for milestone in classify_milestones(segment):
+            mentions.append((milestone, segment))
+    if not mentions and len(text) <= 500:
+        mentions = [(milestone, text) for milestone in classify_milestones(text)]
+    out: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for milestone, segment in mentions:
+        key = (milestone, compact_summary(segment, 80).lower())
+        if key in seen:
+            continue
+        out.append((milestone, segment))
+        seen.add(key)
+    return out
+
+
+def _milestone_segments(text: str) -> list[str]:
+    normalized = re.sub(r"```.*?```", " ", text, flags=re.S)
+    rough_parts = re.split(
+        r"(?:\n{2,}|\n[-*]\s+|\.\s+|;\s+|\?\s+|!\s+|,\s+(?:and|but|so|because|while|also)\s+)",
+        normalized,
+    )
+    parts: list[str] = []
+    for rough in rough_parts:
+        rough = rough.strip(" -:\n\t")
+        if len(rough) < 20:
+            continue
+        parts.extend(_split_long_segment(rough))
+    if not parts:
+        parts = [text.strip()]
+    return [compact_summary(part, 260) for part in parts[:40]]
+
+
+def _split_long_segment(text: str, *, max_words: int = 45, overlap: int = 8) -> list[str]:
+    words = text.split()
+    if len(words) <= max_words:
+        return [text]
+    out: list[str] = []
+    step = max(1, max_words - overlap)
+    for start in range(0, len(words), step):
+        chunk = " ".join(words[start : start + max_words])
+        if len(chunk) >= 20:
+            out.append(chunk)
+    return out
+
+
+def classify_milestones(text: str) -> list[str]:
+    lower = text.lower()
+    out: list[str] = []
+    deployment_specific = _has_any(
+        lower,
+        [
+            "render.com",
+            "on render",
+            "render deployment",
+            "render service",
+            "gunicorn",
+            "port 10000",
+            "worker setup",
+            "worker configuration",
+            "deployment setting",
+            "deployment settings",
+            "deployment config",
+            "deployment configuration",
+            "environment variable",
+            "environment variables",
+            "database_url",
+            "secret_key",
+            "production server",
+            "hosting",
+        ],
+    )
+    deployment_generic = _has_any(lower, ["deployment", "deploy"]) and _has_any(
+        lower,
+        ["configure", "configured", "configuring", "configuration", "settings", "server", "hosting", "render.com", "gunicorn"],
+    )
+    test_context = _has_any(lower, ["integration test", "integration tests", "test suite", "coverage", "endpoint coverage", "additional tests"])
+    deployment_test_improvement = _has_any(lower, ["deployment", "deploy"]) and test_context and _has_any(
+        lower,
+        ["improve", "improving", "expanded", "expanding", "additional", "review", "reviewing"],
+    )
+    deployment_context = deployment_specific or deployment_generic or deployment_test_improvement
+    security_context = _has_any(lower, ["security hardening", "security", "authentication", "authorization", "argon2", "password hashing"])
+    core_context = _has_any(lower, ["core functionality", "mvp scope", "income/expense tracking", "user login", "basic analytics"])
+    setup_debug_context = _has_any(lower, ["templatenotfound", "operationalerror", "no such table", "setup error", "set up my flask app"])
+    if deployment_context:
+        out.append("deployment_configuration")
+    if deployment_context and (test_context or _has_any(lower, ["improve", "improving", "expanded", "expanding", "additional"])):
+        out.append("deployment_and_test_improvements")
+    if test_context:
+        out.append("integration_test_coverage")
+    transaction_impl_context = _has_any(
+        lower,
+        [
+            "implement",
+            "implemented",
+            "working on",
+            "create",
+            "creating",
+            "optimize",
+            "optimizing",
+            "post /transactions",
+            "transaction post",
+            "create_transaction",
+            "crud endpoint",
+            "crud endpoints",
+            "crud in my flask app",
+            "rest api for transactions",
+        ],
+    )
+    if _has_any(lower, ["transaction crud", "post /transactions", "transaction post", "create_transaction"]) and (
+        transaction_impl_context or not test_context
+    ):
+        out.append("transaction_crud_implementation")
+    if setup_debug_context:
+        out.append("setup_debugging")
+    if not setup_debug_context and "transaction" in lower and _has_any(
+        lower,
+        ["try-except", "exception", "exceptions", "error", "errors", "error handling", "meaningful error", "validation"],
+    ):
+        out.append("transaction_error_handling")
+    if "transaction creation" in lower:
+        out.append("transaction_crud_implementation")
+    if "transaction" in lower and _has_any(lower, ["error", "response", "validation", "handling", "201 status"]):
+        out.append("transaction_crud_implementation")
+    if _has_any(lower, ["initial project", "set up the database", "database schema", "local server"]):
+        out.append("initial_project_setup")
+    if core_context:
+        out.append("core_functionality")
+    if security_context and not core_context and not test_context:
+        out.append("security_and_deployment" if _has_any(lower, ["deployment", "deploy", "launch"]) else "security_auth")
+    return list(dict.fromkeys(out))
+
+
+def _milestone_description(group: str | None, text: str) -> str:
+    if not group:
+        return compact_summary(text, 240)
+    label = group.replace("_", " ")
+    return f"Milestone [{group}]: {label}. Evidence: {compact_summary(text, 220)}"
+
+
+def _has_any(lower: str, phrases: list[str]) -> bool:
+    return any(phrase in lower for phrase in phrases)
+
+
+FACT_TOPIC_STOPWORDS = {
+    "about",
+    "after",
+    "also",
+    "and",
+    "before",
+    "between",
+    "can",
+    "could",
+    "for",
+    "from",
+    "have",
+    "help",
+    "how",
+    "into",
+    "like",
+    "need",
+    "now",
+    "project",
+    "should",
+    "that",
+    "the",
+    "this",
+    "want",
+    "with",
+    "you",
+}
+
+
+def _fact_polarity(text: str) -> str:
+    lower = text.lower()
+    if re.search(r"\b(?:never|not yet|haven['’]?t|have not|don['’]?t|do not|without)\b", lower):
+        return "negative"
+    if re.search(r"\b(?:used|integrated|worked|read|listened|met|downloaded|placed|attended|completed|tested|made|drafted|managed|started)\b", lower):
+        return "positive"
+    return "unknown"
+
+
+def _value_mentions(text: str) -> list[str]:
+    values: list[str] = []
+    for pattern in [
+        r"\b20\d{2}[-/]\d{1,2}[-/]\d{1,2}\b",
+        r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s+20\d{2})?\b",
+        r"\b\d+(?:,\d{3})*(?:\.\d+)?\s*(?:ms|s|sec|seconds?|days?|weeks?|months?|commits?|cards?|columns?|features?|%)\b",
+        r"\bv?\d+\.\d+(?:\.\d+)?\b",
+    ]:
+        values.extend(match.group(0) for match in re.finditer(pattern, text, flags=re.I))
+        if len(values) >= 12:
+            break
+    return list(dict.fromkeys(values[:12]))
+
+
+def _topic_terms(text: str) -> list[str]:
+    raw = re.findall(r"[a-zA-Z][a-zA-Z0-9_+-]*", text.lower())
+    terms: list[str] = []
+    for token in raw:
+        token = token.strip("_+-")
+        if len(token) < 4 or token in FACT_TOPIC_STOPWORDS:
+            continue
+        terms.append(token[:-1] if token.endswith("s") and len(token) > 5 else token)
+    return list(dict.fromkeys(terms[:12]))

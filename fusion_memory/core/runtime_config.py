@@ -91,6 +91,10 @@ def _build_extractor() -> Any | None:
         api_key=_optional_env("FUSION_MEMORY_EXTRACTOR_API_KEY"),
         model=os.getenv("FUSION_MEMORY_EXTRACTOR_MODEL", "local-structured-extractor"),
         timeout_seconds=_float_env("FUSION_MEMORY_EXTRACTOR_TIMEOUT_SECONDS", 30.0),
+        retry_attempts=_int_env("FUSION_MEMORY_EXTRACTOR_RETRY_ATTEMPTS", 3),
+        retry_backoff_seconds=_float_env("FUSION_MEMORY_EXTRACTOR_RETRY_BACKOFF_SECONDS", 2.0),
+        retry_max_backoff_seconds=_float_env("FUSION_MEMORY_EXTRACTOR_RETRY_MAX_BACKOFF_SECONDS", 60.0),
+        min_interval_seconds=_float_env("FUSION_MEMORY_EXTRACTOR_MIN_INTERVAL_SECONDS", 0.0),
     )
     return StructuredLLMExtractor(
         client,

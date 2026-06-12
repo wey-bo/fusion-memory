@@ -18,13 +18,50 @@ from fusion_memory.core.config import DEFAULT_EMBEDDING_DIMENSION, DEFAULT_EMBED
 from fusion_memory.core.embedding import DeterministicEmbedder, HTTPEmbeddingClient, Qwen3EmbeddingClient
 from fusion_memory.core.llm import OpenAICompatibleLLMClient
 from fusion_memory.core.runtime_config import memory_service_from_env
+from fusion_memory.core.models import Candidate, EvidencePack
 from fusion_memory.eval.adapter import BenchmarkAdapter, EvalDocument, EvalQuery
 from fusion_memory.eval.model_adapters import OpenAICompatibleAnswerModel, OpenAICompatibleJudgeModel
 from fusion_memory.ingestion.llm_extractor import StructuredLLMExtractor
-from fusion_memory.retrieval.reranker import HTTPReranker, Qwen3Reranker
+from fusion_memory.retrieval.reranker import HTTPReranker, Qwen3Reranker, rerank_candidates
 
 
 class ModelAdapterTests(unittest.TestCase):
+    def test_rerank_candidates_normalizes_large_raw_scores(self) -> None:
+        class FixedScaleReranker:
+            def score(self, query: str, docs: list[str]) -> list[float]:
+                return [-12.0, -3.0, 9.0]
+
+        candidates = [
+            Candidate(id="a", type="span", text="a", source="test", scores={"utility_score": 0.60}, source_span_ids=["a"]),
+            Candidate(id="b", type="span", text="b", source="test", scores={"utility_score": 0.62}, source_span_ids=["b"]),
+            Candidate(id="c", type="span", text="c", source="test", scores={"utility_score": 0.58}, source_span_ids=["c"]),
+        ]
+
+        reranked = rerank_candidates("query", candidates, FixedScaleReranker())
+
+        normalized = [candidate.scores["rerank_score_normalized"] for candidate in reranked]
+        self.assertTrue(all(0.0 <= value <= 1.0 for value in normalized))
+        self.assertGreaterEqual(reranked[0].scores["utility_score"], reranked[-1].scores["utility_score"])
+
+    def test_rubric_score_retries_with_longer_timeout(self) -> None:
+        class FlakyJudgeClient:
+            def __init__(self) -> None:
+                self.timeout_seconds = 15.0
+                self.calls: list[float] = []
+
+            def structured(self, prompt, schema, input):
+                self.calls.append(self.timeout_seconds)
+                if len(self.calls) < 3:
+                    raise ValueError("LLM endpoint did not return a structured JSON object")
+                return {"score": 1.0, "reason": "retry recovered"}
+
+        judge = OpenAICompatibleJudgeModel(FlakyJudgeClient())
+        score, reason = judge.rubric_score("question", "answer", "rubric item")
+
+        self.assertEqual(score, 1.0)
+        self.assertEqual(reason, "retry recovered")
+        self.assertEqual(judge.client.calls, [15.0, 180.0, 300.0])
+
     def test_openai_compatible_llm_client_feeds_structured_extractor(self) -> None:
         with FakeModelServer() as server:
             client = OpenAICompatibleLLMClient(server.url("/llm"), model="test-llm")
@@ -45,6 +82,26 @@ class ModelAdapterTests(unittest.TestCase):
             self.assertEqual(server.requests[-1]["json"]["model"], "test-llm")
             self.assertTrue(client.calls)
             self.assertIn("latency_ms", client.calls[0])
+
+    def test_openai_compatible_llm_client_retries_http_429(self) -> None:
+        with FakeModelServer() as server:
+            client = OpenAICompatibleLLMClient(
+                server.url("/rate-limit-once"),
+                model="test-llm",
+                retry_attempts=2,
+                retry_backoff_seconds=0.0,
+                min_interval_seconds=0.0,
+            )
+
+            response = client.structured(
+                prompt="answer",
+                schema={"type": "object"},
+                input={"evidence_pack": {"source_spans": [{"content": "Atlas uses Qdrant."}]}},
+            )
+
+            self.assertEqual(response["answer"], "Qdrant")
+            self.assertEqual([request["path"] for request in server.requests].count("/rate-limit-once"), 2)
+            self.assertEqual(client.calls[0]["attempts"], 2)
 
     def test_http_embedding_client_can_back_store_embeddings(self) -> None:
         with FakeModelServer() as server:
@@ -164,20 +221,195 @@ class ModelAdapterTests(unittest.TestCase):
             self.assertTrue(any(request["path"] == "/answer" for request in server.requests))
             self.assertTrue(any(request["path"] == "/judge" for request in server.requests))
 
+    def test_eval_answer_model_adds_beam_category_instructions(self) -> None:
+        pack = EvidencePack(
+            query="Could you show me how to implement a login feature?",
+            answer_policy="answer_with_evidence_or_abstain",
+            current_views=[],
+            entity_profiles=[],
+            facts=[],
+            events=[],
+            source_spans=[{"id": "s1", "content": "Always format code snippets with syntax highlighting."}],
+            conflicts=[],
+            coverage={"query_type": "instruction"},
+            debug_trace=[],
+        )
+        with FakeModelServer() as server:
+            client = OpenAICompatibleLLMClient(server.url("/answer"), model="answer-model")
+            answer = OpenAICompatibleAnswerModel(client).answer_with_context(
+                pack.query,
+                pack,
+                benchmark="BEAM",
+                category="instruction_following",
+                metadata={"rubric": ["code blocks with syntax highlighting"]},
+            )
+
+        self.assertEqual(answer, "Qdrant")
+        request_input = _decode_model_payload(server.requests[-1]["json"])["input"]
+        self.assertNotIn("benchmark", request_input)
+        self.assertNotIn("category", request_input)
+        self.assertNotIn("rubric", request_input)
+        self.assertIn("fenced code blocks", request_input["instruction"])
+
+    def test_eval_answer_model_surfaces_client_failure(self) -> None:
+        class FailingClient:
+            version = "failing"
+
+            def structured(self, prompt, schema, input):
+                raise RuntimeError("LLM endpoint returned HTTP 429: rate limited")
+
+        pack = EvidencePack(
+            query="Question",
+            answer_policy="answer_with_evidence_or_abstain",
+            current_views=[],
+            entity_profiles=[],
+            facts=[],
+            events=[],
+            source_spans=[{"id": "s1", "content": "Evidence."}],
+            conflicts=[],
+            coverage={},
+            debug_trace=[],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "HTTP 429"):
+            OpenAICompatibleAnswerModel(FailingClient()).answer_with_context("Question", pack)
+
+    def test_eval_answer_model_does_not_send_beam_gold_metadata(self) -> None:
+        pack = EvidencePack(
+            query="What happened first?",
+            answer_policy="answer_with_evidence_or_abstain",
+            current_views=[],
+            entity_profiles=[],
+            facts=[],
+            events=[
+                {
+                    "id": "e1",
+                    "timeline_index": 1,
+                    "time_start": "2026-06-01T10:00:00+00:00",
+                    "description": "Core functionality was planned.",
+                    "event_type": "milestone",
+                    "milestone_group": "core_functionality",
+                    "source_span_ids": ["s1"],
+                }
+            ],
+            source_spans=[
+                {
+                    "id": "s1",
+                    "timeline_index": 1,
+                    "timestamp": "2026-06-01T10:00:00+00:00",
+                    "content": "The team planned core functionality before deployment.",
+                }
+            ],
+            conflicts=[],
+            coverage={"query_type": "event_ordering"},
+            debug_trace=[],
+        )
+        gold_metadata = {
+            "rubric": ["LLM response should contain: Core functionality"],
+            "ideal_response": "Core functionality came first.",
+            "source_chat_ids": ["chat-1"],
+            "ordering_tested": ["1st: Core functionality", "2nd: Security and deployment"],
+            "conversation_references": ["hidden-source"],
+        }
+        with FakeModelServer() as server:
+            client = OpenAICompatibleLLMClient(server.url("/answer"), model="answer-model")
+            OpenAICompatibleAnswerModel(client).answer_with_context(
+                pack.query,
+                pack,
+                benchmark="BEAM",
+                category="event_ordering",
+                metadata=gold_metadata,
+            )
+
+        request_input = _decode_model_payload(server.requests[-1]["json"])["input"]
+        serialized_input = json.dumps(request_input)
+        self.assertIn("timeline_index", request_input["instruction"])
+        self.assertIn("conversation chronology", request_input["instruction"])
+        self.assertIn("timeline", request_input["evidence_pack"])
+        self.assertNotIn("source_spans", request_input["evidence_pack"])
+        self.assertNotIn("events", request_input["evidence_pack"])
+        timeline = request_input["evidence_pack"]["timeline"]
+        self.assertEqual(timeline[0]["timeline_index"], 1)
+        self.assertEqual(timeline[0]["kind"], "event")
+        self.assertEqual(timeline[0]["milestone_group"], "core_functionality")
+        self.assertEqual(timeline[0]["source_span_ids"], ["s1"])
+        self.assertNotIn("time_start", serialized_input)
+        self.assertNotIn("timestamp", serialized_input)
+        for key in gold_metadata:
+            self.assertNotIn(key, request_input)
+            self.assertNotIn(key, serialized_input)
+
+    def test_eval_answer_model_sends_temporal_role_annotations(self) -> None:
+        pack = EvidencePack(
+            query="How many weeks are between completion and deployment?",
+            answer_policy="answer_with_evidence_or_abstain",
+            current_views=[],
+            entity_profiles=[],
+            facts=[],
+            events=[],
+            source_spans=[
+                {
+                    "id": "s1",
+                    "content": "Features complete on January 15, 2024.",
+                    "temporal_mentions": [
+                        {
+                            "text": "January 15, 2024",
+                            "normalized_date": "2024-01-15",
+                            "role": "feature_finish_date",
+                            "role_confidence": 0.88,
+                            "context": "Features complete on January 15, 2024.",
+                        }
+                    ],
+                    "temporal_roles": ["feature_finish_date"],
+                }
+            ],
+            conflicts=[],
+            coverage={"query_type": "temporal_lookup"},
+            debug_trace=[],
+        )
+        with FakeModelServer() as server:
+            client = OpenAICompatibleLLMClient(server.url("/answer"), model="answer-model")
+            OpenAICompatibleAnswerModel(client).answer_with_context(
+                pack.query,
+                pack,
+                benchmark="BEAM",
+                category="temporal_reasoning",
+            )
+
+        request_input = _decode_model_payload(server.requests[-1]["json"])["input"]
+        span = request_input["evidence_pack"]["source_spans"][0]
+        self.assertEqual(span["temporal_roles"], ["feature_finish_date"])
+        self.assertEqual(span["temporal_mentions"][0]["normalized_date"], "2024-01-15")
+
+    def test_eval_answer_model_adds_strict_abstention_and_contradiction_instructions(self) -> None:
+        pack = EvidencePack(
+            query="Question",
+            answer_policy="answer_with_evidence_or_abstain",
+            current_views=[],
+            entity_profiles=[],
+            facts=[],
+            events=[],
+            source_spans=[{"id": "s1", "content": "Evidence."}],
+            conflicts=[],
+            coverage={},
+            debug_trace=[],
+        )
+        with FakeModelServer() as server:
+            client = OpenAICompatibleLLMClient(server.url("/answer"), model="answer-model")
+            model = OpenAICompatibleAnswerModel(client)
+            model.answer_with_context("Missing?", pack, benchmark="BEAM", category="abstention")
+            model.answer_with_context("Contradiction?", pack, benchmark="BEAM", category="contradiction_resolution")
+
+        abstention_input = _decode_model_payload(server.requests[-2]["json"])["input"]
+        contradiction_input = _decode_model_payload(server.requests[-1]["json"])["input"]
+        self.assertIn("does not contain that information", abstention_input["instruction"])
+        self.assertIn("contradictory claims", contradiction_input["instruction"])
+
     def test_cli_benchmark_accepts_eval_model_endpoints(self) -> None:
         with FakeModelServer() as server, tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
-            dataset = tmp_path / "dataset.json"
+            dataset = _write_official_beam_fixture(tmp_path)
             db = tmp_path / "fm.sqlite3"
-            dataset.write_text(
-                json.dumps(
-                    {
-                        "documents": [{"id": "doc1", "content": "Atlas retrieval uses Qdrant.", "speaker": "user"}],
-                        "queries": [{"id": "q1", "query": "What does Atlas retrieval use?", "gold_answers": ["Qdrant"]}],
-                    }
-                ),
-                encoding="utf-8",
-            )
             proc = subprocess.run(
                 [
                     sys.executable,
@@ -191,8 +423,10 @@ class ModelAdapterTests(unittest.TestCase):
                     "u",
                     "--agent-id",
                     "a",
-                    "run-benchmark",
+                    "run-beam",
                     str(dataset),
+                    "--split",
+                    "small",
                     "--answer-endpoint",
                     server.url("/answer"),
                     "--answer-model",
@@ -208,10 +442,52 @@ class ModelAdapterTests(unittest.TestCase):
                 capture_output=True,
             )
             data = json.loads(proc.stdout)
-            self.assertEqual(data["report"]["answer_match_rate"], 1.0)
+            self.assertGreaterEqual(data["report"]["accuracy"], 1.0)
             self.assertEqual(data["report"]["llm_calls_query"], 2.0)
             self.assertIn("answer-model", data["report"]["answer_model"])
             self.assertIn("judge-model", data["report"]["judge_model"])
+
+    def test_cli_benchmark_accepts_eval_model_env(self) -> None:
+        with FakeModelServer() as server, tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            dataset = _write_official_beam_fixture(tmp_path)
+            db = tmp_path / "fm.sqlite3"
+            env = {
+                **{key: value for key, value in os.environ.items() if not key.startswith("FUSION_MEMORY_")},
+                "FUSION_MEMORY_EVAL_BASE_URL": server.url(""),
+                "FUSION_MEMORY_EVAL_ANSWER_MODEL": "env-answer-model",
+                "FUSION_MEMORY_EVAL_JUDGE_MODEL": "env-judge-model",
+            }
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "fusion_memory.cli",
+                    "--db",
+                    str(db),
+                    "--workspace-id",
+                    "w",
+                    "--user-id",
+                    "u",
+                    "--agent-id",
+                    "a",
+                    "run-beam",
+                    str(dataset),
+                    "--split",
+                    "small",
+                ],
+                cwd=Path(__file__).resolve().parents[1],
+                env=env,
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            data = json.loads(proc.stdout)
+            self.assertGreaterEqual(data["report"]["accuracy"], 1.0)
+            self.assertEqual(data["report"]["llm_calls_query"], 2.0)
+            self.assertIn("env-answer-model", data["report"]["answer_model"])
+            self.assertIn("env-judge-model", data["report"]["judge_model"])
+            self.assertTrue(all(request["path"] == "/chat/completions" for request in server.requests if "json" in request))
 
 
 class FakeModelServer:
@@ -224,35 +500,64 @@ class FakeModelServer:
                 length = int(handler_self.headers.get("Content-Length", "0"))
                 payload = json.loads(handler_self.rfile.read(length).decode("utf-8"))
                 requests_ref.append({"path": handler_self.path, "json": payload})
-                if handler_self.path in {"/llm", "/chat/completions"}:
-                    span_id = payload["messages"][1]["content"]
-                    data = json.loads(span_id)
-                    source_id = data["input"]["spans"][0]["span_id"]
-                    response = {
-                        "choices": [
-                            {
-                                "message": {
-                                    "content": json.dumps(
-                                        {
-                                            "facts": [
-                                                {
-                                                    "text": "User prefers PostgreSQL for reports.",
-                                                    "subject": "user",
-                                                    "predicate": "prefers",
-                                                    "object": "PostgreSQL for reports",
-                                                    "category": "preference",
-                                                    "confidence": 0.91,
-                                                    "salience": 0.84,
-                                                    "source_span_ids": [source_id],
-                                                }
-                                            ]
-                                        }
-                                    )
+                if handler_self.path == "/rate-limit-once" and sum(1 for request in requests_ref if request["path"] == "/rate-limit-once") == 1:
+                    body = json.dumps({"error": "rate limited"}).encode("utf-8")
+                    handler_self.send_response(429)
+                    handler_self.send_header("Content-Type", "application/json")
+                    handler_self.send_header("Retry-After", "0")
+                    handler_self.send_header("Content-Length", str(len(body)))
+                    handler_self.end_headers()
+                    handler_self.wfile.write(body)
+                    return
+                if handler_self.path in {"/llm", "/chat/completions", "/rate-limit-once"}:
+                    data = _decode_model_payload(payload)
+                    request_input = data["input"]
+                    if "evidence_pack" in request_input:
+                        response = {
+                            "choices": [{"message": {"content": json.dumps({"answer": "Qdrant"})}}],
+                            "usage": {"total_tokens": 7},
+                        }
+                    elif "rubric_item" in request_input:
+                        rubric_item = str(request_input["rubric_item"]).lower()
+                        answer = str(request_input.get("candidate_answer", "")).lower()
+                        score = 1.0 if "qdrant" in rubric_item and "qdrant" in answer else 0.0
+                        response = {
+                            "choices": [{"message": {"content": json.dumps({"score": score, "reason": "fixture rubric score"})}}],
+                            "usage": {"total_tokens": 5},
+                        }
+                    elif "candidate_answer" in request_input:
+                        answer = request_input["candidate_answer"]
+                        response = {
+                            "choices": [{"message": {"content": json.dumps({"matched": "qdrant" in answer.lower()})}}],
+                            "usage": {"total_tokens": 5},
+                        }
+                    else:
+                        source_id = request_input["spans"][0]["span_id"]
+                        response = {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "content": json.dumps(
+                                            {
+                                                "facts": [
+                                                    {
+                                                        "text": "User prefers PostgreSQL for reports.",
+                                                        "subject": "user",
+                                                        "predicate": "prefers",
+                                                        "object": "PostgreSQL for reports",
+                                                        "category": "preference",
+                                                        "confidence": 0.91,
+                                                        "salience": 0.84,
+                                                        "source_span_ids": [source_id],
+                                                    }
+                                                ]
+                                            }
+                                        )
+                                    }
                                 }
-                            }
-                        ],
-                        "usage": {"total_tokens": 42},
-                    }
+                            ],
+                            "usage": {"total_tokens": 42},
+                        }
                 elif handler_self.path == "/embed":
                     texts = payload["input"]
                     response = {"embeddings": [_embedding(text) for text in texts], "usage": {"total_tokens": len(texts)}}
@@ -265,12 +570,22 @@ class FakeModelServer:
                         "usage": {"total_tokens": 7},
                     }
                 elif handler_self.path == "/judge":
-                    data = json.loads(payload["messages"][1]["content"])
-                    answer = data["input"]["candidate_answer"]
-                    response = {
-                        "choices": [{"message": {"content": json.dumps({"matched": "qdrant" in answer.lower()})}}],
-                        "usage": {"total_tokens": 5},
-                    }
+                    data = _decode_model_payload(payload)
+                    request_input = data["input"]
+                    if "rubric_item" in request_input:
+                        rubric_item = str(request_input["rubric_item"]).lower()
+                        answer = str(request_input.get("candidate_answer", "")).lower()
+                        score = 1.0 if "qdrant" in rubric_item and "qdrant" in answer else 0.0
+                        response = {
+                            "choices": [{"message": {"content": json.dumps({"score": score, "reason": "fixture rubric score"})}}],
+                            "usage": {"total_tokens": 5},
+                        }
+                    else:
+                        answer = request_input["candidate_answer"]
+                        response = {
+                            "choices": [{"message": {"content": json.dumps({"matched": "qdrant" in answer.lower()})}}],
+                            "usage": {"total_tokens": 5},
+                        }
                 else:
                     response = {"error": "unknown path"}
                 body = json.dumps(response).encode("utf-8")
@@ -303,6 +618,54 @@ def _embedding(text: str) -> list[float]:
     atlas = 1.0 if "atlas" in text.lower() else 0.0
     length = min(1.0, len(text.split()) / 20)
     return [qdrant, atlas, length]
+
+
+def _decode_model_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    content = payload["messages"][-1]["content"]
+    if isinstance(content, str) and "\n" in content:
+        content = content.split("\n", 1)[1]
+    return json.loads(content)
+
+
+def _write_official_beam_fixture(base: Path) -> Path:
+    chat_dir = base / "chats" / "100K" / "1"
+    questions_dir = chat_dir / "probing_questions"
+    questions_dir.mkdir(parents=True)
+    (chat_dir / "chat.json").write_text(
+        json.dumps(
+            [
+                {
+                    "batch_number": 1,
+                    "turns": [
+                        [
+                            {
+                                "role": "user",
+                                "id": 1,
+                                "time_anchor": "March-15-2024",
+                                "content": "Atlas retrieval uses Qdrant.",
+                            }
+                        ]
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (questions_dir / "probing_questions.json").write_text(
+        json.dumps(
+            {
+                "information_extraction": [
+                    {
+                        "question": "What does Atlas retrieval use?",
+                        "answer": "Qdrant",
+                        "rubric": ["LLM response should contain: Qdrant"],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    return base
 
 
 if __name__ == "__main__":

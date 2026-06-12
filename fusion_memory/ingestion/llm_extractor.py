@@ -25,6 +25,12 @@ span_id values present in the input. Do not return plain strings.
 Use facts for stable preferences, instructions, profile details, project state,
 or other information that should be remembered later. Leave arrays empty when
 there is nothing durable to remember.
+
+Use events for timestamped or orderable conversation milestones, project actions,
+decisions, tests, plans, mentions, questions, and state changes that may be used
+later for chronology or timeline questions. Event descriptions should preserve
+specific labels, dates, numbers, versions, file names, columns, and code-like
+tokens from the source span when present.
 """
 
 
@@ -44,32 +50,35 @@ class StructuredLLMExtractor:
     def extract(self, spans: list[EvidenceSpan], existing_facts: list[MemoryFact], session_time: datetime) -> list[ExtractedCandidate]:
         if not spans:
             return []
-        response = self.client.structured(
-            prompt=f"{self.prompt_version}\n\n{EXTRACTION_PROMPT}",
-            schema=EXTRACTION_SCHEMA,
-            input={
-                "session_time": session_time.isoformat(),
-                "spans": [
-                    {
-                        "span_id": span.span_id,
-                        "speaker": span.speaker,
-                        "span_type": span.span_type,
-                        "timestamp": span.timestamp.isoformat(),
-                        "content": span.content,
-                    }
-                    for span in spans
-                ],
-                "existing_facts": [
-                    {
-                        "fact_id": fact.fact_id,
-                        "text": fact.text,
-                        "category": fact.category,
-                        "source_span_ids": fact.source_span_ids,
-                    }
-                    for fact in existing_facts[-50:]
-                ],
-            },
-        )
+        try:
+            response = self.client.structured(
+                prompt=f"{self.prompt_version}\n\n{EXTRACTION_PROMPT}",
+                schema=EXTRACTION_SCHEMA,
+                input={
+                    "session_time": session_time.isoformat(),
+                    "spans": [
+                        {
+                            "span_id": span.span_id,
+                            "speaker": span.speaker,
+                            "span_type": span.span_type,
+                            "timestamp": span.timestamp.isoformat(),
+                            "content": span.content,
+                        }
+                        for span in spans
+                    ],
+                    "existing_facts": [
+                        {
+                            "fact_id": fact.fact_id,
+                            "text": fact.text,
+                            "category": fact.category,
+                            "source_span_ids": fact.source_span_ids,
+                        }
+                        for fact in existing_facts[-50:]
+                    ],
+                },
+            )
+        except Exception:
+            return _rule_fallback(spans, existing_facts, session_time)
         valid_span_ids = {span.span_id for span in spans}
         out: list[ExtractedCandidate] = []
         for fact in response.get("facts", []) or []:
@@ -82,6 +91,12 @@ class StructuredLLMExtractor:
             if not isinstance(relation, dict):
                 continue
             out.append(self._relation_candidate(relation))
+        if not any(candidate.candidate_type == "event" for candidate in out):
+            out.extend(
+                candidate
+                for candidate in _rule_fallback(spans, existing_facts, session_time)
+                if candidate.candidate_type == "event"
+            )
         return out
 
     def _fact_candidate(self, fact: dict[str, Any] | str, valid_span_ids: set[str]) -> ExtractedCandidate:
@@ -101,8 +116,8 @@ class StructuredLLMExtractor:
             "predicate": fact.get("predicate", "said"),
             "object": fact.get("object", fact.get("text", "")),
             "category": fact.get("category", "general_fact"),
-            "confidence": float(fact.get("confidence", 0.5)),
-            "salience": float(fact.get("salience", 0.5)),
+            "confidence": _float_field(fact.get("confidence"), 0.5),
+            "salience": _float_field(fact.get("salience"), 0.5),
         }
         return ExtractedCandidate(
             local_id=fact.get("local_id") or new_id("cand"),
@@ -125,7 +140,7 @@ class StructuredLLMExtractor:
             "time_end": event.get("time_end"),
             "time_granularity": event.get("time_granularity", "unknown"),
             "time_source": event.get("time_source", "unknown"),
-            "confidence": float(event.get("confidence", 0.5)),
+            "confidence": _float_field(event.get("confidence"), 0.5),
         }
         return ExtractedCandidate(
             local_id=event.get("local_id") or new_id("cand"),
@@ -139,7 +154,7 @@ class StructuredLLMExtractor:
         )
 
     def _relation_candidate(self, relation: dict[str, Any]) -> ExtractedCandidate:
-        confidence = float(relation.get("confidence", 0.5))
+        confidence = _float_field(relation.get("confidence"), 0.5)
         return ExtractedCandidate(
             local_id=relation.get("local_id") or new_id("cand"),
             candidate_type="relation",
@@ -159,3 +174,27 @@ class StructuredLLMExtractor:
     def _source_span_ids(self, item: dict[str, Any], valid_span_ids: set[str]) -> list[str]:
         source_span_ids = [span_id for span_id in item.get("source_span_ids", []) if span_id in valid_span_ids]
         return list(dict.fromkeys(source_span_ids))
+
+
+def _rule_fallback(spans: list[EvidenceSpan], existing_facts: list[MemoryFact], session_time: datetime) -> list[ExtractedCandidate]:
+    from fusion_memory.ingestion.extractors import RuleBasedExtractor
+
+    return RuleBasedExtractor().extract(spans, existing_facts, session_time)
+
+
+def _float_field(value: Any, default: float) -> float:
+    if isinstance(value, int | float):
+        return float(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"high", "strong"}:
+            return 0.85
+        if normalized in {"medium", "moderate"}:
+            return 0.60
+        if normalized in {"low", "weak"}:
+            return 0.35
+        try:
+            return float(normalized)
+        except ValueError:
+            return default
+    return default

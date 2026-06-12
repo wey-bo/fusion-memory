@@ -938,58 +938,50 @@ class PostgresViewProfileRepository:
         now = datetime.now(timezone.utc)
         source_span_ids = source_span_ids or []
         aliases = aliases or []
-        existing = self._fetch_all("select * from entities where entity_id = %s limit 1", [entity_id])
         cursor = self.connect().cursor()
         try:
-            if existing:
-                row = existing[0]
-                merged_sources = list(dict.fromkeys(_json_loads(row.get("source_span_ids"), []) + source_span_ids))
-                merged_aliases = list(dict.fromkeys(_json_loads(row.get("aliases"), []) + aliases))
-                observed_count = int(row.get("observed_count") or 0) + 1
-                cursor.execute(
-                    """
-                    update entities set
-                      aliases = %s::jsonb,
-                      source_span_ids = %s::jsonb,
-                      observed_count = %s,
-                      last_observed_at = %s,
-                      updated_at = %s
-                    where entity_id = %s
-                    """,
-                    (
-                        _json_dumps(merged_aliases),
-                        _json_dumps(merged_sources),
-                        observed_count,
-                        _dt_to_pg(observed_at or now),
-                        _dt_to_pg(now),
-                        entity_id,
-                    ),
-                )
-            else:
-                cursor.execute(
-                    """
-                    insert into entities
-                    (entity_id, workspace_id, user_id, agent_id, run_id, session_id, app_id, name, entity_type,
-                     aliases, source_span_ids, observed_count, last_observed_at, created_at, updated_at)
-                    values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, 1, %s, %s, %s)
-                    """,
-                    (
-                        entity_id,
-                        scope.workspace_id,
-                        scope.user_id,
-                        scope.agent_id,
-                        scope.run_id,
-                        scope.session_id,
-                        scope.app_id,
-                        normalized,
-                        entity_type,
-                        _json_dumps(aliases),
-                        _json_dumps(source_span_ids),
-                        _dt_to_pg(observed_at or now),
-                        _dt_to_pg(now),
-                        _dt_to_pg(now),
-                    ),
-                )
+            cursor.execute(
+                """
+                insert into entities
+                (entity_id, workspace_id, user_id, agent_id, run_id, session_id, app_id, name, entity_type,
+                 aliases, source_span_ids, observed_count, last_observed_at, created_at, updated_at)
+                values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, 1, %s, %s, %s)
+                on conflict (entity_id) do update set
+                  aliases = (
+                    select coalesce(jsonb_agg(value order by value), '[]'::jsonb)
+                    from (
+                      select distinct value
+                      from jsonb_array_elements_text(entities.aliases || excluded.aliases) as merged(value)
+                    ) as deduped
+                  ),
+                  source_span_ids = (
+                    select coalesce(jsonb_agg(value order by value), '[]'::jsonb)
+                    from (
+                      select distinct value
+                      from jsonb_array_elements_text(entities.source_span_ids || excluded.source_span_ids) as merged(value)
+                    ) as deduped
+                  ),
+                  observed_count = entities.observed_count + 1,
+                  last_observed_at = excluded.last_observed_at,
+                  updated_at = excluded.updated_at
+                """,
+                (
+                    entity_id,
+                    scope.workspace_id,
+                    scope.user_id,
+                    scope.agent_id,
+                    scope.run_id,
+                    scope.session_id,
+                    scope.app_id,
+                    normalized,
+                    entity_type,
+                    _json_dumps(aliases),
+                    _json_dumps(source_span_ids),
+                    _dt_to_pg(observed_at or now),
+                    _dt_to_pg(now),
+                    _dt_to_pg(now),
+                ),
+            )
             self.connect().commit()
         except Exception:
             self.connect().rollback()
