@@ -387,7 +387,7 @@ def service_status(home: str | Path | None = None) -> dict[str, Any]:
         "url": _base_url(config),
         "pid": pid,
         "home": str(paths.home),
-        "db": str(config["db"]),
+        "db": _redact_dsn(str(config["db"])),
         "log": str(config["log"]),
         "message": "running" if health["ok"] else "not running",
     }

@@ -45,6 +45,26 @@ class HermesFusionMemoryProviderTests(unittest.TestCase):
         self.assertIn("fusion-memory doctor", payload["message"])
         self.assertNotIn("socket timeout", payload["message"])
 
+    def test_invalid_timeout_uses_default(self) -> None:
+        module = load_provider_module()
+        with patch.dict("os.environ", {"FUSION_MEMORY_TIMEOUT_SECONDS": "not-a-number"}):
+            provider = module.FusionMemoryProvider()
+        self.assertEqual(provider.timeout_seconds, 1.5)
+
+    def test_timeout_is_clamped_to_safe_bounds(self) -> None:
+        module = load_provider_module()
+        with patch.dict("os.environ", {"FUSION_MEMORY_TIMEOUT_SECONDS": "0.05"}):
+            provider = module.FusionMemoryProvider()
+        self.assertEqual(provider.timeout_seconds, 0.1)
+
+        with patch.dict("os.environ", {"FUSION_MEMORY_TIMEOUT_SECONDS": "9"}):
+            provider = module.FusionMemoryProvider()
+        self.assertEqual(provider.timeout_seconds, 2.0)
+
+        with patch.dict("os.environ", {"FUSION_MEMORY_TIMEOUT_SECONDS": "-1"}):
+            provider = module.FusionMemoryProvider()
+        self.assertEqual(provider.timeout_seconds, 1.5)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -163,6 +163,22 @@ class ProductCliTests(unittest.TestCase):
         self.assertNotIn("Built-in lightweight embedding (recommended)", wizard_text)
         self.assertNotIn("Built-in lexical reranker (recommended)", wizard_text)
 
+    def test_status_redacts_postgres_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            init_home(
+                home,
+                settings={
+                    "db": "postgresql://fusion:secret@127.0.0.1:55433/fusion_memory",
+                    "storage_backend": "postgres",
+                },
+            )
+
+            status = service_status(home)
+
+        self.assertEqual(status["db"], "postgresql://***:***@127.0.0.1:55433/fusion_memory")
+        self.assertNotIn("fusion:secret", json.dumps(status))
+
     def test_start_status_and_stop_service(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)

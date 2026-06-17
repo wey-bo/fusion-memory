@@ -15,6 +15,8 @@ except Exception:
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8765"
 DEFAULT_TIMEOUT_SECONDS = 1.5
+MIN_TIMEOUT_SECONDS = 0.1
+MAX_TIMEOUT_SECONDS = 2.0
 
 
 class FusionMemoryProvider(MemoryProvider):
@@ -24,7 +26,7 @@ class FusionMemoryProvider(MemoryProvider):
 
     def __init__(self) -> None:
         self.base_url = os.getenv("FUSION_MEMORY_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
-        self.timeout_seconds = float(os.getenv("FUSION_MEMORY_TIMEOUT_SECONDS", str(DEFAULT_TIMEOUT_SECONDS)))
+        self.timeout_seconds = _timeout_seconds(os.getenv("FUSION_MEMORY_TIMEOUT_SECONDS"))
         self.scope: dict[str, Any] = {
             "agent_id": "hermes",
             "app_id": "fusion-memory",
@@ -209,3 +211,15 @@ def _safe_failure() -> Dict[str, Any]:
         "ok": False,
         "message": "Fusion Memory is not available. Continue without memory, then run fusion-memory doctor.",
     }
+
+
+def _timeout_seconds(value: str | None) -> float:
+    if value is None:
+        return DEFAULT_TIMEOUT_SECONDS
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_TIMEOUT_SECONDS
+    if parsed <= 0:
+        return DEFAULT_TIMEOUT_SECONDS
+    return min(MAX_TIMEOUT_SECONDS, max(MIN_TIMEOUT_SECONDS, parsed))
