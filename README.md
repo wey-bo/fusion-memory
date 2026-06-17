@@ -3,6 +3,8 @@
 Fusion Memory 是一个面向 Agent 的通用记忆系统本地 MVP。它基于：
 
 - 新手安装：[docs/quickstart.md](docs/quickstart.md)
+- Agent adapters: [docs/agent-adapters.md](docs/agent-adapters.md)
+- Error guide: [docs/errors.md](docs/errors.md)
 - [docs/fusion-memory-architecture.md](docs/fusion-memory-architecture.md)
 - [docs/fusion-memory-execution-plan.md](docs/fusion-memory-execution-plan.md)
 - [docs/requirements.md](docs/requirements.md)

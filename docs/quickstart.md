@@ -47,7 +47,19 @@ fusion-memory start
 fusion-memory status
 ```
 
-## 4. 接入 psi-agent
+## 4. 安装 Agent 适配
+
+```bash
+fusion-memory install-agent --target all
+```
+
+如果失败，运行：
+
+```bash
+fusion-memory doctor
+```
+
+## 5. 接入 psi-agent
 
 启动 memory 服务后，在 psi-agent 中设置：
 
@@ -57,7 +69,7 @@ export PSI_MEMORY_BASE_URL=http://127.0.0.1:8765
 
 然后给 `psi-agent session` 加上 `--memory-enabled`。
 
-## 5. 常见问题
+## 6. 常见问题
 
 - 启动失败：先运行 `fusion-memory doctor`
 - 端口被占用：修改本地配置文件里的端口
