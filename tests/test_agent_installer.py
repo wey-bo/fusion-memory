@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
-from fusion_memory.agent_installer import install_agent
+from fusion_memory.agent_installer import _action_for, install_agent
 
 
 class AgentInstallerTests(unittest.TestCase):
@@ -20,6 +23,45 @@ class AgentInstallerTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("Choose one of", result["message"])
         self.assertNotIn("Traceback", result["message"])
+
+    def test_openclaw_command_error_returns_beginner_safe_result(self) -> None:
+        with patch("fusion_memory.agent_installer.subprocess.run", side_effect=FileNotFoundError("openclaw missing")):
+            result = install_agent("openclaw")
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["results"][0]["ok"])
+        self.assertIn("OpenClaw", result["results"][0]["message"])
+        self.assertNotIn("Traceback", result["results"][0]["message"])
+        self.assertNotIn("openclaw missing", result["results"][0]["message"])
+
+    def test_hermes_copy_failure_preserves_existing_install(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            destination = home / "plugins" / "fusion_memory"
+            destination.mkdir(parents=True)
+            marker = destination / "existing.txt"
+            marker.write_text("keep", encoding="utf-8")
+
+            with patch("fusion_memory.agent_installer.shutil.copytree", side_effect=OSError("copy exploded")):
+                result = install_agent("hermes", home=home)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
+            self.assertTrue(destination.exists())
+            self.assertNotIn("copy exploded", result["results"][0]["message"])
+
+    def test_fusion_agent_root_uses_home_when_provided(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            action = _action_for("fusion-agent", home=home)
+
+        self.assertEqual(action["path"], str(home / "Fusion-Agent"))
+
+    def test_fusion_agent_root_uses_environment_when_home_not_provided(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict("os.environ", {"FUSION_AGENT_ROOT": tmp}):
+            action = _action_for("fusion-agent")
+
+        self.assertEqual(action["path"], tmp)
 
 
 if __name__ == "__main__":

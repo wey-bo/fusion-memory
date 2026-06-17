@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from fusion_memory.agent_installer import FUSION_AGENT_ROOT, HERMES_PROVIDER, OPENCLAW_PLUGIN, VALID_TARGETS
+from fusion_memory.agent_installer import OPENCLAW_PLUGIN, VALID_TARGETS, _action_for
 
 
 def check_agent(target: str, *, home: str | Path | None = None) -> dict[str, Any]:
@@ -14,18 +14,23 @@ def check_agent(target: str, *, home: str | Path | None = None) -> dict[str, Any
         return {
             "target": target,
             "ok": ok,
+            "path": str(OPENCLAW_PLUGIN),
             "message": "OpenClaw Fusion Memory plugin files are present." if ok else "OpenClaw plugin files are missing. Reinstall Fusion Memory.",
         }
     if target == "hermes":
-        ok = (HERMES_PROVIDER / "__init__.py").exists()
+        destination = Path(_action_for("hermes", home=home)["destination"])
+        ok = (destination / "__init__.py").exists()
         return {
             "target": target,
             "ok": ok,
-            "message": "Hermes Fusion Memory provider files are present." if ok else "Hermes provider files are missing. Reinstall Fusion Memory.",
+            "path": str(destination),
+            "message": "Hermes Fusion Memory provider is installed." if ok else "Hermes provider is not installed. Run fusion-memory install-agent --target hermes.",
         }
-    ok = FUSION_AGENT_ROOT.exists()
+    root = Path(_action_for("fusion-agent", home=home)["path"])
+    ok = root.exists()
     return {
         "target": target,
         "ok": ok,
+        "path": str(root),
         "message": "Fusion-Agent checkout is present. Start psi-agent session with --memory-enabled." if ok else "Fusion-Agent checkout was not found.",
     }
