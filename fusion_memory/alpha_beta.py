@@ -12,6 +12,20 @@ from fusion_memory.product import doctor
 
 
 def run_alpha(*, report_path: str | Path | None = None) -> dict[str, Any]:
+    try:
+        return _run_alpha(report_path=report_path)
+    except Exception:
+        return _safe_failure("alpha")
+
+
+def run_beta(*, report_path: str | Path | None = None) -> dict[str, Any]:
+    try:
+        return _run_beta(report_path=report_path)
+    except Exception:
+        return _safe_failure("beta")
+
+
+def _run_alpha(*, report_path: str | Path | None = None) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
     checks.append(_check("install_dry_run", install_agent("all", dry_run=True)["ok"], "all adapters planned"))
     checks.append(_check("doctor_shape", "checks" in doctor(), "doctor returns checks"))
@@ -32,11 +46,13 @@ def run_alpha(*, report_path: str | Path | None = None) -> dict[str, Any]:
     return result
 
 
-def run_beta(*, report_path: str | Path | None = None) -> dict[str, Any]:
+def _run_beta(*, report_path: str | Path | None = None) -> dict[str, Any]:
+    openclaw = check_agent("openclaw")
+    fusion_agent = check_agent("fusion-agent")
     checks = [
-        _check("openclaw_plugin_files", check_agent("openclaw")["ok"], check_agent("openclaw")["message"]),
+        _check("openclaw_plugin_files", openclaw["ok"], openclaw["message"]),
         _check("hermes_provider_files", (HERMES_PROVIDER / "__init__.py").exists(), "Hermes Fusion Memory provider files are present."),
-        _check("fusion_agent_checkout", check_agent("fusion-agent")["ok"], check_agent("fusion-agent")["message"]),
+        _check("fusion_agent_checkout", fusion_agent["ok"], fusion_agent["message"]),
         _check("cross_agent_scope_policy", True, "cross-Agent retrieval requires matching scope policy"),
         _check("upgrade_dry_run_required", True, "upgrade dry run is part of beta script"),
     ]
@@ -47,6 +63,16 @@ def run_beta(*, report_path: str | Path | None = None) -> dict[str, Any]:
 
 def _check(name: str, ok: bool, detail: str) -> dict[str, Any]:
     return {"name": name, "ok": ok, "detail": detail}
+
+
+def _safe_failure(kind: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "kind": kind,
+        "message": "Simulation could not complete. Run `fusion-memory doctor` and try again.",
+        "checks": [],
+        "generated_at": time.time(),
+    }
 
 
 def _write_report(report_path: str | Path | None, result: dict[str, Any]) -> None:
