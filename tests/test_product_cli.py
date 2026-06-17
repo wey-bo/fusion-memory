@@ -8,12 +8,14 @@ import socket
 from pathlib import Path
 from unittest.mock import patch
 
+import fusion_memory.product as product
 from fusion_memory.product import (
     backup_data,
     configure_interactive,
     doctor,
     init_home,
     load_config,
+    product_paths,
     service_status,
     start_service,
     stop_service,
@@ -30,10 +32,16 @@ class ProductCliTests(unittest.TestCase):
             self.assertTrue(init["ok"])
             self.assertTrue((home / "config.json").exists())
             config = load_config(home)
-            self.assertEqual(config["embedding"]["provider"], "deterministic")
-            self.assertEqual(config["reranker"]["provider"], "lexical")
+            self.assertEqual(config["storage_backend"], "postgres")
+            self.assertEqual(config["embedding"]["provider"], "qwen")
+            self.assertIn("Qwen3-Embedding-0.6B", config["embedding"]["model"])
+            self.assertEqual(config["reranker"]["provider"], "qwen")
+            self.assertIn("Qwen3-Reranker-0.6B", config["reranker"]["model"])
             self.assertEqual(config["extractor"]["provider"], "rule")
             self.assertEqual(config["query_intent"]["provider"], "off")
+            self.assertTrue(hasattr(product, "default_product_settings"))
+            defaults = product.default_product_settings(product_paths(home))
+            self.assertEqual(defaults["storage_backend"], "postgres")
 
             report = doctor(home)
             self.assertTrue(report["ok"])
@@ -93,7 +101,16 @@ class ProductCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             port = _free_port()
-            init_home(home, port=port)
+            init_home(
+                home,
+                port=port,
+                settings={
+                    "db": str(home / "fusion-memory.sqlite3"),
+                    "storage_backend": "sqlite",
+                    "embedding": {"provider": "deterministic"},
+                    "reranker": {"provider": "lexical"},
+                },
+            )
 
             started = start_service(home, wait_seconds=10)
             try:

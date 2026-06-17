@@ -20,9 +20,9 @@ cd C:\path\to\memory
 
 安装完成后会自动进入初始化向导，依次确认：
 
-- 数据库：默认 SQLite，本地单文件，适合 90% 本地使用；高级用户可选 Postgres/pgvector。
-- Embedding：默认内置轻量 embedding；高级用户可选本地 Qwen 或 API。
-- Reranker：默认内置 lexical reranker；高级用户可选本地 Qwen 或 API。
+- 数据库：默认 Postgres/pgvector，本地服务地址来自初始化配置；高级用户可显式选择 SQLite 测试模式。
+- Embedding：默认 Qwen3-Embedding-0.6B。
+- Reranker：默认 Qwen3-Reranker-0.6B。
 - Extractor/router：默认内置规则；高级用户可选 OpenAI-compatible API。
 - Query router：默认关闭；需要复杂查询路由时再开启 API。
 

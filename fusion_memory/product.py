@@ -19,6 +19,9 @@ APP_NAME = "Fusion Memory"
 CONFIG_VERSION = 1
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
+DEFAULT_POSTGRES_DSN = "postgresql://fusion:fusion@127.0.0.1:55433/fusion_memory"
+DEFAULT_QWEN_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
+DEFAULT_QWEN_RERANKER_MODEL = "Qwen/Qwen3-Reranker-0.6B"
 _STARTED_PROCESSES: dict[int, subprocess.Popen[Any]] = {}
 
 
@@ -185,11 +188,11 @@ def load_config(home: str | Path | None = None) -> dict[str, Any]:
     data = json.loads(paths.config.read_text(encoding="utf-8"))
     data.setdefault("host", DEFAULT_HOST)
     data.setdefault("port", DEFAULT_PORT)
-    data.setdefault("db", str(paths.db))
-    data.setdefault("storage_backend", "sqlite")
+    data.setdefault("db", DEFAULT_POSTGRES_DSN)
+    data.setdefault("storage_backend", "postgres")
     data.setdefault("log", str(paths.log))
-    data.setdefault("embedding", {"provider": "deterministic"})
-    data.setdefault("reranker", {"provider": "lexical"})
+    data.setdefault("embedding", {"provider": "qwen", "model": DEFAULT_QWEN_EMBEDDING_MODEL})
+    data.setdefault("reranker", {"provider": "qwen", "model": DEFAULT_QWEN_RERANKER_MODEL})
     data.setdefault("extractor", {"provider": "rule"})
     data.setdefault("query_intent", {"provider": "off"})
     return data
@@ -211,14 +214,16 @@ def doctor(home: str | Path | None = None) -> dict[str, Any]:
         checks.append(_check("home_writable", False, _friendly_os_error(exc)))
 
     config = load_config(home)
-    db_path = Path(str(config["db"])).expanduser()
-    try:
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        checks.append(_check("database_directory", True, str(db_path.parent)))
-    except OSError as exc:
-        checks.append(_check("database_directory", False, _friendly_os_error(exc)))
     if str(config.get("storage_backend")) == "postgres":
-        checks.append(_check("postgres_dsn", str(config.get("db", "")).startswith("postgres"), "configured" if str(config.get("db", "")).startswith("postgres") else "missing Postgres DSN"))
+        db = str(config.get("db", ""))
+        checks.append(_check("postgres_dsn", db.startswith("postgres"), _redact_dsn(db) if db.startswith("postgres") else "missing Postgres DSN"))
+    else:
+        db_path = Path(str(config["db"])).expanduser()
+        try:
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            checks.append(_check("database_directory", True, str(db_path.parent)))
+        except OSError as exc:
+            checks.append(_check("database_directory", False, _friendly_os_error(exc)))
 
     checks.extend(_model_checks(config))
 
@@ -455,18 +460,33 @@ def render_human(result: dict[str, Any]) -> str:
 
 
 def _default_config(paths: ProductPaths, *, host: str, port: int) -> dict[str, Any]:
-    return {
-        "version": CONFIG_VERSION,
+    return default_product_settings(paths) | {
         "host": host,
         "port": port,
-        "db": str(paths.db),
-        "storage_backend": "sqlite",
+    }
+
+
+def default_product_settings(paths: ProductPaths) -> dict[str, Any]:
+    return {
+        "version": CONFIG_VERSION,
+        "host": DEFAULT_HOST,
+        "port": DEFAULT_PORT,
+        "db": DEFAULT_POSTGRES_DSN,
+        "storage_backend": "postgres",
         "log": str(paths.log),
-        "embedding": {"provider": "deterministic"},
-        "reranker": {"provider": "lexical"},
+        "embedding": {"provider": "qwen", "model": DEFAULT_QWEN_EMBEDDING_MODEL},
+        "reranker": {"provider": "qwen", "model": DEFAULT_QWEN_RERANKER_MODEL},
         "extractor": {"provider": "rule"},
         "query_intent": {"provider": "off"},
     }
+
+
+def _redact_dsn(value: str) -> str:
+    if "@" not in value:
+        return value
+    prefix, suffix = value.rsplit("@", 1)
+    scheme = prefix.split("://", 1)[0] if "://" in prefix else "postgresql"
+    return f"{scheme}://***:***@{suffix}"
 
 
 def _configure_model(
@@ -620,7 +640,7 @@ def _model_checks(config: dict[str, Any]) -> list[dict[str, Any]]:
         if provider == "qwen":
             model = str(raw.get("model") or "")
             ok = bool(model)
-            if model and ("/" in model or "\\" in model):
+            if model and (model.startswith("~") or model.startswith("/") or ":\\" in model or model.startswith(".")):
                 ok = Path(model).expanduser().exists()
             checks.append(_check(label, ok, f"qwen model={model or 'missing'}"))
             continue
