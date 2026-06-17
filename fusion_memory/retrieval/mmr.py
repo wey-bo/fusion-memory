@@ -5,24 +5,33 @@ from fusion_memory.core.text import jaccard, tokenize
 
 
 def mmr(candidates: list[Candidate], limit: int, lambda_: float = 0.72) -> list[Candidate]:
-    remaining = list(candidates)
-    selected: list[Candidate] = []
-    while remaining and len(selected) < limit:
+    if limit <= 0 or not candidates:
+        return []
+    ranked = [
+        {
+            "candidate": candidate,
+            "relevance": candidate.scores.get("utility_score", candidate.scores.get("score", 0.0)),
+            "tokens": frozenset(tokenize(candidate.text)),
+            "source_span_ids": frozenset(candidate.source_span_ids),
+        }
+        for candidate in candidates
+    ]
+    selected: list[dict[str, object]] = []
+    while ranked and len(selected) < limit:
         best_index = 0
         best_value = float("-inf")
-        for index, candidate in enumerate(remaining):
-            relevance = candidate.scores.get("utility_score", candidate.scores.get("score", 0.0))
+        for index, candidate in enumerate(ranked):
+            relevance = float(candidate["relevance"])
             diversity_penalty = max((_similarity(candidate, chosen) for chosen in selected), default=0.0)
             value = lambda_ * relevance - (1 - lambda_) * diversity_penalty
             if value > best_value:
                 best_value = value
                 best_index = index
-        selected.append(remaining.pop(best_index))
-    return selected
+        selected.append(ranked.pop(best_index))
+    return [item["candidate"] for item in selected]
 
 
-def _similarity(a: Candidate, b: Candidate) -> float:
-    if set(a.source_span_ids) & set(b.source_span_ids):
+def _similarity(a: dict[str, object], b: dict[str, object]) -> float:
+    if a["source_span_ids"] & b["source_span_ids"]:
         return 1.0
-    return jaccard(set(tokenize(a.text)), set(tokenize(b.text)))
-
+    return jaccard(set(a["tokens"]), set(b["tokens"]))

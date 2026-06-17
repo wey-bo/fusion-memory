@@ -93,6 +93,16 @@ class OpenAICompatibleLLMClient:
             try:
                 self._throttle()
                 data = _post_json(self.endpoint, payload, api_key=self.api_key, timeout_seconds=self.timeout_seconds)
+                if _is_empty_chat_completion(data) and not payload.get("stream"):
+                    stream_payload = dict(payload)
+                    stream_payload["stream"] = True
+                    self._throttle()
+                    data = _post_json(
+                        self.endpoint,
+                        stream_payload,
+                        api_key=self.api_key,
+                        timeout_seconds=self.timeout_seconds,
+                    )
                 parsed = _extract_structured_response(data)
                 break
             except LLMEndpointError as exc:
@@ -270,16 +280,26 @@ def _extract_structured_response(data: dict[str, Any]) -> dict[str, Any]:
     choices = data.get("choices")
     if isinstance(choices, list) and choices:
         message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
-        content = message.get("content")
-        if isinstance(content, dict):
-            return content
-        if isinstance(content, str):
-            parsed = json.loads(content)
-            if isinstance(parsed, dict):
-                return parsed
+        for content in _message_content_candidates(message):
+            if isinstance(content, dict):
+                return content
+            if isinstance(content, str):
+                parsed = json.loads(content)
+                if isinstance(parsed, dict):
+                    return parsed
     if any(key in data for key in ["facts", "events", "relations", "answer", "matched"]):
         return data
     raise ValueError("LLM endpoint did not return a structured JSON object")
+
+
+def _message_content_candidates(message: dict[str, Any]) -> list[Any]:
+    candidates: list[Any] = [message.get("content")]
+    candidates.append(message.get("reasoning_content"))
+    provider_fields = message.get("provider_specific_fields")
+    if isinstance(provider_fields, dict):
+        candidates.append(provider_fields.get("reasoning_content"))
+        candidates.append(provider_fields.get("content"))
+    return [candidate for candidate in candidates if candidate is not None]
 
 
 def _is_empty_chat_completion(data: dict[str, Any]) -> bool:
@@ -292,6 +312,16 @@ def _is_empty_chat_completion(data: dict[str, Any]) -> bool:
 
 def _short_body(body: str, limit: int = 300) -> str:
     clean = " ".join(body.split())
-    clean = re.sub(r"sk-[A-Za-z0-9_-]{6,}", "sk-...", clean)
+    clean = sanitize_error_text(clean, limit=None)
+    return clean[:limit] + ("..." if len(clean) > limit else "")
+
+
+def sanitize_error_text(text: str, limit: int | None = 300) -> str:
+    clean = " ".join(str(text).split())
+    clean = re.sub(r"sk-[A-Za-z0-9_.-]{3,}", "sk-...", clean)
+    clean = re.sub(r"(api[_ -]?key\s*[=:]\s*)[A-Za-z0-9._~+/=-]{8,}", r"\1...", clean, flags=re.I)
+    clean = re.sub(r"(token\s*[=:]\s*)[A-Za-z0-9._~+/=-]{8,}", r"\1...", clean, flags=re.I)
     clean = re.sub(r"(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}", r"\1...", clean, flags=re.I)
+    if limit is None:
+        return clean
     return clean[:limit] + ("..." if len(clean) > limit else "")

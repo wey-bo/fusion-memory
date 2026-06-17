@@ -1,0 +1,115 @@
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+import unittest
+import socket
+from pathlib import Path
+from unittest.mock import patch
+
+from fusion_memory.product import (
+    backup_data,
+    configure_interactive,
+    doctor,
+    init_home,
+    load_config,
+    service_status,
+    start_service,
+    stop_service,
+    upgrade,
+    _service_env,
+)
+
+
+class ProductCliTests(unittest.TestCase):
+    def test_init_doctor_backup_and_upgrade_dry_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            init = init_home(home, port=0)
+            self.assertTrue(init["ok"])
+            self.assertTrue((home / "config.json").exists())
+            config = load_config(home)
+            self.assertEqual(config["embedding"]["provider"], "deterministic")
+            self.assertEqual(config["reranker"]["provider"], "lexical")
+            self.assertEqual(config["extractor"]["provider"], "rule")
+            self.assertEqual(config["query_intent"]["provider"], "off")
+
+            report = doctor(home)
+            self.assertTrue(report["ok"])
+            self.assertTrue(report["checks"])
+
+            (home / "fusion-memory.sqlite3").write_text("seed", encoding="utf-8")
+            backup = backup_data(home)
+            self.assertTrue(backup["ok"])
+            self.assertGreaterEqual(len(backup["files"]), 2)
+
+            plan = upgrade(home, dry_run=True)
+            self.assertTrue(plan["ok"])
+            self.assertTrue(plan["dry_run"])
+            self.assertIn("command", plan)
+
+    def test_interactive_configures_models_without_storing_secret(self) -> None:
+        answers = iter(
+            [
+                "",  # host
+                "18766",  # port
+                "",  # database sqlite
+                "",  # sqlite path
+                "http",  # embedding
+                "http://embed.example/v1/embeddings",
+                "embed-model",
+                "FUSION_MEMORY_MODEL_API_KEY",
+                "qwen",  # reranker
+                "/tmp/qwen-reranker",
+                "cpu",
+                "api",  # extractor
+                "http://llm.example/v1",
+                "extractor-model",
+                "FUSION_MEMORY_MODEL_API_KEY",
+                "",  # query router off
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp, patch("builtins.input", lambda _prompt="": next(answers)):
+            home = Path(tmp)
+            result = configure_interactive(home)
+            self.assertTrue(result["ok"])
+            raw = (home / "config.json").read_text(encoding="utf-8")
+            self.assertNotIn("secret-value", raw)
+            config = json.loads(raw)
+            self.assertEqual(config["embedding"]["provider"], "http")
+            self.assertEqual(config["reranker"]["provider"], "qwen")
+            self.assertEqual(config["extractor"]["provider"], "api")
+            self.assertEqual(config["query_intent"]["provider"], "off")
+
+            with patch.dict(os.environ, {"FUSION_MEMORY_MODEL_API_KEY": "secret-value"}):
+                env = _service_env(config)
+            self.assertEqual(env["FUSION_MEMORY_EMBEDDING_PROVIDER"], "http")
+            self.assertEqual(env["FUSION_MEMORY_EMBEDDING_API_KEY"], "secret-value")
+            self.assertEqual(env["FUSION_MEMORY_RERANKER_PROVIDER"], "qwen")
+            self.assertEqual(env["FUSION_MEMORY_EXTRACTOR_API_KEY"], "secret-value")
+
+    def test_start_status_and_stop_service(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            port = _free_port()
+            init_home(home, port=port)
+
+            started = start_service(home, wait_seconds=10)
+            try:
+                self.assertTrue(started["ok"], started)
+                status = service_status(home)
+                self.assertTrue(status["running"], status)
+            finally:
+                stopped = stop_service(home)
+                self.assertTrue(stopped["ok"], stopped)
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+if __name__ == "__main__":
+    unittest.main()

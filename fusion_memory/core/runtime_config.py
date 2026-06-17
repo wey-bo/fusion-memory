@@ -31,6 +31,9 @@ def memory_service_from_env(
         embedder=_build_embedder(),
         reranker=_build_reranker(),
         extractor=_build_extractor(),
+        query_intent_refiner=_build_query_intent_refiner(),
+        query_intent_refiner_min_confidence=_float_env("FUSION_MEMORY_QUERY_INTENT_MIN_CONFIDENCE", 0.70),
+        query_intent_refiner_mode=os.getenv("FUSION_MEMORY_QUERY_INTENT_MODE", "auto"),
     )
 
 
@@ -99,6 +102,25 @@ def _build_extractor() -> Any | None:
     return StructuredLLMExtractor(
         client,
         prompt_version=os.getenv("FUSION_MEMORY_EXTRACTOR_PROMPT_VERSION", "llm-extractor-v0"),
+    )
+
+
+def _build_query_intent_refiner() -> Any | None:
+    endpoint = _optional_env("FUSION_MEMORY_QUERY_INTENT_ENDPOINT") or _endpoint_from_base_url(
+        "FUSION_MEMORY_QUERY_INTENT_BASE_URL",
+        "chat/completions",
+    )
+    if not endpoint:
+        return None
+    return OpenAICompatibleLLMClient(
+        endpoint,
+        api_key=_optional_env("FUSION_MEMORY_QUERY_INTENT_API_KEY"),
+        model=os.getenv("FUSION_MEMORY_QUERY_INTENT_MODEL", "local-query-intent"),
+        timeout_seconds=_float_env("FUSION_MEMORY_QUERY_INTENT_TIMEOUT_SECONDS", 20.0),
+        retry_attempts=_int_env("FUSION_MEMORY_QUERY_INTENT_RETRY_ATTEMPTS", 3),
+        retry_backoff_seconds=_float_env("FUSION_MEMORY_QUERY_INTENT_RETRY_BACKOFF_SECONDS", 1.0),
+        retry_max_backoff_seconds=_float_env("FUSION_MEMORY_QUERY_INTENT_RETRY_MAX_BACKOFF_SECONDS", 30.0),
+        min_interval_seconds=_float_env("FUSION_MEMORY_QUERY_INTENT_MIN_INTERVAL_SECONDS", 0.0),
     )
 
 

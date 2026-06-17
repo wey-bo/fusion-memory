@@ -3,11 +3,24 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fusion_memory import MemoryService, Scope
 from fusion_memory.core.config import DEFAULT_CONFIG
 from fusion_memory.core.llm import OpenAICompatibleLLMClient
+from fusion_memory.product import (
+    backup_data,
+    configure_interactive,
+    doctor,
+    init_home,
+    render_human,
+    service_status,
+    start_service,
+    stop_service,
+    upgrade,
+)
 from fusion_memory.core.runtime_config import memory_service_from_env
 from fusion_memory.eval.beam_adapter import BEAM_SPLITS, BeamAdapter
 from fusion_memory.eval.model_adapters import OpenAICompatibleAnswerModel, OpenAICompatibleJudgeModel
@@ -24,6 +37,41 @@ def main() -> None:
     parser.add_argument("--run-id")
     parser.add_argument("--session-id")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    init_cmd = sub.add_parser("init", help="Set up the beginner-friendly local configuration")
+    init_cmd.add_argument("--home", default=None, help="Fusion Memory data directory")
+    init_cmd.add_argument("--host", default="127.0.0.1")
+    init_cmd.add_argument("--port", type=int, default=8765)
+    init_cmd.add_argument("--wizard", action="store_true", help="Ask for database and model configuration")
+    init_cmd.add_argument("--force", action="store_true", help="Overwrite existing local configuration")
+    init_cmd.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+
+    doctor_cmd = sub.add_parser("doctor", help="Check whether Fusion Memory is ready to run")
+    doctor_cmd.add_argument("--home", default=None, help="Fusion Memory data directory")
+    doctor_cmd.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+
+    start_cmd = sub.add_parser("start", help="Start the local Fusion Memory service")
+    start_cmd.add_argument("--home", default=None, help="Fusion Memory data directory")
+    start_cmd.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    start_cmd.add_argument("--wait-seconds", type=float, default=10.0)
+
+    stop_cmd = sub.add_parser("stop", help="Stop the local Fusion Memory service")
+    stop_cmd.add_argument("--home", default=None, help="Fusion Memory data directory")
+    stop_cmd.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+
+    status_cmd = sub.add_parser("status", help="Show local Fusion Memory service status")
+    status_cmd.add_argument("--home", default=None, help="Fusion Memory data directory")
+    status_cmd.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+
+    backup_cmd = sub.add_parser("backup", help="Back up local configuration and SQLite data")
+    backup_cmd.add_argument("--home", default=None, help="Fusion Memory data directory")
+    backup_cmd.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+
+    upgrade_cmd = sub.add_parser("upgrade", help="Back up data and upgrade Fusion Memory")
+    upgrade_cmd.add_argument("--home", default=None, help="Fusion Memory data directory")
+    upgrade_cmd.add_argument("--package", default=None, help="Package/path to upgrade from")
+    upgrade_cmd.add_argument("--dry-run", action="store_true")
+    upgrade_cmd.add_argument("--json", action="store_true", help="Print machine-readable JSON")
 
     add = sub.add_parser("add", help="Add a memory input")
     add.add_argument("content")
@@ -101,6 +149,36 @@ def main() -> None:
     pg_verify.add_argument("--skip-migrate", action="store_true", help="Skip migration and only run the service smoke")
 
     args = parser.parse_args()
+    if args.command == "init":
+        if args.wizard:
+            _print_product_result(
+                configure_interactive(args.home, host=args.host, port=args.port, force=args.force),
+                json_output=args.json,
+            )
+        else:
+            _print_product_result(
+                init_home(args.home, host=args.host, port=args.port, force=args.force),
+                json_output=args.json,
+            )
+        return
+    if args.command == "doctor":
+        _print_product_result(doctor(args.home), json_output=args.json)
+        return
+    if args.command == "start":
+        _print_product_result(start_service(args.home, wait_seconds=args.wait_seconds), json_output=args.json)
+        return
+    if args.command == "stop":
+        _print_product_result(stop_service(args.home), json_output=args.json)
+        return
+    if args.command == "status":
+        _print_product_result(service_status(args.home), json_output=args.json)
+        return
+    if args.command == "backup":
+        _print_product_result(backup_data(args.home), json_output=args.json)
+        return
+    if args.command == "upgrade":
+        _print_product_result(upgrade(args.home, package=args.package, dry_run=args.dry_run), json_output=args.json)
+        return
     if args.command == "migrate-postgres":
         runner = PostgresMigrationRunner(args.dsn)
         try:
@@ -198,7 +276,19 @@ def _jsonable(value):
     return value
 
 
+def _print_product_result(result: dict, *, json_output: bool = False) -> None:
+    if json_output:
+        print(json.dumps(_jsonable(result), ensure_ascii=False, indent=2))
+    else:
+        print(render_human(result))
+
+
 def _add_eval_model_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--model-config-file",
+        default=None,
+        help="Loose key/base_url/model_use config file for benchmark answer and judge models",
+    )
     parser.add_argument("--answer-endpoint", default=None, help="OpenAI-compatible chat/completions endpoint for benchmark answers")
     parser.add_argument("--answer-model", default=None, help="Model name sent to --answer-endpoint")
     parser.add_argument("--answer-api-key", default=None, help="Bearer token for --answer-endpoint")
@@ -207,45 +297,71 @@ def _add_eval_model_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--judge-api-key", default=None, help="Bearer token for --judge-endpoint")
     parser.add_argument("--model-api-key", default=None, help="Shared fallback Bearer token for answer/judge endpoints")
     parser.add_argument("--model-timeout-seconds", type=float, default=None, help="HTTP timeout for answer/judge model calls")
+    parser.add_argument(
+        "--use-llm-aggregation",
+        action="store_true",
+        default=None,
+        help="Use a strict LLM aggregation pass for multi-session count/list evidence before answering",
+    )
+    parser.add_argument(
+        "--llm-aggregation-min-confidence",
+        type=float,
+        default=None,
+        help="Minimum confidence accepted from the LLM aggregation pass",
+    )
 
 
 def _build_eval_models(args: argparse.Namespace):
     answer_model = None
     judge_model = None
+    file_config = _eval_model_config_from_file(getattr(args, "model_config_file", None))
     shared_endpoint = _env_endpoint("FUSION_MEMORY_EVAL_ENDPOINT", "FUSION_MEMORY_EVAL_BASE_URL")
     answer_endpoint = (
         getattr(args, "answer_endpoint", None)
         or _env_endpoint("FUSION_MEMORY_EVAL_ANSWER_ENDPOINT", "FUSION_MEMORY_EVAL_ANSWER_BASE_URL")
         or shared_endpoint
+        or file_config.get("endpoint")
     )
     judge_endpoint = (
         getattr(args, "judge_endpoint", None)
         or _env_endpoint("FUSION_MEMORY_EVAL_JUDGE_ENDPOINT", "FUSION_MEMORY_EVAL_JUDGE_BASE_URL")
         or shared_endpoint
+        or file_config.get("endpoint")
     )
-    shared_api_key = getattr(args, "model_api_key", None) or os.getenv("FUSION_MEMORY_EVAL_MODEL_API_KEY")
+    shared_api_key = getattr(args, "model_api_key", None) or os.getenv("FUSION_MEMORY_EVAL_MODEL_API_KEY") or file_config.get("api_key")
+    shared_model = os.getenv("FUSION_MEMORY_EVAL_MODEL") or file_config.get("model")
     timeout_seconds = getattr(args, "model_timeout_seconds", None) or _float_env("FUSION_MEMORY_EVAL_TIMEOUT_SECONDS", 30.0)
     retry_attempts = _int_env("FUSION_MEMORY_EVAL_RETRY_ATTEMPTS", 5)
     retry_backoff_seconds = _float_env("FUSION_MEMORY_EVAL_RETRY_BACKOFF_SECONDS", 2.0)
     retry_max_backoff_seconds = _float_env("FUSION_MEMORY_EVAL_RETRY_MAX_BACKOFF_SECONDS", 60.0)
     min_interval_seconds = _float_env("FUSION_MEMORY_EVAL_MIN_INTERVAL_SECONDS", 1.0)
+    use_llm_aggregation = _bool_arg_or_env(args, "use_llm_aggregation", "FUSION_MEMORY_EVAL_USE_LLM_AGGREGATION", False)
+    llm_aggregation_min_confidence = (
+        getattr(args, "llm_aggregation_min_confidence", None)
+        if getattr(args, "llm_aggregation_min_confidence", None) is not None
+        else _float_env("FUSION_MEMORY_EVAL_LLM_AGGREGATION_MIN_CONFIDENCE", 0.70)
+    )
     if answer_endpoint:
         answer_client = OpenAICompatibleLLMClient(
             answer_endpoint,
             api_key=getattr(args, "answer_api_key", None) or os.getenv("FUSION_MEMORY_EVAL_ANSWER_API_KEY") or shared_api_key,
-            model=getattr(args, "answer_model", None) or os.getenv("FUSION_MEMORY_EVAL_ANSWER_MODEL") or os.getenv("FUSION_MEMORY_EVAL_MODEL") or "eval-answer",
+            model=getattr(args, "answer_model", None) or os.getenv("FUSION_MEMORY_EVAL_ANSWER_MODEL") or shared_model or "eval-answer",
             timeout_seconds=timeout_seconds,
             retry_attempts=retry_attempts,
             retry_backoff_seconds=retry_backoff_seconds,
             retry_max_backoff_seconds=retry_max_backoff_seconds,
             min_interval_seconds=min_interval_seconds,
         )
-        answer_model = OpenAICompatibleAnswerModel(answer_client)
+        answer_model = OpenAICompatibleAnswerModel(
+            answer_client,
+            use_llm_aggregation=use_llm_aggregation,
+            llm_aggregation_min_confidence=llm_aggregation_min_confidence,
+        )
     if judge_endpoint:
         judge_client = OpenAICompatibleLLMClient(
             judge_endpoint,
             api_key=getattr(args, "judge_api_key", None) or os.getenv("FUSION_MEMORY_EVAL_JUDGE_API_KEY") or shared_api_key,
-            model=getattr(args, "judge_model", None) or os.getenv("FUSION_MEMORY_EVAL_JUDGE_MODEL") or os.getenv("FUSION_MEMORY_EVAL_MODEL") or "eval-judge",
+            model=getattr(args, "judge_model", None) or os.getenv("FUSION_MEMORY_EVAL_JUDGE_MODEL") or shared_model or "eval-judge",
             timeout_seconds=timeout_seconds,
             retry_attempts=retry_attempts,
             retry_backoff_seconds=retry_backoff_seconds,
@@ -254,6 +370,70 @@ def _build_eval_models(args: argparse.Namespace):
         )
         judge_model = OpenAICompatibleJudgeModel(judge_client)
     return answer_model, judge_model
+
+
+def _eval_model_config_from_file(path: str | None) -> dict[str, str]:
+    if not path:
+        return {}
+    values: dict[str, str] = {}
+    for raw_line in Path(path).read_text(encoding="utf-8").splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if "=" in line:
+            key, raw_value = line.split("=", 1)
+            key = _normalize_eval_config_key(key)
+            value = _strip_loose_quotes(raw_value.strip())
+            _store_eval_config_value(values, key, value)
+            continue
+        if ":" in line:
+            key, raw_value = line.split(":", 1)
+            key = _normalize_eval_config_key(key)
+            if key:
+                _store_eval_config_value(values, key, _strip_loose_quotes(raw_value.strip()))
+                continue
+        if "api_key" not in values:
+            values["api_key"] = _strip_loose_quotes(line)
+    return values
+
+
+def _normalize_eval_config_key(key: str) -> str:
+    return _strip_loose_quotes(key).strip().lower().replace("-", "_")
+
+
+def _store_eval_config_value(values: dict[str, str], key: str, value: str) -> None:
+    if key in {"base_url", "url"}:
+        values["endpoint"] = _endpoint_from_eval_base_url(value)
+    elif key in {"endpoint", "answer_endpoint", "judge_endpoint"}:
+        values["endpoint"] = _strip_loose_quotes(value)
+    elif key in {"api_key", "key", "token", "model_api_key", "openai_api_key"}:
+        values["api_key"] = value
+    elif key in {"model", "model_use", "model_name"}:
+        model = _first_model_name(value)
+        if model:
+            values["model"] = model
+
+
+def _strip_loose_quotes(value: str) -> str:
+    value = value.strip().strip(",")
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1].strip()
+    return value
+
+
+def _first_model_name(value: str) -> str | None:
+    value = _strip_loose_quotes(value)
+    # Local key files often document alternatives as "model_a or model_b".
+    value = re.split(r"\s+or\s+|[,/]", value, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+    value = re.sub(r"^gpt(?=\d)", "gpt-", value, flags=re.IGNORECASE)
+    return value or None
+
+
+def _endpoint_from_eval_base_url(base_url: str) -> str:
+    base_url = _strip_loose_quotes(base_url).rstrip("/")
+    if base_url.endswith("/chat/completions"):
+        return base_url
+    return f"{base_url}/chat/completions"
 
 
 def _env_endpoint(endpoint_name: str, base_url_name: str) -> str | None:
@@ -281,6 +461,16 @@ def _int_env(name: str, default: int) -> int:
     if value is None or value == "":
         return default
     return int(value)
+
+
+def _bool_arg_or_env(args: argparse.Namespace, arg_name: str, env_name: str, default: bool) -> bool:
+    value = getattr(args, arg_name, None)
+    if value is not None:
+        return bool(value)
+    raw = os.getenv(env_name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 if __name__ == "__main__":

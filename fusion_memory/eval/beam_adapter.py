@@ -67,9 +67,10 @@ class BeamAdapter(BenchmarkAdapter):
         return super().build_queries(dataset_path, split=effective_split)
 
     def answer_query(self, query: EvalQuery, budget: dict[str, Any] | None = None) -> EvalResult:
-        budget = {"mode": "benchmark", **(budget or {})}
+        budget = {"mode": "benchmark", "query_type_hint": query.category, **(budget or {})}
         started = perf_counter()
-        pack = self.service.answer_context(query.query, self.scope, budget=budget)
+        query_scope = self._beam_scope(query.id)
+        pack = self.service.answer_context(query.query, query_scope, budget=budget)
         latency_ms = (perf_counter() - started) * 1000
         model_call_mark = _model_call_count(self.answer_model, self.judge_model)
         answer_failed = False
@@ -105,6 +106,24 @@ class BeamAdapter(BenchmarkAdapter):
             judge_reason=judge_reason,
             answer_failed=answer_failed,
         )
+
+    def ingest_documents(self, documents: list[EvalDocument]) -> list[str]:
+        span_ids: list[str] = []
+        for doc in documents:
+            session_time = doc.timestamp or datetime.now(timezone.utc)
+            result = self.service.add(
+                {
+                    "role": doc.speaker,
+                    "content": doc.content,
+                    "turn_id": doc.id,
+                    "timestamp": session_time.isoformat(),
+                },
+                self._beam_scope(doc.id),
+                session_time,
+                {"source_uri": doc.id},
+            )
+            span_ids.extend(result.span_ids)
+        return span_ids
 
     def run_queries(self, queries: list[EvalQuery], budget: dict[str, Any] | None = None) -> list[EvalResult]:
         return [self.answer_query(query, budget=budget) for query in queries]
@@ -179,6 +198,17 @@ class BeamAdapter(BenchmarkAdapter):
         self.split = effective_split
         return effective_split
 
+    def _beam_scope(self, item_id: str) -> Scope:
+        session_id = _beam_session_id_from_id(item_id)
+        return Scope(
+            workspace_id=self.scope.workspace_id,
+            user_id=self.scope.user_id,
+            agent_id=self.scope.agent_id,
+            run_id=self.scope.run_id,
+            session_id=session_id or self.scope.session_id,
+            app_id=self.scope.app_id,
+        )
+
 
 def validate_beam_split(split: str) -> None:
     if split not in BEAM_SPLITS:
@@ -204,6 +234,13 @@ def _load_official_beam_dataset(dataset_path: str | Path, split: str) -> tuple[l
         documents.extend(_load_chat_documents(chat_dir, split))
         queries.extend(_load_chat_queries(chat_dir, split))
     return documents, queries
+
+
+def _beam_session_id_from_id(item_id: str | None) -> str | None:
+    if not item_id:
+        return None
+    match = re.match(r"^(beam:[^:]+:\d+):", str(item_id))
+    return match.group(1) if match else None
 
 
 def _chat_dirs(split_dir: Path) -> list[Path]:
@@ -353,10 +390,17 @@ def _answer_record(result: EvalResult) -> dict[str, Any]:
         "judge_reason": result.judge_reason,
         "judge_failed": _judge_failed(result.judge_reason),
         "answer_failed": result.answer_failed,
+        "source_span_quota_met": result.source_span_quota_met,
+        "coverage_insufficient": result.coverage_insufficient,
         "retrieved_source_span_ids": result.retrieved_source_span_ids,
         "evidence_pack": result.evidence_pack,
+        "evidence_matched_gold": result.evidence_matched_gold,
+        "answer_model": result.answer_model,
+        "judge_model": result.judge_model,
+        "mode": result.mode,
         "tokens_query": result.tokens_query,
         "retrieval_latency_ms": result.retrieval_latency_ms,
+        "llm_calls": result.llm_calls,
     }
 
 

@@ -1093,6 +1093,52 @@ class SQLiteMemoryStore:
         row = self.conn.execute(f"select trace_json from debug_traces where {where}", params).fetchone()
         return loads(row["trace_json"], None) if row else None
 
+    def clear_scope(self, scope: Scope, *, include_session: bool = False) -> dict[str, Any]:
+        where, params = self._scope_where(scope, include_session=include_session)
+        scoped_tables = [
+            "evidence_spans",
+            "memory_facts",
+            "events",
+            "current_views",
+            "entity_profiles",
+            "entities",
+            "encoding_decisions",
+            "debug_traces",
+            "audit_events",
+            "background_tasks",
+        ]
+        counts: dict[str, int] = {}
+        fact_ids = [row["fact_id"] for row in self.conn.execute(f"select fact_id from memory_facts where {where}", params).fetchall()]
+        event_ids = [row["event_id"] for row in self.conn.execute(f"select event_id from events where {where}", params).fetchall()]
+        span_ids = [row["span_id"] for row in self.conn.execute(f"select span_id from evidence_spans where {where}", params).fetchall()]
+        profile_ids = [row["profile_id"] for row in self.conn.execute(f"select profile_id from entity_profiles where {where}", params).fetchall()]
+
+        try:
+            if self.fts_enabled:
+                self._delete_fts_ids("fts_evidence", "span_id", span_ids)
+                self._delete_fts_ids("fts_facts", "fact_id", fact_ids)
+                self._delete_fts_ids("fts_events", "event_id", event_ids)
+                self._delete_fts_ids("fts_profiles", "profile_id", profile_ids)
+
+            counts["fact_relations"] = self._delete_by_related_ids(
+                "fact_relations",
+                ("from_fact_id", "to_fact_id"),
+                fact_ids,
+            )
+            counts["event_edges"] = self._delete_by_related_ids(
+                "event_edges",
+                ("from_event_id", "to_event_id"),
+                event_ids,
+            )
+            for table in scoped_tables:
+                cur = self.conn.execute(f"delete from {table} where {where}", params)
+                counts[table] = cur.rowcount if cur.rowcount >= 0 else 0
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        return {"deleted": counts, "include_session": include_session}
+
     def insert_audit_event(
         self,
         scope: Scope,
@@ -1294,6 +1340,23 @@ class SQLiteMemoryStore:
                 )
         except sqlite3.Error:
             self.fts_enabled = False
+
+    def _delete_fts_ids(self, table: str, id_column: str, object_ids: list[str]) -> None:
+        if not object_ids:
+            return
+        placeholders = ", ".join(["?"] * len(object_ids))
+        self.conn.execute(f"delete from {table} where {id_column} in ({placeholders})", object_ids)
+
+    def _delete_by_related_ids(self, table: str, id_columns: tuple[str, str], object_ids: list[str]) -> int:
+        if not object_ids:
+            return 0
+        placeholders = ", ".join(["?"] * len(object_ids))
+        first, second = id_columns
+        cur = self.conn.execute(
+            f"delete from {table} where {first} in ({placeholders}) or {second} in ({placeholders})",
+            [*object_ids, *object_ids],
+        )
+        return cur.rowcount if cur.rowcount >= 0 else 0
 
     def _fts_query(self, query: str) -> str:
         tokens = tokenize(query)

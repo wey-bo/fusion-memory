@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from datetime import datetime, timezone
 from typing import Any
@@ -212,7 +213,20 @@ class FakePostgresCursor:
         self.closed = True
 
     def _upsert(self, table: str, object_id: str, row: dict[str, Any]) -> None:
+        if table == "entities" and object_id in self.conn.tables[table]:
+            self._merge_entity_row(object_id, row)
+            return
         self.conn.tables[table][object_id] = row
+        self.rowcount = 1
+        self._set_results([])
+
+    def _merge_entity_row(self, object_id: str, row: dict[str, Any]) -> None:
+        existing = self.conn.tables["entities"][object_id]
+        existing["aliases"] = json.dumps(_merge_json_lists(existing["aliases"], row["aliases"]))
+        existing["source_span_ids"] = json.dumps(_merge_json_lists(existing["source_span_ids"], row["source_span_ids"]))
+        existing["observed_count"] = int(existing["observed_count"]) + 1
+        existing["last_observed_at"] = row["last_observed_at"]
+        existing["updated_at"] = row["updated_at"]
         self.rowcount = 1
         self._set_results([])
 
@@ -356,6 +370,15 @@ def _entity_row(params: list[Any]) -> dict[str, Any]:
         "created_at": params[12],
         "updated_at": params[13],
     }
+
+
+def _merge_json_lists(left: Any, right: Any) -> list[str]:
+    def values(raw: Any) -> list[str]:
+        if isinstance(raw, str):
+            return [str(item) for item in json.loads(raw)]
+        return [str(item) for item in (raw or [])]
+
+    return list(dict.fromkeys(values(left) + values(right)))
 
 
 def _encoding_row(params: list[Any]) -> dict[str, Any]:

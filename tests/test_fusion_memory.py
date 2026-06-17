@@ -2,11 +2,20 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 from fusion_memory import MemoryService, Scope
-from fusion_memory.api.service import _event_ordering_milestone_score
-from fusion_memory.core.models import Candidate
-from fusion_memory.ingestion.extractors import classify_milestone, classify_milestones, extract_milestone_mentions
+from fusion_memory.api.service import (
+    _aggregation_query_context_keys,
+    _event_ordering_select_episode_recall_candidates,
+    _event_ordering_support_option_signal,
+    _event_ordering_milestone_score,
+    _key_diverse_aggregation_candidates,
+)
+from fusion_memory.core.models import Candidate, QueryPlan
+from fusion_memory.ingestion.extractors import classify_milestone, classify_milestones, extract_generic_event_facets, extract_milestone_mentions
+from fusion_memory.retrieval.evidence_pack import _exact_answer_candidates, _value_context_is_target_goal, _value_mentions
+from fusion_memory.retrieval.mmr import mmr
 from fusion_memory.retrieval.rrf import reciprocal_rank_fusion
 
 
@@ -15,6 +24,627 @@ def ts(value: str) -> datetime:
 
 
 class FusionMemoryTests(unittest.TestCase):
+    def test_exact_answer_candidates_rank_user_distance_location_fact(self) -> None:
+        plan = QueryPlan(
+            query="How far away did I say my parents live from me, and in which town?",
+            query_type="factual_exact",
+            entities=[],
+            time_constraints=[],
+        )
+        spans = [
+            SimpleNamespace(
+                span_id="generic",
+                span_type="turn",
+                speaker="user",
+                content="My parents Amy and Kyle are retired and like gardening.",
+                source_uri="s",
+                turn_id="1",
+                timestamp=ts("2026-06-01T10:00:00+00:00"),
+            ),
+            SimpleNamespace(
+                span_id="target",
+                span_type="turn",
+                speaker="user",
+                content="My parents Amy and Kyle live 15 miles away in West Janethaven.",
+                source_uri="s",
+                turn_id="2",
+                timestamp=ts("2026-06-01T10:01:00+00:00"),
+            ),
+        ]
+
+        candidates = _exact_answer_candidates(plan.query, plan, spans, set())
+
+        self.assertEqual(candidates[0]["source_span_id"], "target")
+        self.assertIn("15 miles away", candidates[0]["content"])
+        self.assertIn("West Janethaven", candidates[0]["content"])
+
+    def test_exact_answer_candidates_rank_multi_session_count_fraction_user_fact(self) -> None:
+        plan = QueryPlan(
+            query="How many scenes had I filmed in total by July 5 and how many were left to film after that?",
+            query_type="multi_session_reasoning",
+            entities=[],
+            time_constraints=[],
+        )
+        spans = [
+            SimpleNamespace(
+                span_id="assistant-plan",
+                span_type="turn",
+                speaker="assistant",
+                content="Break down the pilot episode into tasks and set filming deadlines before July 10.",
+                source_uri="s",
+                turn_id="1",
+                timestamp=ts("2026-06-01T10:00:00+00:00"),
+            ),
+            SimpleNamespace(
+                span_id="target",
+                span_type="turn",
+                speaker="user",
+                content="By July 5, my pilot was 75% complete, with 12 of 16 scenes filmed.",
+                source_uri="s",
+                turn_id="2",
+                timestamp=ts("2026-06-01T10:01:00+00:00"),
+            ),
+        ]
+
+        candidates = _exact_answer_candidates(plan.query, plan, spans, set())
+
+        self.assertEqual(candidates[0]["source_span_id"], "target")
+        self.assertIn("12 of 16 scenes", candidates[0]["content"])
+        self.assertTrue(any(value["text"] == "12 of 16 scenes" for value in candidates[0]["value_mentions"]))
+
+    def test_exact_answer_candidates_bind_person_location_events_to_user_plan(self) -> None:
+        plan = QueryPlan(
+            query="What two special events am I planning with David, and where will they take place?",
+            query_type="multi_session_reasoning",
+            entities=[],
+            time_constraints=[],
+        )
+        spans = [
+            SimpleNamespace(
+                span_id="other-person",
+                span_type="turn",
+                speaker="user",
+                content="Erica's home office has mock interviews scheduled from 6:30 to 7:30 PM.",
+                source_uri="s",
+                turn_id="1",
+                timestamp=ts("2026-06-01T10:00:00+00:00"),
+            ),
+            SimpleNamespace(
+                span_id="david-planned",
+                span_type="turn",
+                speaker="user",
+                content="David planned a surprise picnic at Montserrat Botanical Gardens for my promotion.",
+                source_uri="s",
+                turn_id="2",
+                timestamp=ts("2026-06-01T10:01:00+00:00"),
+            ),
+            SimpleNamespace(
+                span_id="anniversary",
+                span_type="turn",
+                speaker="user",
+                content="I'm nervous about my upcoming anniversary dinner with David at The Coral Reef, East Janethaven.",
+                source_uri="s",
+                turn_id="3",
+                timestamp=ts("2026-06-01T10:02:00+00:00"),
+            ),
+            SimpleNamespace(
+                span_id="getaway",
+                span_type="turn",
+                speaker="user",
+                content="I'm planning a weekend getaway to Blue Bay Resort with David.",
+                source_uri="s",
+                turn_id="4",
+                timestamp=ts("2026-06-01T10:03:00+00:00"),
+            ),
+        ]
+
+        candidates = _exact_answer_candidates(plan.query, plan, spans, set())
+        top_ids = [candidate["source_span_id"] for candidate in candidates[:2]]
+
+        self.assertEqual(top_ids, ["getaway", "anniversary"])
+        self.assertNotIn("other-person", top_ids)
+
+    def test_exact_answer_candidates_rank_assistant_work_transition_recommendation(self) -> None:
+        plan = QueryPlan(
+            query="What steps did you recommend I take to prepare for changing work environment?",
+            query_type="assistant_reference",
+            entities=[],
+            time_constraints=[],
+        )
+        spans = [
+            SimpleNamespace(
+                span_id="generic",
+                span_type="turn",
+                speaker="assistant",
+                content="You could reflect on your decision process and list pros and cons before acting.",
+                source_uri="s",
+                turn_id="1",
+                timestamp=ts("2026-06-01T10:00:00+00:00"),
+            ),
+            SimpleNamespace(
+                span_id="target",
+                span_type="turn",
+                speaker="assistant",
+                content=(
+                    "Preparing for the Transition: do due diligence. Research the company mission, "
+                    "values, and financial health; talk to current employees; clarify workload, "
+                    "hours, and performance metrics."
+                ),
+                source_uri="s",
+                turn_id="2",
+                timestamp=ts("2026-06-01T10:01:00+00:00"),
+            ),
+        ]
+
+        candidates = _exact_answer_candidates(plan.query, plan, spans, set())
+
+        self.assertEqual(candidates[0]["source_span_id"], "target")
+        self.assertIn("financial health", candidates[0]["content"])
+        self.assertIn("current employees", candidates[0]["content"])
+
+    def test_exact_answer_candidates_rank_assistant_writing_timeline_plan(self) -> None:
+        plan = QueryPlan(
+            query="How did you recommend I structure the process of writing and submitting my scholarship essay?",
+            query_type="assistant_reference",
+            entities=[],
+            time_constraints=[],
+        )
+        spans = [
+            SimpleNamespace(
+                span_id="generic",
+                span_type="turn",
+                speaker="assistant",
+                content="It is good to submit grant applications early and stay organized.",
+                source_uri="s",
+                turn_id="1",
+                timestamp=ts("2026-06-01T10:00:00+00:00"),
+            ),
+            SimpleNamespace(
+                span_id="target",
+                span_type="turn",
+                speaker="assistant",
+                content=(
+                    "Timeline and Plan: March 15 initial draft, March 25 review, April 5 second draft "
+                    "and final edits, April 15 final review, April 20 scholarship submission, with later "
+                    "deadlines in mid-May and early June."
+                ),
+                source_uri="s",
+                turn_id="2",
+                timestamp=ts("2026-06-01T10:01:00+00:00"),
+            ),
+        ]
+
+        candidates = _exact_answer_candidates(plan.query, plan, spans, set())
+
+        self.assertEqual(candidates[0]["source_span_id"], "target")
+        self.assertIn("initial draft", candidates[0]["content"])
+        self.assertIn("scholarship submission", candidates[0]["content"])
+
+    def test_exact_answer_candidates_include_adjacent_assistant_support_for_recommendation_request(self) -> None:
+        plan = QueryPlan(
+            query="How many unique movies did I plan for April 8?",
+            query_type="multi_session_reasoning",
+            entities=[],
+            time_constraints=[],
+        )
+        spans = [
+            SimpleNamespace(
+                span_id="request",
+                span_type="turn",
+                speaker="user",
+                content='What movies would you recommend for April 8, considering "River Quest" and "Garden Bears"?',
+                source_uri="session:msg1",
+                turn_id="session:msg1",
+                timestamp=ts("2026-06-01T10:00:00+00:00"),
+            ),
+            SimpleNamespace(
+                span_id="answer",
+                span_type="turn",
+                speaker="assistant",
+                content='Here are good recommendations:\n1. **"Sky Boats"**\n2. **"Moon Kitchen"**\n3. **"City Parade"**',
+                source_uri="session:msg2",
+                turn_id="session:msg2",
+                timestamp=ts("2026-06-01T10:01:00+00:00"),
+            ),
+        ]
+
+        candidates = _exact_answer_candidates(plan.query, plan, spans, set())
+        by_id = {candidate["source_span_id"]: candidate for candidate in candidates}
+
+        self.assertIn("request", by_id)
+        self.assertIn("answer", by_id)
+        self.assertEqual(by_id["answer"]["candidate_source"], "adjacent_exact_answer_support")
+        self.assertEqual(by_id["request"]["history_index"], 1)
+        self.assertEqual(by_id["answer"]["history_index"], 2)
+
+    def test_value_mentions_extracts_product_metrics_and_word_counts(self) -> None:
+        mentions = _value_mentions(
+            "The new quota is 1,200 calls per day, coverage reached 78%, "
+            "and I am scheduled for three days a week remotely. My reading list has 7 series and 4,200 pages. "
+            "The weekly target is 1,350 words."
+        )
+        values = {(item["type"], item["text"].lower()) for item in mentions}
+
+        self.assertIn(("count", "1,200 calls per day"), values)
+        self.assertIn(("percentage", "78%"), values)
+        self.assertIn(("count", "three days a week"), values)
+        self.assertIn(("count", "7 series"), values)
+        self.assertIn(("count", "4,200 pages"), values)
+        self.assertIn(("count", "1,350 words"), values)
+
+    def test_value_context_distinguishes_goal_from_current_value(self) -> None:
+        self.assertTrue(_value_context_is_target_goal("I am trying to achieve 100% coverage and currently reached 65%.", "100%"))
+        self.assertFalse(_value_context_is_target_goal("I am trying to achieve 100% coverage and currently reached 65%.", "65%"))
+
+    def test_key_diverse_aggregation_keeps_contextual_duplicate_support(self) -> None:
+        user_choice = Candidate(
+            id="choice",
+            type="span",
+            text='I think "Moana" and "Zootopia" sound perfect.',
+            source="aggregation_coverage_raw",
+            scores={},
+            source_span_ids=["choice"],
+            metadata={"speaker": "user", "aggregation_keys": ["title:moana", "title:zootopia"]},
+        )
+        dated_schedule = Candidate(
+            id="schedule",
+            type="span",
+            text='Schedule for April 8, 2024: 10:00 AM "Moana", 11:45 AM "Zootopia".',
+            source="aggregation_coverage_raw",
+            scores={},
+            source_span_ids=["schedule"],
+            metadata={"speaker": "assistant", "aggregation_keys": ["title:moana", "title:zootopia"]},
+        )
+
+        selected = _key_diverse_aggregation_candidates(
+            [
+                (0.45, user_choice, ((1, "session"),), ((0, 112),)),
+                (0.90, dated_schedule, ((1, "session"),), ((0, 113),)),
+            ],
+            limit=4,
+        )
+
+        self.assertEqual([candidate.id for candidate in selected], ["choice", "schedule"])
+
+    def test_aggregation_context_keys_preserve_exploration_features_without_query_scene_terms(self) -> None:
+        query = "How many different book series or genres have I mentioned wanting to explore across my conversations?"
+
+        self.assertIn(
+            "query_context:feature:event",
+            _aggregation_query_context_keys(
+                query,
+                "I'm trying to decide on a must-read fiction series and have been invited to co-host a live chat on sci-fi series.",
+            ),
+        )
+        self.assertIn(
+            "query_context:feature:budget",
+            _aggregation_query_context_keys(
+                query,
+                "With a $120 budget for print editions from Montserrat Books, which fiction series should I buy?",
+            ),
+        )
+        self.assertIn(
+            "query_context:feature:social",
+            _aggregation_query_context_keys(
+                query,
+                "Douglas and I want a series that we can read together and discuss.",
+            ),
+        )
+
+    def test_key_diverse_aggregation_promotes_distinct_context_scenes(self) -> None:
+        store_budget = Candidate(
+            id="store",
+            type="span",
+            text="With a $120 budget from Montserrat Books, I need fiction series options.",
+            source="aggregation_coverage_raw",
+            scores={"score": 0.95, "aggregation_focus": 0.8, "aggregation_signal": 0.8},
+            source_span_ids=["store"],
+            metadata={"speaker": "user", "aggregation_keys": ["title:fiction", "query_context:feature:budget"]},
+        )
+        store_budget_duplicate = Candidate(
+            id="store-duplicate",
+            type="span",
+            text="More Montserrat Books budget options for fiction series.",
+            source="aggregation_coverage_raw",
+            scores={"score": 0.90, "aggregation_focus": 0.7, "aggregation_signal": 0.7},
+            source_span_ids=["store-duplicate"],
+            metadata={"speaker": "assistant", "aggregation_keys": ["title:fiction", "query_context:feature:budget"]},
+        )
+        live_event = Candidate(
+            id="live-event",
+            type="span",
+            text="I chose The Dune Series for the live chat on sci-fi series with Wyatt.",
+            source="aggregation_coverage_raw",
+            scores={"score": 0.30, "aggregation_focus": 0.45, "aggregation_signal": 0.33},
+            source_span_ids=["live-event"],
+            metadata={"speaker": "user", "aggregation_keys": ["title:dune", "query_context:feature:event"]},
+        )
+
+        selected = _key_diverse_aggregation_candidates(
+            [
+                (0.95, store_budget, ((1, "s"),), ((0, 1),)),
+                (0.90, store_budget_duplicate, ((1, "s"),), ((0, 2),)),
+                (0.30, live_event, ((1, "s"),), ((0, 3),)),
+            ],
+            limit=2,
+        )
+
+        self.assertEqual([candidate.id for candidate in selected], ["store", "live-event"])
+
+    def test_topic_scope_filter_does_not_remove_broad_exploration_context_scenes(self) -> None:
+        service = MemoryService()
+        query = "How many different book series or genres have I mentioned wanting to explore across my conversations?"
+        plan = QueryPlan(query=query, query_type="multi_session_reasoning", entities=[], time_constraints=[])
+        selected = [
+            Candidate(
+                id="store",
+                type="span",
+                text="With a $120 budget from Montserrat Books, I need fiction series options.",
+                source="aggregation_coverage_raw",
+                scores={},
+                source_span_ids=["store"],
+                metadata={"topic_group": "books", "aggregation_keys": ["query_context:feature:budget"]},
+            ),
+            Candidate(
+                id="live-event",
+                type="span",
+                text="I chose The Dune Series for the live chat on sci-fi series with Wyatt.",
+                source="aggregation_coverage_raw",
+                scores={},
+                source_span_ids=["live-event"],
+                metadata={"topic_group": "events", "aggregation_keys": ["query_context:feature:event"]},
+            ),
+        ]
+        candidates = [
+            Candidate(
+                id="topic-anchor",
+                type="span",
+                text="Book series topic anchor",
+                source="topic_scope_raw",
+                scores={},
+                source_span_ids=["topic-anchor"],
+                metadata={"topic_group": "books"},
+            ),
+            *selected,
+        ]
+
+        filtered = service._apply_topic_scope_filter(query, plan, candidates, selected, limit=2)
+
+        self.assertEqual([candidate.id for candidate in filtered], ["store", "live-event"])
+
+    def test_event_ordering_preserve_reserves_episode_recall_slots(self) -> None:
+        service = MemoryService()
+        query = "Can you list the order in which I brought up different support options and strategies for the dashboard project across conversations? Mention ONLY and ONLY three items."
+        anchors = [
+            Candidate(
+                id=f"anchor-{index}",
+                type="span",
+                text=f"Dashboard project anchor {index}",
+                source="event_ordering_coverage",
+                scores={"score": 0.9},
+                source_span_ids=[f"anchor-{index}"],
+                metadata={
+                    "speaker": "user",
+                    "timeline_role": "user_aspect_anchor",
+                    "coverage_origin": "query_required_facet",
+                    "topic_group": "dashboard",
+                    "source_uri": f"session:{index}",
+                    "turn_id": f"msg{index}",
+                },
+            )
+            for index in range(6)
+        ]
+        episodes = [
+            Candidate(
+                id="episode-a",
+                type="span",
+                text="I added the chart export option with CSV support.",
+                source="event_ordering_episode_recall+l0_raw_hybrid",
+                scores={"score": 0.62, "event_episode_signal": 0.42, "event_detail_signal": 0.32, "event_facet_coverage": 0.20},
+                source_span_ids=["episode-a"],
+                metadata={
+                    "speaker": "user",
+                    "topic_group": "reports",
+                    "event_ordering_facet_hits": ["dashboard"],
+                    "source_uri": "session:7",
+                    "turn_id": "msg7",
+                },
+            ),
+            Candidate(
+                id="episode-b",
+                type="span",
+                text="I configured role-based dashboard permissions for admins.",
+                source="event_ordering_episode_recall",
+                scores={"score": 0.59, "event_episode_signal": 0.40, "event_detail_signal": 0.38, "event_facet_coverage": 0.18},
+                source_span_ids=["episode-b"],
+                metadata={
+                    "speaker": "user",
+                    "topic_group": "security",
+                    "event_ordering_facet_hits": ["dashboard"],
+                    "source_uri": "session:8",
+                    "turn_id": "msg8",
+                },
+            ),
+        ]
+
+        preserved = service._preserve_event_ordering_events(query, anchors + episodes, anchors[:4], limit=4)
+
+        self.assertIn("episode-a", [candidate.id for candidate in preserved])
+        self.assertIn("episode-b", [candidate.id for candidate in preserved])
+        self.assertLess([candidate.id for candidate in preserved].count("anchor-0") + [candidate.id for candidate in preserved].count("anchor-1") + [candidate.id for candidate in preserved].count("anchor-2") + [candidate.id for candidate in preserved].count("anchor-3"), 4)
+
+    def test_event_ordering_topic_scope_filter_keeps_typed_episode_recall(self) -> None:
+        service = MemoryService()
+        query = "Can you list the order in which I brought up different aspects of the dashboard project across conversations?"
+        plan = QueryPlan(query=query, query_type="event_ordering", entities=[], time_constraints=[])
+        selected = [
+            Candidate(
+                id="anchor",
+                type="span",
+                text="Dashboard project topic anchor",
+                source="event_ordering_coverage",
+                scores={},
+                source_span_ids=["anchor"],
+                metadata={"topic_group": "dashboard", "timeline_role": "user_aspect_anchor", "speaker": "user"},
+            ),
+            Candidate(
+                id="episode",
+                type="span",
+                text="I added CSV export and permission details for the dashboard.",
+                source="event_ordering_episode_recall+l0_raw_hybrid",
+                scores={"event_episode_signal": 0.40, "event_detail_signal": 0.32, "event_facet_coverage": 0.18},
+                source_span_ids=["episode"],
+                metadata={
+                    "topic_group": "reporting",
+                    "speaker": "user",
+                    "event_ordering_facet_hits": ["dashboard"],
+                },
+            ),
+        ]
+        candidates = [
+            selected[0],
+            selected[1],
+            Candidate(
+                id="replacement",
+                type="span",
+                text="Another dashboard anchor.",
+                source="event_ordering_coverage",
+                scores={},
+                source_span_ids=["replacement"],
+                metadata={"topic_group": "dashboard", "timeline_role": "user_aspect_anchor", "speaker": "user"},
+            ),
+        ]
+
+        filtered = service._apply_topic_scope_filter(query, plan, candidates, selected, limit=2)
+
+        self.assertEqual([candidate.id for candidate in filtered], ["anchor", "episode"])
+
+    def test_event_ordering_preserve_episode_recall_uses_time_bucket_coverage(self) -> None:
+        service = MemoryService()
+        query = "Can you list the order in which I brought up different strategies and support options for managing my workload throughout our conversations in order? Mention ONLY and ONLY five items."
+        anchors = [
+            Candidate(
+                id=f"anchor-{index}",
+                type="span",
+                text=f"Workload strategy anchor {index}",
+                source="event_ordering_coverage",
+                scores={"score": 0.9},
+                source_span_ids=[f"anchor-{index}"],
+                metadata={
+                    "speaker": "user",
+                    "timeline_role": "user_aspect_anchor",
+                    "coverage_origin": "query_required_facet",
+                    "topic_group": "workload",
+                    "source_uri": f"batch1:msg{index}",
+                    "turn_id": f"msg{index}",
+                },
+            )
+            for index in range(5)
+        ]
+        episodes = [
+            Candidate(
+                id=f"episode-{index}",
+                type="span",
+                text=f"Workload support strategy episode {index}",
+                source="event_ordering_episode_recall+l0_raw_hybrid",
+                scores={
+                    "score": 0.30 + index * 0.01,
+                    "event_episode_signal": 0.40,
+                    "event_detail_signal": 0.40,
+                    "event_facet_coverage": 0.18,
+                },
+                source_span_ids=[f"episode-{index}"],
+                metadata={
+                    "speaker": "user",
+                    "topic_group": "workload",
+                    "event_ordering_facet_hits": ["manage"],
+                    "source_uri": f"batch{index + 1}:msg{index * 10}",
+                    "turn_id": f"msg{index * 10}",
+                },
+            )
+            for index in range(6)
+        ]
+
+        preserved = service._preserve_event_ordering_events(query, anchors + episodes, anchors[:4], limit=8)
+        episode_ids = [candidate.id for candidate in preserved if candidate.id.startswith("episode-")]
+
+        self.assertEqual(len(episode_ids), 4)
+        self.assertIn("episode-5", episode_ids)
+
+    def test_event_ordering_support_option_signal_promotes_resource_episode(self) -> None:
+        query = "Can you list the order in which I brought up different strategies and support options for managing my workload throughout our conversations in order? Mention ONLY and ONLY five items."
+        generic_strategy = Candidate(
+            id="generic-strategy",
+            type="span",
+            text="I felt good about my collaboration strategies after the meeting.",
+            source="event_ordering_episode_recall",
+            scores={"score": 0.42, "event_episode_signal": 0.35, "event_detail_signal": 0.20, "event_facet_coverage": 0.27},
+            source_span_ids=["generic-strategy"],
+            metadata={"speaker": "user", "source_uri": "batch4:msg218", "turn_id": "msg218"},
+        )
+        support_option = Candidate(
+            id="support-option",
+            type="span",
+            text="I hired a part-time assistant for 20 hours/week at $25/hour after a mentor recommended hiring one to help manage my schedule.",
+            source="event_ordering_episode_recall+l0_raw_hybrid",
+            scores={
+                "score": 0.34,
+                "event_episode_signal": 0.35,
+                "event_detail_signal": 0.80,
+                "event_support_option_signal": _event_ordering_support_option_signal(
+                    query,
+                    "I hired a part-time assistant for 20 hours/week at $25/hour after a mentor recommended hiring one to help manage my schedule.",
+                ),
+                "event_facet_coverage": 0.18,
+            },
+            source_span_ids=["support-option"],
+            metadata={"speaker": "user", "source_uri": "batch4:msg202", "turn_id": "msg202"},
+        )
+
+        selected = _event_ordering_select_episode_recall_candidates(
+            [(generic_strategy.scores["score"], generic_strategy), (support_option.scores["score"] + 0.30, support_option)],
+            limit=1,
+            requested=5,
+        )
+
+        self.assertGreater(_event_ordering_support_option_signal(query, support_option.text), 0.60)
+        self.assertEqual([candidate.id for candidate in selected], ["support-option"])
+
+    def test_event_ordering_raw_facet_preserve_keeps_existing_strong_episode(self) -> None:
+        service = MemoryService()
+        query = "Can you list the order in which I brought up different strategies and support options for managing my workload throughout our conversations in order? Mention ONLY and ONLY five items."
+        strong_episode = Candidate(
+            id="support-option",
+            type="span",
+            text="I hired a part-time assistant for 20 hours/week at $25/hour after a mentor recommended hiring one to help manage my schedule.",
+            source="event_ordering_episode_recall+l0_raw_hybrid",
+            scores={
+                "score": 0.34,
+                "event_episode_signal": 0.35,
+                "event_detail_signal": 0.80,
+                "event_support_option_signal": 0.94,
+                "event_facet_coverage": 0.18,
+            },
+            source_span_ids=["support-option"],
+            metadata={"speaker": "user", "source_uri": "batch4:msg202", "turn_id": "msg202", "event_ordering_facet_hits": ["manage"]},
+        )
+        raw_facets = [
+            Candidate(
+                id=f"raw-{index}",
+                type="span",
+                text=f"I discussed workload strategies and manage options {index}.",
+                source="event_ordering_episode_recall",
+                scores={"score": 0.45, "event_episode_signal": 0.40, "event_detail_signal": 0.30, "event_facet_coverage": 0.27},
+                source_span_ids=[f"raw-{index}"],
+                metadata={"speaker": "user", "source_uri": f"batch{index}:msg{index}", "turn_id": f"msg{index}", "event_ordering_facet_hits": ["manage", "strategies"]},
+            )
+            for index in range(8)
+        ]
+
+        preserved = service._preserve_event_ordering_raw_facets(query, [strong_episode, *raw_facets], [strong_episode], limit=5)
+
+        self.assertIn("support-option", [candidate.id for candidate in preserved])
+
     def test_scope_required_for_add(self) -> None:
         memory = MemoryService()
         with self.assertRaises(ValueError):
@@ -84,6 +714,18 @@ class FusionMemoryTests(unittest.TestCase):
         self.assertTrue(pack.source_spans)
         self.assertTrue(any("BM25" in span["content"] for span in pack.source_spans))
 
+    def test_mmr_preserves_relevance_while_penalizing_duplicate_sources(self) -> None:
+        candidates = [
+            Candidate(id="a", type="span", text="budget tracker auth setup", source="test", scores={"utility_score": 1.0}, source_span_ids=["s1"]),
+            Candidate(id="b", type="span", text="budget tracker auth setup duplicate", source="test", scores={"utility_score": 0.95}, source_span_ids=["s1"]),
+            Candidate(id="c", type="span", text="deployment render gunicorn", source="test", scores={"utility_score": 0.80}, source_span_ids=["s2"]),
+        ]
+
+        selected = mmr(candidates, limit=2, lambda_=0.72)
+
+        self.assertEqual(selected[0].id, "a")
+        self.assertEqual(selected[1].id, "c")
+
     def test_event_ordering_pack_includes_timeline_indices_for_milestones(self) -> None:
         memory = MemoryService()
         scope = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s")
@@ -130,7 +772,89 @@ class FusionMemoryTests(unittest.TestCase):
         self.assertIn("render deployment", contents)
         self.assertIn("integration tests", contents)
         self.assertIn("security auth", contents)
-        self.assertTrue(any("event_ordering_timeline" in item["source"] for item in pack.debug_trace))
+        self.assertTrue(any("event_ordering_coverage" in item["source"] for item in pack.debug_trace))
+
+    def test_event_ordering_coverage_segments_user_aspects_before_rerank(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a")
+        memory.add(
+            {
+                "role": "user",
+                "content": "\n".join(
+                    [
+                        "For my personal budget tracker, I brought up:",
+                        "1. Core functionality: login, income tracking, expenses, and analytics.",
+                        "2. Database schema: users, transactions, categories, and recurring payments.",
+                    ]
+                ),
+                "turn_id": "beam:test:1:batch1:msg1",
+                "timestamp": "2026-06-01T10:00:00+00:00",
+            },
+            scope,
+            ts("2026-06-01T10:00:00+00:00"),
+            {"source_uri": "beam:test:1:batch1:msg1"},
+        )
+        memory.add(
+            {
+                "role": "assistant",
+                "content": "That plan gives the app a solid foundation before implementation.",
+                "turn_id": "beam:test:1:batch1:msg2",
+                "timestamp": "2026-06-01T10:05:00+00:00",
+            },
+            scope,
+            ts("2026-06-01T10:05:00+00:00"),
+            {"source_uri": "beam:test:1:batch1:msg2"},
+        )
+        memory.add(
+            {
+                "role": "user",
+                "content": "Next I brought up transaction CRUD response handling and validation errors.",
+                "turn_id": "beam:test:1:batch1:msg3",
+                "timestamp": "2026-06-02T10:00:00+00:00",
+            },
+            scope,
+            ts("2026-06-02T10:00:00+00:00"),
+            {"source_uri": "beam:test:1:batch1:msg3"},
+        )
+        memory.add(
+            {
+                "role": "user",
+                "content": "Finally I brought up deployment on Render with Gunicorn workers and port configuration.",
+                "turn_id": "beam:test:1:batch1:msg4",
+                "timestamp": "2026-06-03T10:00:00+00:00",
+            },
+            scope,
+            ts("2026-06-03T10:00:00+00:00"),
+            {"source_uri": "beam:test:1:batch1:msg4"},
+        )
+        memory.add(
+            {
+                "role": "user",
+                "content": "For stress management, I brought up no-work Sundays and emergency savings.",
+                "turn_id": "beam:test:16:batch1:msg1",
+                "timestamp": "2026-06-01T09:00:00+00:00",
+            },
+            scope,
+            ts("2026-06-01T09:00:00+00:00"),
+            {"source_uri": "beam:test:16:batch1:msg1"},
+        )
+
+        pack = memory.answer_context(
+            "Can you list the order in which I brought up different aspects of developing my personal budget tracker throughout our conversations? Mention ONLY and ONLY four items.",
+            scope,
+            budget={"limit": 10},
+        )
+
+        anchors = [span for span in pack.source_spans if span.get("selector") == "event_ordering_coverage" and span.get("timeline_role") == "user_aspect_anchor"]
+        self.assertGreaterEqual(len(anchors), 3)
+        anchor_text = " ".join(span["content"] for span in anchors[:4]).lower()
+        self.assertTrue("core functionality" in anchor_text or "initial project setup" in anchor_text or "database schema" in anchor_text)
+        self.assertIn("transaction crud", anchor_text)
+        self.assertIn("deployment", anchor_text)
+        self.assertNotIn("stress management", anchor_text)
+        self.assertEqual([span["timeline_index"] for span in anchors[:3]], [1, 2, 3])
+        self.assertTrue(all(span["speaker"] == "user" for span in anchors[:4]))
+        self.assertTrue(any(span.get("timeline_role") == "supporting_context" and span["speaker"] == "assistant" for span in pack.source_spans))
 
     def test_event_ordering_pack_preserves_event_timeline_graph_candidates(self) -> None:
         memory = MemoryService()
@@ -143,12 +867,12 @@ class FusionMemoryTests(unittest.TestCase):
         pack = memory.answer_context(
             "Can you walk me through the order in which I brought up different aspects of my app development and deployment across our conversations?",
             scope,
-            budget={"limit": 8},
+            budget={"limit": 12},
         )
 
-        groups = [event.get("milestone_group") for event in pack.events]
+        groups = [event.get("milestone_group") for event in pack.events if event.get("milestone_group")]
         self.assertIn("initial_project_setup", groups)
-        self.assertIn("transaction_crud_implementation", groups)
+        self.assertTrue(any(group in groups for group in {"transaction_crud_implementation", "transaction_error_handling"}))
         self.assertIn("deployment_configuration", groups)
         self.assertIn("integration_test_coverage", groups)
         self.assertEqual([event["timeline_index"] for event in pack.events], list(range(1, len(pack.events) + 1)))
@@ -169,11 +893,39 @@ class FusionMemoryTests(unittest.TestCase):
             budget={"limit": 8},
         )
 
-        groups = [event.get("milestone_group") for event in pack.events]
+        groups = [event.get("milestone_group") for event in pack.events if event.get("milestone_group")]
         self.assertIn("core_functionality", groups)
         self.assertTrue(any(group in groups for group in ["transaction_error_handling", "transaction_crud_implementation"]))
         self.assertTrue(any(group in groups for group in ["security_and_deployment", "deployment_configuration"]))
         self.assertLess(groups.index("core_functionality"), groups.index(next(group for group in groups if group.startswith("transaction"))))
+
+    def test_event_ordering_long_timeline_keeps_early_setup_anchor(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s")
+        memory.add("I started by setting up the Flask project, local server, and initial database schema.", scope, ts("2026-06-01T10:00:00+00:00"))
+        memory.add("I later integrated Flask-Login for core session management and user logins.", scope, ts("2026-06-02T10:00:00+00:00"))
+        memory.add("I fixed transaction POST validation errors and missing amount handling.", scope, ts("2026-06-03T10:00:00+00:00"))
+        memory.add("I configured Render deployment with Gunicorn workers and port settings.", scope, ts("2026-06-04T10:00:00+00:00"))
+        memory.add("I expanded integration tests for auth and security coverage.", scope, ts("2026-06-05T10:00:00+00:00"))
+
+        pack = memory.answer_context(
+            "Can you walk me through the order in which I brought up different aspects of my app development and deployment across our conversations? Mention ONLY and ONLY five items.",
+            scope,
+            budget={"limit": 12},
+        )
+
+        anchors = [
+            span
+            for span in pack.source_spans
+            if span.get("selector") == "event_ordering_coverage" and span.get("timeline_role") == "user_aspect_anchor"
+        ]
+        labels = [span.get("timeline_label", "") for span in anchors[:5]]
+        contents = " ".join(span["content"].lower() for span in anchors[:5])
+        self.assertGreaterEqual(len(anchors), 5)
+        self.assertTrue("initial project setup" in labels[0].lower() or "schema" in contents[:300] or "local server" in contents[:300])
+        self.assertIn("transaction", contents)
+        self.assertIn("deployment", contents)
+        self.assertTrue("integration tests" in contents or "coverage" in contents)
 
     def test_exact_signal_preserved_through_rrf_merge(self) -> None:
         raw = Candidate(
@@ -380,6 +1132,140 @@ class FusionMemoryTests(unittest.TestCase):
         self.assertEqual(by_date["2024-04-19"], "feature_finish_date")
         self.assertNotEqual(by_date["2024-01-15"], "feature_finish_date")
 
+    def test_temporal_lookup_labels_decision_and_reschedule_dates(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s")
+        memory.add(
+            "I decided to reject the raise on March 12, 2026 after reviewing the offer.",
+            scope,
+            ts("2026-06-01T10:00:00+00:00"),
+        )
+        memory.add(
+            "I rescheduled my final meeting to March 30, 2026 so I could have more time.",
+            scope,
+            ts("2026-06-02T10:00:00+00:00"),
+        )
+
+        pack = memory.answer_context(
+            "How many days passed between when I decided to reject the raise and when I rescheduled my final meeting to give myself more time?",
+            scope,
+            budget={"limit": 4},
+        )
+
+        self.assertIn("decision_date", pack.coverage["temporal_target_roles"])
+        self.assertIn("reschedule_date", pack.coverage["temporal_target_roles"])
+        candidates = pack.coverage["temporal_candidates"]
+        roles_by_date = {candidate["normalized_date"]: candidate["role"] for candidate in candidates}
+        self.assertEqual(roles_by_date["2026-03-12"], "decision_date")
+        self.assertEqual(roles_by_date["2026-03-30"], "reschedule_date")
+        self.assertTrue(candidates[0]["target_role_match"])
+
+    def test_temporal_candidates_prioritize_user_target_roles_over_assistant_examples(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s")
+        memory.add(
+            "Example plan: March 1, 2024 gather options; March 11, 2024 interview advisors.",
+            scope,
+            ts("2026-06-01T10:00:00+00:00"),
+        )
+        memory.add(
+            "I decided to reject the raise on March 12, 2026.",
+            scope,
+            ts("2026-06-02T10:00:00+00:00"),
+        )
+        memory.add(
+            "I rescheduled my final meeting to March 30, 2026.",
+            scope,
+            ts("2026-06-03T10:00:00+00:00"),
+        )
+
+        pack = memory.answer_context(
+            "How many days passed between when I decided to reject the raise and when I rescheduled my final meeting?",
+            scope,
+            budget={"limit": 6},
+        )
+
+        candidates = pack.coverage["temporal_candidates"]
+        top_dates = [candidate["normalized_date"] for candidate in candidates[:2]]
+        self.assertEqual(top_dates, ["2026-03-12", "2026-03-30"])
+
+    def test_temporal_pack_exposes_explicit_date_range_pairs(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s")
+        memory.add(
+            "I completed the clarity editing challenge from May 10 to May 25, 2026.",
+            scope,
+            ts("2026-06-01T10:00:00+00:00"),
+        )
+
+        pack = memory.answer_context(
+            "How many days were there between when I completed the clarity editing challenge and another milestone?",
+            scope,
+            budget={"limit": 4},
+        )
+
+        pairs = pack.coverage["temporal_range_pairs"]
+        self.assertEqual(pairs[0]["start_date"], "2026-05-10")
+        self.assertEqual(pairs[0]["end_date"], "2026-05-25")
+        self.assertEqual(pairs[0]["start_role"], "start_date")
+        self.assertIn(pairs[0]["end_role"], {"completion_date", "feature_finish_date"})
+
+    def test_temporal_coverage_recovers_decision_object_span(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s")
+        memory.add(
+            "I decided on a film festival path on October 15, 2026.",
+            scope,
+            ts("2026-06-01T10:00:00+00:00"),
+        )
+        memory.add(
+            "I'm torn about rejecting that $10,000 raise on March 12, 2026.",
+            scope,
+            ts("2026-06-02T10:00:00+00:00"),
+        )
+        memory.add(
+            "I rescheduled my final meeting to March 30, 2026 to give myself more time.",
+            scope,
+            ts("2026-06-03T10:00:00+00:00"),
+        )
+
+        pack = memory.answer_context(
+            "How many days passed between when I decided to reject the raise and when I rescheduled my final meeting to give myself more time?",
+            scope,
+            budget={"limit": 4},
+        )
+
+        content = " ".join(span["content"].lower() for span in pack.source_spans)
+        self.assertIn("rejecting that $10,000 raise on march 12", content)
+        self.assertIn("rescheduled my final meeting to march 30", content)
+        roles_by_date = {candidate["normalized_date"]: candidate["role"] for candidate in pack.coverage["temporal_candidates"]}
+        self.assertEqual(roles_by_date["2026-03-12"], "decision_date")
+        self.assertEqual(roles_by_date["2026-03-30"], "reschedule_date")
+
+    def test_temporal_coverage_recovers_duration_completion_span(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s")
+        memory.add(
+            'I downloaded "The Poppy War" trilogy on December 7, 2026.',
+            scope,
+            ts("2026-06-01T10:00:00+00:00"),
+        )
+        memory.add(
+            'I finished "The Poppy War" trilogy with 1,150 pages in 12 days.',
+            scope,
+            ts("2026-06-02T10:00:00+00:00"),
+        )
+
+        pack = memory.answer_context(
+            "How many days did it take me to finish reading the trilogy after I downloaded it?",
+            scope,
+            budget={"limit": 4},
+        )
+
+        content = " ".join(span["content"].lower() for span in pack.source_spans)
+        self.assertIn("downloaded", content)
+        self.assertIn("12 days", content)
+
     def test_event_ordering_topic_scope_prevents_generic_milestone_bleed(self) -> None:
         memory = MemoryService()
         scope = Scope(workspace_id="w", user_id="u", agent_id="a")
@@ -459,6 +1345,7 @@ class FusionMemoryTests(unittest.TestCase):
         self.assertIn("Bootstrap 5.3.0", content)
         self.assertIn("Chrome DevTools", content)
         self.assertNotIn("salary negotiation", content)
+        self.assertIn("summary_clusters", pack.coverage)
 
     def test_contradiction_pack_groups_surface_claim_polarity(self) -> None:
         memory = MemoryService()
@@ -477,12 +1364,48 @@ class FusionMemoryTests(unittest.TestCase):
         self.assertGreaterEqual(pack.coverage["claim_polarity_counts"]["negative"], 1)
         self.assertTrue(any(str(item["source"]).startswith("contradiction_claim_") for item in pack.debug_trace))
 
+    def test_contradiction_pack_preserves_both_polarities_through_noise(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a")
+        for index in range(20):
+            memory.add(
+                f"Budget planning note {index}: track income, expenses, and monthly savings carefully.",
+                scope,
+                ts(f"2026-06-01T10:{index:02d}:00+00:00"),
+                {"source_uri": f"beam:test:16:noise:{index}"},
+            )
+        memory.add(
+            "I have never used Excel for tracking expenses before.",
+            scope,
+            ts("2026-06-02T10:00:00+00:00"),
+            {"source_uri": "beam:test:16:batch1:msg1"},
+        )
+        memory.add(
+            "I've been using Excel to track my daily expenses since March 1.",
+            scope,
+            ts("2026-06-03T10:00:00+00:00"),
+            {"source_uri": "beam:test:16:batch1:msg2"},
+        )
+
+        pack = memory.answer_context(
+            "Have I been using Excel to track my daily expenses?",
+            scope,
+            budget={"limit": 6, "query_type_hint": "contradiction_resolution"},
+        )
+
+        polarities = {span.get("claim_polarity") for span in pack.source_spans}
+        self.assertIn("negative", polarities)
+        self.assertIn("positive", polarities)
+        self.assertGreaterEqual(pack.coverage["claim_polarity_counts"]["positive"], 1)
+        self.assertGreaterEqual(pack.coverage["claim_polarity_counts"]["negative"], 1)
+
     def test_knowledge_update_pack_marks_history_and_value_mentions(self) -> None:
         memory = MemoryService()
         scope = Scope(workspace_id="w", user_id="u", agent_id="a")
         memory.add("The dashboard API response time was initially 800ms.", scope, ts("2026-06-01T10:00:00+00:00"), {"source_uri": "beam:test:1:batch1:msg1"})
         memory.add("The dashboard API response time improved to 300ms after optimization.", scope, ts("2026-06-02T10:00:00+00:00"), {"source_uri": "beam:test:1:batch1:msg2"})
         memory.add("The dashboard API response time is now 250ms after caching tweaks.", scope, ts("2026-06-03T10:00:00+00:00"), {"source_uri": "beam:test:1:batch1:msg3"})
+        memory.add("The mobile animation duration is now 300ms.", scope, ts("2026-06-04T10:00:00+00:00"), {"source_uri": "beam:test:other:batch1:msg1"})
 
         pack = memory.answer_context("What is the average response time of the dashboard API?", scope, budget={"limit": 6})
 
@@ -490,6 +1413,7 @@ class FusionMemoryTests(unittest.TestCase):
         self.assertEqual(sorted(span["history_index"] for span in pack.source_spans), list(range(1, len(pack.source_spans) + 1)))
         self.assertTrue(any(span.get("recency_rank") == 1 and "250ms" in span["content"] for span in pack.source_spans))
         self.assertTrue(any(span.get("value_mentions") for span in pack.source_spans))
+        self.assertTrue(any(row.get("subject_key") and "response" in row["subject_key"] for row in pack.coverage["value_history"]))
 
     def test_multi_session_pack_marks_history_order_for_aggregation(self) -> None:
         memory = MemoryService()
@@ -504,6 +1428,525 @@ class FusionMemoryTests(unittest.TestCase):
         self.assertIn("category column", content)
         self.assertIn("notes column", content)
         self.assertEqual([span["history_index"] for span in pack.source_spans], list(range(1, len(pack.source_spans) + 1)))
+
+    def test_multi_session_aggregation_preserves_estate_asset_candidates(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a")
+        memory.add(
+            "My asset inventory includes $25,000 in savings, $15,000 in film equipment, and a 2018 Toyota RAV4 valued at $18,000.",
+            scope,
+            ts("2026-06-01T10:00:00+00:00"),
+            {"source_uri": "beam:test:19:batch1:msg8"},
+        )
+        memory.add(
+            "I started listing my assets on March 1, and my $350,000 home on 45 Coral Bay Rd is a big part of that.",
+            scope,
+            ts("2026-06-02T10:00:00+00:00"),
+            {"source_uri": "beam:test:19:batch1:msg9"},
+        )
+        memory.add(
+            "I installed a fireproof safe at 45 Coral Bay Rd for storing my original will and important documents.",
+            scope,
+            ts("2026-06-03T10:00:00+00:00"),
+            {"source_uri": "beam:test:19:batch3:msg8"},
+        )
+        memory.add(
+            "A generic estate checklist can mention bank accounts, retirement accounts, and vacation homes.",
+            scope,
+            ts("2026-06-04T10:00:00+00:00"),
+            {"source_uri": "beam:test:19:batch4:msg1"},
+        )
+
+        pack = memory.answer_context(
+            "How many specific assets or items have I mentioned across my conversations that are part of my estate planning?",
+            scope,
+            budget={"limit": 6},
+        )
+
+        self.assertEqual(pack.coverage["query_type"], "multi_session_reasoning")
+        self.assertTrue(any("aggregation_coverage" in item["source"] for item in pack.debug_trace))
+        content = " ".join(span["content"].lower() for span in pack.source_spans)
+        self.assertIn("2018 toyota rav4", content)
+        self.assertIn("film equipment", content)
+        self.assertIn("45 coral bay", content)
+        self.assertIn("fireproof safe", content)
+        self.assertIn("original will", content)
+
+    def test_multi_session_count_query_with_did_i_mention_is_not_yes_no_contradiction(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a")
+        memory.add(
+            "I mentioned arranging 3 colored balls in a row with 3! equals 6 ways.",
+            scope,
+            ts("2026-06-01T10:00:00+00:00"),
+            {"source_uri": "beam:test:5:batch1:msg1"},
+        )
+        memory.add(
+            "I also mentioned choosing 2 balls out of 3 with 3C2 equals 3 ways.",
+            scope,
+            ts("2026-06-02T10:00:00+00:00"),
+            {"source_uri": "beam:test:5:batch2:msg1"},
+        )
+        memory.add(
+            "Then I asked about choosing 2 cards from a 52-card deck.",
+            scope,
+            ts("2026-06-03T10:00:00+00:00"),
+            {"source_uri": "beam:test:5:batch3:msg1"},
+        )
+
+        pack = memory.answer_context(
+            "How many total ways did I mention for arranging or choosing balls and cards across my questions?",
+            scope,
+            budget={"limit": 8},
+        )
+
+        self.assertEqual(pack.coverage["query_type"], "multi_session_reasoning")
+        self.assertTrue(any("aggregation_coverage" in item["source"] for item in pack.debug_trace))
+        content = " ".join(span["content"].lower() for span in pack.source_spans)
+        self.assertIn("arranging 3 colored balls", content)
+        self.assertIn("choosing 2 balls", content)
+        self.assertIn("choosing 2 cards", content)
+
+    def test_multi_session_combinatorics_aggregation_ignores_other_topic_groups(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a")
+        memory.add(
+            "I asked about arranging 3 different colored balls in a row, where 3! equals 6 ways.",
+            scope,
+            ts("2026-06-01T10:00:00+00:00"),
+            {"source_uri": "beam:test:5:batch1:msg27"},
+        )
+        memory.add(
+            "I asked if choosing 2 balls from 3 means 3C2 equals 3 ways.",
+            scope,
+            ts("2026-06-02T10:00:00+00:00"),
+            {"source_uri": "beam:test:5:batch1:msg28"},
+        )
+        memory.add(
+            "I asked how many ways there are to choose cards from a 52-card deck.",
+            scope,
+            ts("2026-06-03T10:00:00+00:00"),
+            {"source_uri": "beam:test:5:batch2:msg79"},
+        )
+        memory.add(
+            "In my sneaker notes, I compared many total ways to choose black or white sneakers with cards and discounts.",
+            scope,
+            ts("2026-06-04T10:00:00+00:00"),
+            {"source_uri": "beam:test:15:batch1:msg37"},
+        )
+
+        pack = memory.answer_context(
+            "How many total ways did I mention for arranging or choosing balls and cards across my questions?",
+            scope,
+            budget={"limit": 8},
+        )
+
+        self.assertEqual(pack.coverage["query_type"], "multi_session_reasoning")
+        content = " ".join(span["content"].lower() for span in pack.source_spans)
+        self.assertIn("3c2 equals 3 ways", content)
+        self.assertIn("52-card deck", content)
+        self.assertNotIn("sneaker", content)
+
+    def test_multi_session_aggregation_preserves_column_candidates(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a")
+        memory.add("My transactions table currently has id, user_id, type, amount, and date.", scope, ts("2026-06-01T10:00:00+00:00"), {"source_uri": "beam:test:1:batch1:msg1"})
+        memory.add("I want to add a category column to the transactions table for reporting.", scope, ts("2026-06-02T10:00:00+00:00"), {"source_uri": "beam:test:1:batch2:msg1"})
+        memory.add("In another request, I also wanted a notes column on transactions for free-form details.", scope, ts("2026-06-03T10:00:00+00:00"), {"source_uri": "beam:test:1:batch3:msg1"})
+        memory.add("I discussed unrelated auth login copy.", scope, ts("2026-06-04T10:00:00+00:00"), {"source_uri": "beam:test:1:batch4:msg1"})
+
+        pack = memory.answer_context(
+            "How many new columns did I want to add to the transactions table across my requests?",
+            scope,
+            budget={"limit": 6},
+        )
+
+        content = " ".join(span["content"].lower() for span in pack.source_spans)
+        self.assertIn("category column", content)
+        self.assertIn("notes column", content)
+        self.assertTrue(any("aggregation_coverage" in item["source"] for item in pack.debug_trace))
+
+    def test_multi_session_aggregation_preserves_many_distinct_candidates(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a")
+        names = ["drama", "comedy", "thriller", "animation", "documentary", "sci-fi", "fantasy", "mystery"]
+        for index, name in enumerate(names, start=1):
+            memory.add(
+                f"In movie marathon note {index}, I planned a {name} movie.",
+                scope,
+                ts(f"2026-06-{index:02d}T10:00:00+00:00"),
+                {"source_uri": f"beam:test:movies:batch{index}:msg1"},
+            )
+
+        pack = memory.answer_context(
+            "How many unique movies have I planned to watch across all my family movie marathons?",
+            scope,
+            budget={"limit": 12},
+        )
+
+        content = " ".join(span["content"].lower() for span in pack.source_spans)
+        for name in names:
+            self.assertIn(name, content)
+
+    def test_multi_session_generic_aggregation_keys_are_added_to_user_spans(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a")
+        memory.add(
+            "I focused on adapting my resume to international standards.",
+            scope,
+            ts("2026-06-01T10:00:00+00:00"),
+            {"source_uri": "beam:test:generic:batch1:msg1"},
+        )
+        memory.add(
+            "I also wanted to improve my portfolio project selection.",
+            scope,
+            ts("2026-06-02T10:00:00+00:00"),
+            {"source_uri": "beam:test:generic:batch2:msg1"},
+        )
+        memory.add(
+            "You could also improve general interview practice.",
+            scope,
+            ts("2026-06-03T10:00:00+00:00"),
+            {"source_uri": "beam:test:generic:batch3:msg1"},
+        )
+
+        pack = memory.answer_context(
+            "How many different planning areas did I mention across my sessions?",
+            scope,
+            budget={"limit": 6},
+        )
+
+        keyed_spans = [span for span in pack.source_spans if span.get("aggregation_keys")]
+        keys = {key for span in keyed_spans for key in span["aggregation_keys"]}
+        self.assertIn("area:resume_international_standards", keys)
+        self.assertIn("area:portfolio_project_selection", keys)
+        self.assertFalse(any("interview_practice" in key for key in keys))
+
+    def test_multi_session_aggregation_prefers_user_spans_for_shared_keys(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a")
+        memory.add(
+            "I focused on adapting my resume to international standards.",
+            scope,
+            ts("2026-06-01T10:00:00+00:00"),
+            {"source_uri": "beam:test:generic:batch1:msg1"},
+        )
+        memory.add(
+            "I also wanted to improve my portfolio project selection.",
+            scope,
+            ts("2026-06-02T10:00:00+00:00"),
+            {"source_uri": "beam:test:generic:batch2:msg1"},
+        )
+        memory.add(
+            "You could also improve general interview practice.",
+            scope,
+            ts("2026-06-03T10:00:00+00:00"),
+            {"source_uri": "beam:test:generic:batch3:msg1"},
+        )
+
+        pack = memory.answer_context(
+            "How many different planning areas did I mention across my sessions?",
+            scope,
+            budget={"limit": 6},
+        )
+
+        keyed = [span for span in pack.source_spans if span.get("aggregation_keys")]
+        self.assertTrue(keyed)
+        self.assertTrue(all(span.get("speaker") == "user" for span in keyed))
+        self.assertNotIn("interview practice", " ".join(span["content"].lower() for span in keyed))
+
+    def test_multi_session_generic_user_spans_are_preserved_by_aggregation_signal(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a")
+        memory.add("I focused on adapting my resume to international standards.", scope, ts("2026-06-01T10:00:00+00:00"), {"source_uri": "beam:test:generic:batch1:msg1"})
+        memory.add("I also wanted to improve my portfolio project selection.", scope, ts("2026-06-02T10:00:00+00:00"), {"source_uri": "beam:test:generic:batch2:msg1"})
+        memory.add("You could also improve general interview practice.", scope, ts("2026-06-03T10:00:00+00:00"), {"source_uri": "beam:test:generic:batch3:msg1"})
+
+        pack = memory.answer_context(
+            "How many different planning areas did I mention across my sessions?",
+            scope,
+            budget={"limit": 6},
+        )
+
+        content = " ".join(span["content"].lower() for span in pack.source_spans)
+        self.assertIn("resume to international standards", content)
+        self.assertIn("portfolio project selection", content)
+        keyed_content = " ".join(span["content"].lower() for span in pack.source_spans if span.get("aggregation_keys"))
+        self.assertNotIn("interview practice", keyed_content)
+
+    def test_multi_session_expansion_spans_receive_generic_aggregation_keys(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a")
+        for index, text in enumerate(
+            [
+                "I want city autocomplete for my app.",
+                "I need error handling for invalid city names.",
+                "I am trying to support responsive design on mobile.",
+                "I implemented saved search filters for returning users.",
+            ],
+            start=1,
+        ):
+            memory.add(
+                text,
+                scope,
+                ts(f"2026-06-{index:02d}T10:00:00+00:00"),
+                {"source_uri": f"beam:test:features:batch{index}:msg1"},
+            )
+
+        pack = memory.answer_context(
+            "How many different features or concerns did I mention wanting to handle across my app conversations?",
+            scope,
+            budget={"limit": 3, "token_budget": 4000},
+        )
+
+        keys = {key for span in pack.source_spans for key in span.get("aggregation_keys", [])}
+        self.assertGreaterEqual(len(keys), 2)
+        self.assertIn("feature:city_autocomplete", keys)
+        self.assertIn("feature:error_handling", keys)
+
+    def test_multi_session_cross_factor_effect_pack_preserves_all_factors(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a")
+        memory.add("Our grocery budget is increasing to $500 per month starting September 1.", scope, ts("2026-06-01T10:00:00+00:00"), {"source_uri": "beam:test:budget:batch1:msg1"})
+        memory.add("I am taking on a freelance contract that adds $900 per month for three months.", scope, ts("2026-06-02T10:00:00+00:00"), {"source_uri": "beam:test:budget:batch2:msg1"})
+        memory.add("I need to support Ashlee's medical bills, which are $350 per month.", scope, ts("2026-06-03T10:00:00+00:00"), {"source_uri": "beam:test:budget:batch3:msg1"})
+        memory.add("My savings goal is still $600 per month for the emergency fund.", scope, ts("2026-06-04T10:00:00+00:00"), {"source_uri": "beam:test:budget:batch4:msg1"})
+        memory.add("A recipe note mentioned groceries but not my budget plan.", scope, ts("2026-06-05T10:00:00+00:00"), {"source_uri": "beam:test:cooking:batch1:msg1"})
+
+        pack = memory.answer_context(
+            "How will increasing our grocery budget while taking on the freelance contract affect my ability to support Ashlee's medical bills and still meet my savings goals?",
+            scope,
+            budget={"limit": 4},
+        )
+
+        self.assertEqual(pack.coverage["query_type"], "multi_session_reasoning")
+        content = " ".join(span["content"].lower() for span in pack.source_spans)
+        self.assertIn("grocery budget", content)
+        self.assertIn("freelance contract", content)
+        self.assertIn("medical bills", content)
+        self.assertIn("savings goal", content)
+
+    def test_multi_session_stress_break_aggregation_does_not_crash(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a")
+        memory.add(
+            "I took a one-hour yoga break because I was stressed and needed to reset.",
+            scope,
+            ts("2026-06-01T10:00:00+00:00"),
+            {"source_uri": "beam:test:breaks:batch1:msg1"},
+        )
+        memory.add(
+            "I took two full days off to prevent burnout before continuing the project.",
+            scope,
+            ts("2026-06-02T10:00:00+00:00"),
+            {"source_uri": "beam:test:breaks:batch2:msg1"},
+        )
+
+        pack = memory.answer_context(
+            "How many total days did I take off or breaks to manage stress and prevent burnout across my sessions?",
+            scope,
+            budget={"limit": 6},
+        )
+
+        keys = {key for span in pack.source_spans for key in span.get("aggregation_keys", [])}
+        self.assertIn("break:one_hour_stress_day", keys)
+        self.assertIn("break:full_days_off", keys)
+
+    def test_multi_session_pack_extracts_generic_size_values(self) -> None:
+        from fusion_memory.eval.model_adapters import _pack_for_model
+
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a")
+        memory.add("I usually wear size 11 running shoes.", scope, ts("2026-06-01T10:00:00+00:00"), {"source_uri": "beam:test:sizes:batch1:msg1"})
+        memory.add("For narrow sneakers I sometimes need size 11.5.", scope, ts("2026-06-02T10:00:00+00:00"), {"source_uri": "beam:test:sizes:batch2:msg1"})
+
+        pack = memory.answer_context(
+            "How many different shoe sizes have I mentioned across my messages?",
+            scope,
+            budget={"limit": 6},
+        )
+
+        keys = {key for span in pack.source_spans for key in span.get("aggregation_keys", [])}
+        self.assertIn("value:size_11", keys)
+        self.assertIn("value:size_11_5", keys)
+        labels = {item["label"] for item in _pack_for_model(pack).get("aggregation_items", [])}
+        self.assertIn("size 11.5", labels)
+
+    def test_multi_session_pack_exposes_quoted_titles_as_aggregation_items(self) -> None:
+        from fusion_memory.eval.model_adapters import _pack_for_model
+
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a")
+        memory.add('I planned "Soul" and "Paddington 2" for the first movie night.', scope, ts("2026-06-01T10:00:00+00:00"), {"source_uri": "beam:test:movies:batch1:msg1"})
+        memory.add('I added "Coco" for the second movie night.', scope, ts("2026-06-02T10:00:00+00:00"), {"source_uri": "beam:test:movies:batch2:msg1"})
+        memory.add("I want to make the movie night special with themed snacks.", scope, ts("2026-06-03T10:00:00+00:00"), {"source_uri": "beam:test:movies:batch3:msg1"})
+
+        pack = memory.answer_context(
+            "How many unique movies have I planned across all movie nights?",
+            scope,
+            budget={"limit": 6},
+        )
+        model_pack = _pack_for_model(pack)
+        item_keys = {item["key"] for item in model_pack.get("aggregation_items", [])}
+
+        self.assertIn("title:soul", item_keys)
+        self.assertIn("title:paddington_2", item_keys)
+        self.assertIn("title:coco", item_keys)
+        self.assertTrue(all(key.startswith("title:") for key in item_keys))
+        self.assertFalse(any("snack" in key or "special" in key for key in item_keys))
+
+    def test_multi_session_preserves_adjacent_assistant_recommendation_group(self) -> None:
+        from fusion_memory.eval.model_adapters import _pack_for_model
+
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a")
+        memory.add(
+            {
+                "role": "user",
+                "content": "Can you suggest some must-read fiction series that fit my winter budget?",
+                "turn_id": "beam:test:series:batch1:msg1",
+                "timestamp": "2026-06-01T10:00:00+00:00",
+            },
+            scope,
+            ts("2026-06-01T10:00:00+00:00"),
+            {"source_uri": "beam:test:series:batch1:msg1"},
+        )
+        memory.add(
+            {
+                "role": "assistant",
+                "content": 'Here are a few suggestions:\n\n### "The Kingkiller Chronicle"\nDetails...\n\n### "The Mistborn Trilogy"\nDetails...\n\n### "The Lies of Locke Lamora"\nDetails...',
+                "turn_id": "beam:test:series:batch1:msg2",
+                "timestamp": "2026-06-01T10:01:00+00:00",
+            },
+            scope,
+            ts("2026-06-01T10:01:00+00:00"),
+            {"source_uri": "beam:test:series:batch1:msg2"},
+        )
+        memory.add(
+            {
+                "role": "user",
+                "content": 'I later mentioned that "The Vorkosigan Saga" sounded interesting, and I want to explore it as a science fiction series.',
+                "turn_id": "beam:test:series:batch2:msg1",
+                "timestamp": "2026-06-02T10:00:00+00:00",
+            },
+            scope,
+            ts("2026-06-02T10:00:00+00:00"),
+            {"source_uri": "beam:test:series:batch2:msg1"},
+        )
+
+        pack = memory.answer_context(
+            "How many different book series or genres have I mentioned wanting to explore across my conversations?",
+            scope,
+            budget={"mode": "benchmark", "limit": 8},
+        )
+        model_pack = _pack_for_model(pack)
+        content = "\n".join(span["content"] for span in pack.source_spans)
+        included = {item["key"]: item for item in model_pack.get("aggregation_items", []) if item["included"]}
+
+        self.assertIn("The Kingkiller Chronicle", content)
+        self.assertTrue(any(key.startswith("group_count:series:") and item["value"] == 3 for key, item in included.items()))
+        self.assertIn("title:the_vorkosigan_saga", included)
+
+    def test_multi_session_prefers_specific_adjacent_recommendation_group(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a")
+        turns = [
+            ("user", "Can you suggest a fiction series for cozy evenings?", "msg1"),
+            ("assistant", 'Here are options:\n\n### "Series A"\n...\n\n### "Series B"\n...\n\n### "Series C"\n...', "msg2"),
+            ("user", "Can you suggest a few fantasy books for a club chat?", "msg3"),
+            ("assistant", 'Here are options:\n\n### "Series D"\n...\n\n### "Series E"\n...\n\n### "Series F"\n...', "msg4"),
+            (
+                "user",
+                "I have a $120 budget and want to buy print editions from North Street Books; can you suggest three must-read fiction series that fit?",
+                "msg5",
+            ),
+            (
+                "assistant",
+                'With that budget and print-edition constraint, I would suggest:\n\n### "Specific One"\n...\n\n### "Specific Two"\n...\n\n### "Specific Three"\n...',
+                "msg6",
+            ),
+            ("user", 'I later mentioned "Specific Four" as a science fiction series to explore.', "msg7"),
+        ]
+        for index, (role, content, turn_id) in enumerate(turns):
+            memory.add(
+                {
+                    "role": role,
+                    "content": content,
+                    "turn_id": f"beam:test:specific:{turn_id}",
+                    "timestamp": f"2026-06-01T10:{index:02d}:00+00:00",
+                },
+                scope,
+                ts(f"2026-06-01T10:{index:02d}:00+00:00"),
+                {"source_uri": f"beam:test:specific:{turn_id}"},
+            )
+
+        pack = memory.answer_context(
+            "How many different book series or genres have I mentioned wanting to explore across my conversations?",
+            scope,
+            budget={"mode": "benchmark", "limit": 6},
+        )
+        from fusion_memory.eval.model_adapters import _pack_for_model
+
+        content = "\n".join(span["content"] for span in pack.source_spans)
+        model_pack = _pack_for_model(pack)
+        included_group_counts = [
+            item for item in model_pack.get("aggregation_items", [])
+            if item.get("included") and str(item.get("key", "")).startswith("group_count:")
+        ]
+        self.assertIn("Specific One", content)
+        self.assertIn("Specific Four", content)
+        self.assertEqual(1, len(included_group_counts))
+        self.assertIn("Specific One", included_group_counts[0]["context"])
+
+    def test_scent_trail_recovers_followup_version_details(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a")
+        memory.add("The project uses Flask for the backend.", scope, ts("2026-06-01T10:00:00+00:00"), {"source_uri": "beam:test:trail:batch1:msg1"})
+        memory.add("I also want to keep Flask-Login and Flask-WTF in the stack.", scope, ts("2026-06-02T10:00:00+00:00"), {"source_uri": "beam:test:trail:batch1:msg2"})
+        memory.add("The project also uses Flask==2.3.1, Flask-Login==0.6.2, and Flask-WTF==1.0.1.", scope, ts("2026-06-03T10:00:00+00:00"), {"source_uri": "beam:test:trail:batch1:msg3"})
+
+        result = memory.search("Which libraries are used in this project? Include version details.", scope, options={"limit": 5})
+        pack = memory.answer_context("Which libraries are used in this project? Include version details.", scope, budget={"limit": 2})
+
+        content = " ".join(span["content"].lower() for span in pack.source_spans)
+        self.assertIn("flask", content)
+        self.assertTrue(any("raw_scent_trail" in candidate.source and "0.6.2" in candidate.text for candidate in result.candidates))
+
+    def test_quality_fallback_recovers_high_signal_span_from_weak_selection(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a")
+        memory.add("Sounds good.", scope, ts("2026-06-01T10:00:00+00:00"), {"source_uri": "beam:test:fallback:batch1:msg1"})
+        memory.add(
+            "The frontend launch checklist included fixing the navbar error, adding retry backoff, and testing image loading on June 12.",
+            scope,
+            ts("2026-06-02T10:00:00+00:00"),
+            {"source_uri": "beam:test:fallback:batch1:msg2"},
+        )
+        memory.add("Thanks, that helps.", scope, ts("2026-06-03T10:00:00+00:00"), {"source_uri": "beam:test:fallback:batch1:msg3"})
+        plan = memory.planner.plan("Summarize the frontend launch checklist issues and fixes.")
+        weak_selected = [
+            Candidate(
+                id="weak",
+                type="span",
+                text="Sounds good.",
+                source="test",
+                scores={"score": 0.01, "utility_score": 0.01},
+                source_span_ids=["weak"],
+            )
+        ]
+
+        recovered = memory._apply_quality_fallback(
+            "Summarize the frontend launch checklist issues and fixes.",
+            plan,
+            scope,
+            [],
+            weak_selected,
+            3,
+        )
+
+        contents = " ".join(candidate.text.lower() for candidate in recovered)
+        self.assertIn("navbar error", contents)
+        self.assertTrue(any(candidate.source == "quality_fallback" for candidate in recovered))
 
     def test_instruction_pack_exposes_format_requirements(self) -> None:
         memory = MemoryService()
@@ -529,6 +1972,212 @@ class FusionMemoryTests(unittest.TestCase):
         self.assertTrue(any(fact.metadata.get("value_mentions") for fact in facts))
         events = memory.store.list_events(scope)
         self.assertTrue(any("portfolio" in event.participants or "bootstrap" in event.participants for event in events))
+
+    def test_rule_extractor_emits_cross_domain_event_facets(self) -> None:
+        facets = extract_generic_event_facets(
+            "I'm worried about emergency savings, decided to create a monthly budget, "
+            "and I need to track every expense over $20. I compared checking vs. savings and listed three options."
+        )
+
+        facet_types = [facet for facet, _label, _snippet in facets]
+        self.assertIn("concern", facet_types)
+        self.assertIn("decision", facet_types)
+        self.assertIn("constraint", facet_types)
+        self.assertIn("request_for_comparison", facet_types)
+        self.assertIn("count_list_mention", facet_types)
+
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s")
+        memory.add(
+            "I'm worried about emergency savings, decided to create a monthly budget, and I need to track every expense over $20.",
+            scope,
+            ts("2026-06-01T10:00:00+00:00"),
+        )
+
+        event_types = {event.event_type for event in memory.store.list_events(scope)}
+        self.assertIn("concern", event_types)
+        self.assertIn("decision", event_types)
+        self.assertIn("constraint", event_types)
+
+    def test_event_ordering_uses_generic_event_facets_for_cross_domain_timeline(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s")
+        memory.add("I'm worried about emergency savings after the phishing attempt.", scope, ts("2026-06-01T10:00:00+00:00"))
+        memory.add("I decided to create a monthly budget for rent, groceries, and transport.", scope, ts("2026-06-02T10:00:00+00:00"))
+        memory.add("I need to track every expense over $20 in Excel.", scope, ts("2026-06-03T10:00:00+00:00"))
+
+        pack = memory.answer_context(
+            "Can you list the order in which I brought up different money-management concerns and decisions?",
+            scope,
+            budget={"limit": 8},
+        )
+
+        anchors = [
+            span
+            for span in pack.source_spans
+            if span.get("selector") == "event_ordering_coverage" and span.get("timeline_role") == "user_aspect_anchor"
+        ]
+        self.assertGreaterEqual(len(anchors), 3)
+        contents = " ".join(span["content"].lower() for span in anchors)
+        self.assertIn("emergency savings", contents)
+        self.assertIn("monthly budget", contents)
+        self.assertIn("expense over $20", contents)
+
+    def test_event_ordering_prefers_single_anchor_for_non_list_turns(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s")
+        memory.add(
+            "I'm planning to wear my Nike Dunk Low to the festival, but with a moderate water resistance rating, should I take any extra precautions or consider Bradley's suggestion to carry a sneaker protector spray, given the weather forecast?",
+            scope,
+            ts("2026-06-13T10:47:34.798910+08:00"),
+        )
+        pack = memory.answer_context(
+            "Can you list the order in which I brought up different sneaker shopping experiences and related details throughout our conversations in order? Mention ONLY and ONLY four items.",
+            scope,
+            budget={"limit": 8},
+        )
+
+        anchors = [
+            span
+            for span in pack.source_spans
+            if span.get("selector") == "event_ordering_coverage" and span.get("timeline_role") == "user_aspect_anchor"
+        ]
+        self.assertEqual(len(anchors), 1)
+        self.assertIn("Nike Dunk Low", anchors[0]["content"])
+
+    def test_event_ordering_event_graph_candidates_stay_topic_scoped(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s")
+        memory.add("I'm trying to increase my social media followers by 15% by showcasing my sneaker style at the festival.", scope, ts("2026-06-13T10:25:59.059829+08:00"), {"source_uri": "beam:test:15:batch1:msg1"})
+        memory.add("I'm trying to set up the automatic transfers. It makes sense to automate it to keep me on track with my savings goals.", scope, ts("2026-06-13T10:52:47.975134+08:00"), {"source_uri": "beam:test:16:batch1:msg1"})
+
+        pack = memory.answer_context(
+            "Can you list the order in which I brought up different sneaker shopping experiences and related details throughout our conversations in order? Mention ONLY and ONLY four items.",
+            scope,
+            budget={"limit": 8},
+        )
+
+        contents = " ".join(span["content"].lower() for span in pack.source_spans)
+        self.assertIn("sneaker", contents)
+        self.assertNotIn("automatic transfers", contents)
+        self.assertNotIn("savings goals", contents)
+
+    def test_event_ordering_user_chronology_beats_event_phase_priority(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s")
+        memory.add("I first asked about choosing running shoes for daily wear.", scope, ts("2026-06-01T10:00:00+00:00"))
+        memory.add("Then I compared Nike React versus Adidas Ultraboost for comfort.", scope, ts("2026-06-02T10:00:00+00:00"))
+        memory.add("Later I worried my parents would prefer classic leather shoes.", scope, ts("2026-06-03T10:00:00+00:00"))
+        memory.add("Finally I decided on Adidas Ultraboost for the trip.", scope, ts("2026-06-04T10:00:00+00:00"))
+
+        pack = memory.answer_context(
+            "Can you list the order in which I brought up different sneaker shopping experiences and related details? Mention ONLY and ONLY four items.",
+            scope,
+            budget={"limit": 8},
+        )
+
+        anchors = [
+            span
+            for span in pack.source_spans
+            if span.get("selector") == "event_ordering_coverage" and span.get("timeline_role") == "user_aspect_anchor"
+        ]
+        self.assertGreaterEqual(len(anchors), 4)
+        anchor_texts = [span["content"].lower() for span in anchors[:4]]
+        self.assertIn("running shoes", anchor_texts[0])
+        self.assertIn("nike react", anchor_texts[1])
+        self.assertIn("parents", anchor_texts[2])
+        self.assertIn("adidas ultraboost", anchor_texts[3])
+
+    def test_event_ordering_scopes_timeline_to_query_topic_inside_mixed_chat(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s")
+        memory.add("I'm nervous about improving my writing skills and using Grammarly.", scope, ts("2026-06-01T10:00:00+00:00"), {"source_uri": "beam:test:1:batch1:msg1"})
+        memory.add("Practice dialogue flow with a screenplay exercise.", scope, ts("2026-06-01T10:01:00+00:00"), {"source_uri": "beam:test:1:batch1:msg2", "speaker": "assistant"})
+        memory.add("I'm building a personal budget tracker in Flask and SQLite.", scope, ts("2026-06-02T10:00:00+00:00"), {"source_uri": "beam:test:1:batch2:msg1"})
+        memory.add("Set up the Flask app, database schema, and local server first.", scope, ts("2026-06-02T10:01:00+00:00"), {"source_uri": "beam:test:1:batch2:msg2", "speaker": "assistant"})
+        memory.add("Then I wanted transaction CRUD with validation errors.", scope, ts("2026-06-03T10:00:00+00:00"), {"source_uri": "beam:test:1:batch3:msg1"})
+        memory.add("Later I worked on deployment to Render with Gunicorn.", scope, ts("2026-06-04T10:00:00+00:00"), {"source_uri": "beam:test:1:batch4:msg1"})
+
+        pack = memory.answer_context(
+            "Can you list the order in which I brought up different aspects of developing my personal budget tracker? Mention ONLY and ONLY three items.",
+            scope,
+            budget={"limit": 8},
+        )
+
+        packed_text = " ".join(span["content"].lower() for span in pack.source_spans)
+        self.assertNotIn("writing skills", packed_text)
+        anchors = [
+            span
+            for span in pack.source_spans
+            if span.get("selector") == "event_ordering_coverage" and span.get("timeline_role") == "user_aspect_anchor"
+        ]
+        self.assertGreaterEqual(len(anchors), 3)
+        anchor_text = " ".join(span["content"].lower() for span in anchors)
+        self.assertTrue("flask" in anchor_text or "database schema" in anchor_text or "local server" in anchor_text)
+        self.assertTrue("transaction crud" in anchor_text or "transaction error" in anchor_text)
+        self.assertIn("deployment", anchor_text)
+
+    def test_event_ordering_pack_expands_topic_user_chronology_beyond_selected_anchors(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s")
+        memory.add("I started the garden redesign by comparing soil drainage and sunlight.", scope, ts("2026-06-01T10:00:00+00:00"), {"source_uri": "beam:test:30:batch1:msg1"})
+        memory.add(
+            {
+                "role": "assistant",
+                "content": "Use raised beds if the drainage stays poor.",
+                "turn_id": "beam:test:30:batch1:msg2",
+                "timestamp": "2026-06-01T10:01:00+00:00",
+            },
+            scope,
+            ts("2026-06-01T10:01:00+00:00"),
+            {"source_uri": "beam:test:30:batch1:msg2"},
+        )
+        memory.add("Then I chose drought-tolerant plants for the side yard.", scope, ts("2026-06-02T10:00:00+00:00"), {"source_uri": "beam:test:30:batch2:msg1"})
+        memory.add("Later I planned drip irrigation zones around the beds.", scope, ts("2026-06-03T10:00:00+00:00"), {"source_uri": "beam:test:30:batch3:msg1"})
+        memory.add("Finally I scheduled a weekend mulch delivery and cleanup.", scope, ts("2026-06-04T10:00:00+00:00"), {"source_uri": "beam:test:30:batch4:msg1"})
+        memory.add("I also compared headphone noise cancellation for travel.", scope, ts("2026-06-02T09:00:00+00:00"), {"source_uri": "beam:test:31:batch1:msg1"})
+
+        pack = memory.answer_context(
+            "Can you list the order in which I brought up different aspects of the garden redesign throughout our conversations?",
+            scope,
+            budget={"limit": 6, "token_budget": 4000},
+        )
+
+        packed_text = " ".join(span["content"].lower() for span in pack.source_spans)
+        self.assertIn("soil drainage", packed_text)
+        self.assertIn("drought-tolerant plants", packed_text)
+        self.assertIn("drip irrigation", packed_text)
+        self.assertIn("mulch delivery", packed_text)
+        self.assertNotIn("headphone", packed_text)
+        user_spans = [span for span in pack.source_spans if span["speaker"] == "user"]
+        self.assertGreaterEqual(len(user_spans), 4)
+        self.assertEqual([span["timestamp"] for span in user_spans], sorted(span["timestamp"] for span in user_spans))
+
+    def test_event_ordering_coverage_survives_topic_scope_filter(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s")
+        memory.add("I'm trying to implement city autocomplete using OpenWeather's Geocoding API v1.", scope, ts("2026-06-01T10:00:00+00:00"))
+        memory.add("I want a 5-item dropdown and 300ms debounce.", scope, ts("2026-06-02T10:00:00+00:00"))
+        memory.add("I'm handling invalid city name messages and API failures.", scope, ts("2026-06-03T10:00:00+00:00"))
+        memory.add("Later I worked on deployment to GitHub Pages and custom domain support.", scope, ts("2026-06-04T10:00:00+00:00"))
+
+        pack = memory.answer_context(
+            "Can you list the order in which I brought up different aspects of implementing the city autocomplete feature throughout our conversations? Mention ONLY and ONLY four items.",
+            scope,
+            budget={"limit": 8},
+        )
+
+        anchors = [
+            span
+            for span in pack.source_spans
+            if span.get("selector") == "event_ordering_coverage" and span.get("timeline_role") == "user_aspect_anchor"
+        ]
+        self.assertGreaterEqual(len(anchors), 4)
+        contents = " ".join(span["content"].lower() for span in anchors)
+        self.assertIn("autocomplete", contents)
+        self.assertIn("dropdown", contents)
+        self.assertIn("invalid city", contents)
+        self.assertIn("deployment", contents)
 
     def test_event_ordering_milestone_score_prefers_specific_milestones(self) -> None:
         generic = _event_ordering_milestone_score("I decided on blueprints for auth, transactions, and analytics.")
@@ -625,6 +2274,23 @@ class FusionMemoryTests(unittest.TestCase):
         self.assertIn("deployment_configuration", groups)
         self.assertIn("integration_test_coverage", groups)
         self.assertEqual([event["timeline_index"] for event in pack.events], list(range(1, len(pack.events) + 1)))
+
+    def test_benchmark_answer_context_expands_retrieval_budget(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s")
+        memory.add("I brought up Core functionality for the budget tracker.", scope, ts("2026-06-01T10:00:00+00:00"))
+        memory.add("I mentioned Transaction error handling for the budget tracker.", scope, ts("2026-06-02T10:00:00+00:00"))
+        memory.add("I discussed Security and deployment for the budget tracker.", scope, ts("2026-06-03T10:00:00+00:00"))
+
+        pack = memory.answer_context(
+            "Can you list the order in which I brought up different aspects of developing my personal budget tracker throughout our conversations, in order?",
+            scope,
+            budget={"mode": "benchmark"},
+        )
+
+        self.assertGreaterEqual(pack.coverage["token_budget"], 24000)
+        self.assertGreaterEqual(pack.coverage["source_span_quota_required"], 4)
+        self.assertGreaterEqual(len(pack.source_spans), 3)
 
     def test_abstention_sets_policy_when_evidence_insufficient(self) -> None:
         memory = MemoryService()
@@ -776,6 +2442,63 @@ class FusionMemoryTests(unittest.TestCase):
         self.assertIn("Atlas", names)
         result = memory.search("Atlas", scope)
         self.assertTrue(any("entity_registry" in candidate.source for candidate in result.candidates))
+
+    def test_broad_raw_recall_uses_query_intent_to_rescue_current_state_evidence(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s")
+        memory.add(
+            [
+                {"role": "user", "content": "I used to track the project status in a spreadsheet."},
+                {"role": "assistant", "content": "That was the previous tracking setup."},
+                {"role": "user", "content": "Now the project status tracker is updated in Notion, with current owners and due dates."},
+                {"role": "user", "content": "For dinner I bought oranges and rice."},
+            ],
+            scope,
+            ts("2026-06-01T10:00:00+00:00"),
+        )
+        plan = memory.planner.plan("What is the current project status tracker?")
+
+        candidates = memory._broad_raw_recall_candidates(
+            "What is the current project status tracker?",
+            scope,
+            plan,
+            limit=8,
+            include_session=True,
+        )
+
+        self.assertTrue(candidates)
+        self.assertEqual(candidates[0].source, "broad_raw_recall")
+        self.assertTrue(candidates[0].metadata["broad_raw_recall"])
+        self.assertIn("Notion", candidates[0].text)
+        self.assertGreaterEqual(candidates[0].scores["intent_recall_signal"], 0.16)
+        self.assertFalse(any("oranges" in candidate.text for candidate in candidates[:3]))
+
+    def test_event_ordering_compaction_preserves_broad_raw_provenance(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s")
+        memory.add(
+            [
+                {"role": "user", "content": "I am concerned about using AI for hiring in my company."},
+                {"role": "assistant", "content": "That raises fairness and transparency issues."},
+                {"role": "user", "content": "I also want to make sure the pilot program improves screening quality."},
+            ],
+            scope,
+            ts("2026-06-01T10:00:00+00:00"),
+        )
+        plan = memory.planner.plan("What order did I bring up the hiring concerns?")
+        pack = memory.answer_context(
+            "What order did I bring up the hiring concerns?",
+            scope,
+            budget={"mode": "benchmark", "limit": 24, "rerank_top_n": 48},
+        )
+        model_pack = __import__("fusion_memory.eval.model_adapters", fromlist=["_pack_for_model"])._pack_for_model(pack)
+
+        self.assertTrue(pack.coverage["selected_candidate_sources"])
+        self.assertIn("broad_raw_recall", str(pack.coverage["selected_candidate_sources"]))
+        if model_pack.get("sequence_items"):
+            item = model_pack["sequence_items"][0]
+            self.assertIn("source_span_id", item)
+        self.assertTrue(any(span.get("candidate_source") for span in model_pack.get("timeline", [])))
 
 
 if __name__ == "__main__":

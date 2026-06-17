@@ -2,6 +2,7 @@
 
 Fusion Memory 是一个面向 Agent 的通用记忆系统本地 MVP。它基于：
 
+- 新手安装：[docs/quickstart.md](docs/quickstart.md)
 - [docs/fusion-memory-architecture.md](docs/fusion-memory-architecture.md)
 - [docs/fusion-memory-execution-plan.md](docs/fusion-memory-execution-plan.md)
 - [docs/requirements.md](docs/requirements.md)
@@ -35,6 +36,26 @@ PYTHONDONTWRITEBYTECODE=1 python -m compileall -q fusion_memory tests
 当前测试结果：70 个 unittest 通过，1 个 live Postgres 测试因未设置 `FUSION_MEMORY_POSTGRES_DSN` 按预期跳过；本地 Docker Postgres/pgvector verifier 和本地 Qwen runtime smoke 已手动通过。
 
 ## 快速开始
+
+面向新手的默认 SQLite 本地服务：
+
+```bash
+cd /public/home/wwb/memory
+sh install.sh
+fusion-memory start
+fusion-memory status
+```
+
+`install.sh` / `install.ps1` 安装完成后会自动提示初始化数据库、embedding、reranker、extractor/router。默认一路回车即可使用 SQLite + 内置轻量模型；API key 只通过环境变量读取，不写入配置文件。
+
+常用维护命令：
+
+```bash
+fusion-memory doctor
+fusion-memory backup
+fusion-memory upgrade --dry-run
+fusion-memory stop
+```
 
 ```bash
 cd /public/home/wwb/memory

@@ -57,6 +57,11 @@ def make_handler(state: MemoryServerState) -> type[BaseHTTPRequestHandler]:
                             _scope(payload),
                             budget=payload.get("budget"),
                         )
+                    elif path in {"/clear", "/delete"}:
+                        result = state.service.clear(
+                            _scope(payload),
+                            allow_cross_session=bool(payload.get("allow_cross_session", False)),
+                        )
                     else:
                         self._write_json(404, {"error": "not_found"})
                         return
@@ -112,7 +117,7 @@ def main() -> None:
     server = serve(service, host=args.host, port=args.port)
 
     def stop(_signum: int, _frame: Any) -> None:
-        server.shutdown()
+        threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)

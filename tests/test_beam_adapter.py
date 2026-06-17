@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 from fusion_memory import MemoryService, Scope
+from fusion_memory.eval.adapter import EvalQuery
 from fusion_memory.eval.beam_adapter import BeamAdapter, _event_ordering_score
 
 
@@ -46,6 +47,11 @@ class BeamAdapterTests(unittest.TestCase):
             self.assertIn("information_extraction", report["query_type_mapping"])
             self.assertEqual(report["evidence_pack_trace_coverage"], 1.0)
             self.assertTrue(report["answers"][0]["evidence_pack"]["source_span_ids"])
+            self.assertIn("source_span_quota_met", report["answers"][0])
+            self.assertIn("coverage_insufficient", report["answers"][0])
+            self.assertIn("answer_model", report["answers"][0])
+            self.assertIn("judge_model", report["answers"][0])
+            self.assertIn("llm_calls", report["answers"][0])
             self.assertEqual(set(output["ablation"]), {"retrieval_modes"})
 
     def test_beam_adapter_passes_category_context_to_answer_model(self) -> None:
@@ -79,6 +85,65 @@ class BeamAdapterTests(unittest.TestCase):
         self.assertEqual(answer_model.calls[0]["benchmark"], "BEAM")
         self.assertEqual(answer_model.calls[0]["category"], "instruction_following")
         self.assertEqual(answer_model.calls[0]["metadata"], {})
+
+    def test_beam_adapter_passes_category_hint_to_retrieval(self) -> None:
+        class CaptureService(MemoryService):
+            def __init__(self) -> None:
+                super().__init__()
+                self.answer_context_calls = []
+
+            def answer_context(self, query, scope, budget=None):
+                self.answer_context_calls.append({"query": query, "scope": scope, "budget": dict(budget or {})})
+                return super().answer_context(query, scope, budget=budget)
+
+        class StaticAnswer:
+            version = "static-answer"
+
+            def answer_with_context(self, query, pack, *, benchmark=None, category=None, metadata=None):
+                return "There is contradictory information."
+
+        class AlwaysMatchJudge:
+            version = "always-match"
+
+            def rubric_score(self, query, answer, rubric_item):
+                return 1.0, "ok"
+
+        service = CaptureService()
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a")
+        adapter = BeamAdapter(service, scope, split="100k", answer_model=StaticAnswer(), judge_model=AlwaysMatchJudge())
+        service.add("I have never used Excel for tracking expenses.", adapter._beam_scope("beam:100k:1:contradiction_resolution:0"))
+        result = adapter.answer_query(
+            EvalQuery(
+                id="beam:100k:1:contradiction_resolution:0",
+                query="Have I used Excel for tracking expenses?",
+                gold_answers=["There is contradictory information."],
+                category="contradiction_resolution",
+                metadata={"rubric": ["LLM response should contain: There is contradictory information."]},
+            )
+        )
+
+        self.assertEqual(result.query_type, "contradiction_resolution")
+        self.assertEqual(service.answer_context_calls[0]["budget"]["query_type_hint"], "contradiction_resolution")
+
+    def test_beam_adapter_scopes_official_queries_to_their_chat_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset = _write_official_beam_fixture(Path(tmp), include_second_chat=True)
+            service = MemoryService()
+            scope = Scope(workspace_id="w", user_id="u", agent_id="a")
+            adapter = BeamAdapter(service, scope, split="100k")
+            adapter.ingest_dataset(dataset, split="100k")
+            query = next(
+                item
+                for item in adapter.build_queries(dataset, split="100k")
+                if item.id == "beam:100k:1:information_extraction:0"
+            )
+
+            result = adapter.answer_query(query)
+
+        self.assertTrue(result.retrieved_source_span_ids)
+        spans = [service.get(span_id, "span") for span_id in result.retrieved_source_span_ids]
+        self.assertTrue(all(span and span.scope.session_id == "beam:100k:1" for span in spans))
+        self.assertFalse(any(span and span.scope.session_id == "beam:100k:2" for span in spans))
 
     def test_beam_adapter_reports_answer_model_failures(self) -> None:
         class FailingAnswer:
@@ -174,7 +239,7 @@ class BeamAdapterTests(unittest.TestCase):
             self.assertNotIn("retrieval_match_rate", data["report"])
 
 
-def _write_official_beam_fixture(base: Path) -> Path:
+def _write_official_beam_fixture(base: Path, *, include_second_chat: bool = False) -> Path:
     chat_dir = base / "chats" / "100K" / "1"
     questions_dir = chat_dir / "probing_questions"
     questions_dir.mkdir(parents=True)
@@ -234,6 +299,43 @@ def _write_official_beam_fixture(base: Path) -> Path:
         ),
         encoding="utf-8",
     )
+    if include_second_chat:
+        chat2_dir = base / "chats" / "100K" / "2"
+        questions2_dir = chat2_dir / "probing_questions"
+        questions2_dir.mkdir(parents=True)
+        (chat2_dir / "chat.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "batch_number": 1,
+                        "turns": [
+                            [
+                                {
+                                    "role": "user",
+                                    "id": 1,
+                                    "time_anchor": "March-16-2024",
+                                    "content": "I prefer Pinecone for Atlas retrieval.",
+                                }
+                            ]
+                        ],
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+        (questions2_dir / "probing_questions.json").write_text(
+            json.dumps(
+                {
+                    "information_extraction": [
+                        {
+                            "question": "What does Atlas retrieval use?",
+                            "answer": "Pinecone",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
     return base
 
 

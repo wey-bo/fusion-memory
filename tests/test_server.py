@@ -54,6 +54,36 @@ class ServerTests(unittest.TestCase):
                 },
             )
             self.assertTrue(search["candidates"])
+
+            clear = _post_or_get(
+                f"{base_url}/clear",
+                {
+                    "scope": scope,
+                    "allow_cross_session": True,
+                },
+            )
+            self.assertTrue(clear["ok"])
+            self.assertEqual(clear["operation"], "clear_scope")
+            self.assertGreaterEqual(clear["deleted"]["evidence_spans"], 1)
+
+            after_clear = _post_or_get(
+                f"{base_url}/search",
+                {
+                    "query": "What do I prefer for Atlas retrieval?",
+                    "scope": scope,
+                    "options": {"limit": 3},
+                },
+            )
+            self.assertFalse(after_clear["candidates"])
+
+            delete_alias = _post_or_get(
+                f"{base_url}/delete",
+                {
+                    "scope": scope,
+                    "allow_cross_session": True,
+                },
+            )
+            self.assertTrue(delete_alias["ok"])
         finally:
             server.shutdown()
             thread.join(timeout=2)

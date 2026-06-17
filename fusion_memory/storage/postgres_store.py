@@ -1491,6 +1491,77 @@ class PostgresMemoryStore:
     def get_trace(self, trace_id: str, scope: Scope | None = None, *, include_session: bool = False) -> dict[str, Any] | None:
         return self.runtime.get_trace(trace_id, scope, include_session=include_session)
 
+    def clear_scope(self, scope: Scope, *, include_session: bool = False) -> dict[str, Any]:
+        where, params = _scope_where(scope, include_session=include_session)
+        conn = self.connect()
+        cursor = conn.cursor()
+        scoped_tables = [
+            "evidence_spans",
+            "memory_facts",
+            "events",
+            "current_views",
+            "entity_profiles",
+            "entities",
+            "encoding_decisions",
+            "debug_traces",
+            "audit_events",
+            "background_tasks",
+        ]
+        counts: dict[str, int] = {}
+        try:
+            fact_ids = self._select_ids(cursor, "memory_facts", "fact_id", where, params)
+            event_ids = self._select_ids(cursor, "events", "event_id", where, params)
+            counts["fact_relations"] = self._delete_related_ids(
+                cursor,
+                "fact_relations",
+                ("from_fact_id", "to_fact_id"),
+                fact_ids,
+            )
+            counts["event_edges"] = self._delete_related_ids(
+                cursor,
+                "event_edges",
+                ("from_event_id", "to_event_id"),
+                event_ids,
+            )
+            for table in scoped_tables:
+                cursor.execute(f"delete from {table} where {where}", params)
+                counts[table] = cursor.rowcount if cursor.rowcount >= 0 else 0
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cursor.close()
+        return {"deleted": counts, "include_session": include_session}
+
+    def _select_ids(
+        self,
+        cursor: Any,
+        table: str,
+        id_column: str,
+        where: str,
+        params: list[Any],
+    ) -> list[str]:
+        cursor.execute(f"select {id_column} from {table} where {where}", params)
+        return [row[0] for row in cursor.fetchall()]
+
+    def _delete_related_ids(
+        self,
+        cursor: Any,
+        table: str,
+        id_columns: tuple[str, str],
+        object_ids: list[str],
+    ) -> int:
+        if not object_ids:
+            return 0
+        placeholders = ", ".join(["%s"] * len(object_ids))
+        first, second = id_columns
+        cursor.execute(
+            f"delete from {table} where {first} in ({placeholders}) or {second} in ({placeholders})",
+            [*object_ids, *object_ids],
+        )
+        return cursor.rowcount if cursor.rowcount >= 0 else 0
+
     def insert_audit_event(
         self,
         scope: Scope,

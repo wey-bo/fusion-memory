@@ -199,13 +199,32 @@ class RuleBasedExtractor:
         return out
 
     def _extract_event_candidates(self, span: EvidenceSpan, session_time: datetime) -> list[ExtractedCandidate]:
+        generic_facets = extract_generic_event_facets(span.content) if span.speaker == "user" else []
         milestone_mentions = extract_milestone_mentions(span.content) if span.speaker == "user" else []
-        if not milestone_mentions and not EVENT_RE.search(span.content):
+        if not generic_facets and not milestone_mentions and not EVENT_RE.search(span.content):
             return []
         normalized = self.temporal.normalize(span.content, session_time)
         participants = list(dict.fromkeys([*(extract_entities(span.content) or ["user"]), *_topic_terms(span.content)[:6]]))
+        out: list[ExtractedCandidate] = []
+        for facet, label, snippet in generic_facets[:6]:
+            out.append(
+                self._candidate(
+                    "event",
+                    _facet_description(facet, label, snippet),
+                    span,
+                    {
+                        "event_type": facet,
+                        "participants": list(dict.fromkeys([facet, label.lower(), *participants])),
+                        "description": _facet_description(facet, label, snippet),
+                        "time_start": normalized.time_start.isoformat() if normalized.time_start else None,
+                        "time_end": normalized.time_end.isoformat() if normalized.time_end else None,
+                        "time_granularity": normalized.granularity,
+                        "time_source": normalized.source,
+                        "confidence": 0.80,
+                    },
+                )
+            )
         if milestone_mentions:
-            out: list[ExtractedCandidate] = []
             for milestone, snippet in milestone_mentions[:4]:
                 out.append(
                     self._candidate(
@@ -224,6 +243,8 @@ class RuleBasedExtractor:
                         },
                     )
                 )
+            return out
+        if out:
             return out
         description = compact_summary(span.content, 240)
         return [
@@ -296,6 +317,131 @@ def _event_type(text: str) -> str:
     if re.search(r"\b(?:planned|discussed|mentioned|asked|brought\s+up|came\s+up)\b", text, re.I):
         return "milestone"
     return "user_action"
+
+
+GENERIC_EVENT_FACETS = {
+    "user_introduced_aspect",
+    "preference_change",
+    "plan_step",
+    "concern",
+    "decision",
+    "activity",
+    "constraint",
+    "request_for_comparison",
+    "count_list_mention",
+}
+
+
+def extract_generic_event_facets(text: str) -> list[tuple[str, str, str]]:
+    out: list[tuple[str, str, str]] = []
+    for segment in _generic_event_segments(text):
+        for facet in classify_event_facets(segment):
+            label = _facet_label(segment, facet)
+            if not label:
+                continue
+            out.append((facet, label, segment))
+    deduped: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for facet, label, segment in out:
+        key = (facet, _facet_key(label))
+        if key in seen:
+            continue
+        deduped.append((facet, label, segment))
+        seen.add(key)
+    return deduped[:8]
+
+
+def classify_event_facet(text: str) -> str | None:
+    facets = classify_event_facets(text)
+    return facets[0] if facets else None
+
+
+def classify_event_facets(text: str) -> list[str]:
+    lower = text.lower()
+    if _low_value_event_segment(lower):
+        return []
+    out: list[str] = []
+    if re.search(r"\b(?:switched|moved|changed|now prefer|now preferred|instead of|rather than)\b", lower):
+        out.append("preference_change")
+    if re.search(r"\b(?:decided|chose|picked|settled on|went with|opted for)\b", lower):
+        out.append("decision")
+    if re.search(r"\b(?:worried|concerned|concern|stressed|anxious|trouble|issue|problem|error|blocked|struggling)\b", lower):
+        out.append("concern")
+    if re.search(r"\b(?:always|never|must|need to|have to|required|requirement|constraint|deadline|budget|limit|only|format)\b", lower):
+        out.append("constraint")
+    if re.search(r"\b(?:compare|compared|comparing|comparison|versus|vs\.?|between|which (?:one|option)|choose between|decide between)\b", lower):
+        out.append("request_for_comparison")
+    if re.search(r"\b(?:how many|total|unique|count|number of|list(?:ed)?(?: of)?|ways to|different (?:ways|items|options|topics|calculations|movies|books|series|genres)|(?:two|three|four|five|six|seven|eight|nine|\d+)\s+(?:ways|items|options|topics|calculations|movies|books|series|genres))\b", lower):
+        out.append("count_list_mention")
+    if re.search(r"\b(?:plan|planned|planning|schedule|step|sprint|phase|timeline|roadmap)\b", lower):
+        out.append("plan_step")
+    if re.search(r"\b(?:started|finished|completed|implemented|configured|tested|deployed|launched|created|added|fixed|reviewed|worked on|working on|trying to)\b", lower):
+        out.append("activity")
+    if re.search(r"\b(?:brought up|mentioned|discussed|asked about|asked|want to|i want|i need|i'm trying|i am trying)\b", lower):
+        out.append("user_introduced_aspect")
+    return out
+
+
+def _generic_event_segments(text: str) -> list[str]:
+    normalized = re.sub(r"```.*?```", " ", text, flags=re.S)
+    lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+    segments: list[str] = []
+    for line in lines:
+        line = re.sub(r"^\s*#{1,6}\s*", "", line).strip()
+        bullet = re.match(r"^(?:[-*+]|\d+[.)]|[A-Za-z][.)])\s+(.{8,})$", line)
+        if bullet:
+            segments.append(bullet.group(1).strip())
+            continue
+        if re.match(r"^[A-Z][A-Za-z0-9 /&+_.-]{2,60}:\s+.{6,}$", line):
+            segments.append(line)
+    if not segments:
+        segments = [
+            part.strip(" -:\n\t")
+            for part in re.split(r"(?:\n{2,}|\.\s+|;\s+|\?\s+|!\s+|,\s+(?:and|but|so|because|while|also)\s+)", normalized)
+            if len(part.strip(" -:\n\t")) >= 18
+        ]
+    if not segments and len(normalized.strip()) >= 18:
+        segments = [normalized.strip()]
+    return [compact_summary(segment, 260) for segment in segments[:40]]
+
+
+def _low_value_event_segment(lower: str) -> bool:
+    return bool(
+        re.fullmatch(r"(?:ok|okay|thanks|thank you|sure|great|yes|no)[.!]?", lower.strip())
+        or re.search(r"\b(?:can you help me with that|can you review this|what do you think)\??$", lower.strip())
+    )
+
+
+def _facet_label(text: str, facet: str) -> str:
+    cleaned = re.sub(r"```.*?```", " ", text, flags=re.S)
+    cleaned = re.sub(r"\*\*([^*]+)\*\*", r"\1", cleaned)
+    cleaned = re.sub(r"`([^`]+)`", r"\1", cleaned)
+    cleaned = re.sub(r"^\s*(?:[-*+]|\d+[.)]|[A-Za-z][.)])\s+", "", cleaned)
+    if ":" in cleaned and len(cleaned.split(":", 1)[0].strip()) <= 70:
+        prefix, rest = cleaned.split(":", 1)
+        if len(prefix.strip()) >= 3:
+            cleaned = prefix.strip() if facet in {"user_introduced_aspect", "plan_step"} else f"{prefix.strip()}: {rest.strip()}"
+    cleaned = re.sub(
+        r"^\s*(?:i(?:'m| am)?|we(?:'re| are)?)\s+(?:am\s+|are\s+)?(?:trying to|want to|need to|started|finished|completed|implemented|configured|tested|deployed|launched|created|added|fixed|reviewed|worked on|working on|planning to|plan to|decided to|chose to|worried about|concerned about)\s+",
+        "",
+        cleaned,
+        flags=re.I,
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -;.")
+    terms = _topic_terms(cleaned)
+    if not cleaned or not terms:
+        return ""
+    return cleaned[:120]
+
+
+def _facet_key(label: str) -> str:
+    terms = [term for term in _topic_terms(label) if term not in {"trying", "want", "need", "help"}]
+    return "-".join(terms[:6])
+
+
+def _facet_description(facet: str, label: str, text: str) -> str:
+    facet_label = facet.replace("_", " ")
+    return f"Facet [{facet}]: {facet_label}. Label: {compact_summary(label, 90)}. Evidence: {compact_summary(text, 220)}"
 
 
 def classify_milestone(text: str) -> str | None:

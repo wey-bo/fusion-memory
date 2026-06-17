@@ -30,16 +30,107 @@ from fusion_memory.ingestion.normalizer import normalize_input
 from fusion_memory.ingestion.views import ViewBuilder
 from fusion_memory.ingestion.window_builder import build_session_summary_span
 from fusion_memory.retrieval.evidence_pack import EvidencePackBuilder
+from fusion_memory.retrieval.event_graph_selection import (
+    _event_milestone_group,
+    _event_ordering_milestone_score,
+    _select_event_ordering_representatives,
+)
+from fusion_memory.retrieval.candidate_provider import build_candidate_lists
+from fusion_memory.retrieval.aggregation_keys import (
+    aggregation_keys_for_query as _aggregation_keys,
+    combinatorics_aggregation_keys,
+    generic_aggregation_keys,
+    generic_list_candidate_keys,
+    is_combinatorics_aggregation_query as _is_combinatorics_aggregation_query,
+    is_generic_count_or_list_query,
+    is_stress_break_aggregation_query as _is_stress_break_aggregation_query,
+    stress_break_aggregation_keys,
+    vendor_tool_aggregation_keys,
+)
 from fusion_memory.retrieval.mmr import mmr
 from fusion_memory.retrieval.query_planner import QueryPlanner
 from fusion_memory.retrieval.raw_evidence_quota import RawEvidenceQuota
 from fusion_memory.retrieval.reranker import LexicalCrossEncoderReranker, Reranker, rerank_candidates
 from fusion_memory.retrieval.rrf import reciprocal_rank_fusion
 from fusion_memory.retrieval.scoring import score_candidate
+from fusion_memory.retrieval.structured_annotations import select_event_ordering_timeline
 from fusion_memory.retrieval.utility_model import LogisticUtilityScorer, UtilityTrainingReport
 from fusion_memory.retrieval.utility_scorer import utility_example
 from fusion_memory.storage.postgres_store import PostgresMemoryStore
 from fusion_memory.storage.sqlite_store import SQLiteMemoryStore, dt_from_str
+from fusion_memory.api.service_helpers import (
+    _source_coverage,
+    _broad_recall_candidate_allowed,
+    _replaceable_low_synthesis_index,
+    _dedupe_event_ordering_support_events,
+    TOPIC_SCOPE_STOPWORDS,
+    TOPIC_SCOPE_EQUIVALENTS,
+    _topic_scope_group_limit,
+    _topic_scope_groups,
+    _topic_scope_score,
+    _exact_overlap_score,
+    _surface_claim_polarity,
+    _topic_phrase_bonus,
+    _topic_anchor_phrases_for_service,
+    _clean_topic_anchor_for_service,
+    _topic_anchor_score_for_service,
+    _topic_scope_tokens,
+    _expand_topic_tokens,
+    _span_group_key,
+    _date_signal,
+    _temporal_target_roles_for_service,
+    _temporal_roles_in_text,
+    _temporal_focus_terms_for_service,
+    _exact_query_terms,
+    _aggregation_query_terms,
+    _broad_raw_recall_queries,
+    _intent_string_list,
+    _intent_recall_signal,
+    _scent_trail_queries,
+    _ordered_topic_scope_tokens,
+    _scent_trail_score,
+    _quality_fallback_terms,
+    _fallback_salience_score,
+    _aggregation_signal,
+    _adjacent_assistant_recommendation_spans,
+    _aggregation_recommendation_request_signal,
+    _recommendation_request_specificity,
+    _assistant_recommendation_list_signal,
+    _synthesis_evidence_signal,
+    _is_cross_factor_synthesis_query,
+    _synthesis_candidate_key,
+    _aggregation_focus_priority,
+    _is_generic_count_or_list_query,
+    _generic_aggregation_keys,
+    _clean_generic_aggregation_key,
+    _quoted_title_candidates,
+    _normalize_title_key,
+    _is_non_title_quote,
+    _has_value_intent,
+    _has_current_intent,
+    _compatible_value_mention,
+    _value_signal,
+    _current_state_signal,
+    _code_identifier_signal,
+    EVENT_ORDERING_STOPWORDS,
+    _candidate_in_timeline_window,
+    _natural_turn_key,
+    _key_diverse_aggregation_candidates,
+    _aggregation_scene_representatives,
+    _aggregation_context_support_candidate,
+    _aggregation_group_support_specificity,
+    _high_value_aggregation_context_support,
+    _aggregation_query_date_support,
+    _aggregation_context_specificity,
+    _aggregation_query_context_keys,
+    _is_broad_exploration_aggregation_query,
+    _service_date_scope_labels,
+    _sanitize_model_call,
+    _model_call_summary,
+    _labeled_precision,
+    ORDER_RE,
+    _explicit_order_mentions,
+)
 
 
 class MemoryService:
@@ -54,6 +145,9 @@ class MemoryService:
         storage_backend: str = "sqlite",
         store: Any | None = None,
         store_connect: Any | None = None,
+        query_intent_refiner: Any | None = None,
+        query_intent_refiner_min_confidence: float = 0.70,
+        query_intent_refiner_mode: str = "auto",
     ) -> None:
         self.config = config or DEFAULT_CONFIG
         if store is not None:
@@ -68,7 +162,11 @@ class MemoryService:
         self.extractor = extractor or RuleBasedExtractor()
         self.gate = EncodingGate(self.config)
         self.views = ViewBuilder()
-        self.planner = QueryPlanner()
+        self.planner = QueryPlanner(
+            intent_refiner=query_intent_refiner,
+            intent_refiner_min_confidence=query_intent_refiner_min_confidence,
+            intent_refiner_mode=query_intent_refiner_mode,
+        )
         self.quota = RawEvidenceQuota(self.store, self.config)
         self.pack_builder = EvidencePackBuilder(self.store, self.config)
         self.utility_scorer = LogisticUtilityScorer()
@@ -112,6 +210,9 @@ class MemoryService:
         existing_facts = self.store.list_facts(scope)
         extraction_spans = [span for span in spans if span.span_type not in {"window", "summary"}]
         candidates = self.extractor.extract(extraction_spans, existing_facts, session_time)
+        extractor_telemetry = getattr(self.extractor, "last_telemetry", None)
+        if isinstance(extractor_telemetry, dict) and extractor_telemetry:
+            trace["steps"].append({"step": "extractor_telemetry", **extractor_telemetry})
         decisions = self.gate.decide(candidates, existing_facts)
         accepted_fact_ids: list[str] = []
         accepted_event_ids: list[str] = []
@@ -219,7 +320,9 @@ class MemoryService:
         )
         model_call_marks = self._model_call_marks()
         trace_id = new_id("trace")
-        plan = self.planner.plan(query)
+        precomputed_plan = options.get("_plan")
+        plan = precomputed_plan or self.planner.plan(query, query_type_hint=options.get("query_type_hint"))
+        intent_telemetry = options.get("_intent_telemetry") if precomputed_plan else self.planner.last_intent_telemetry
         candidate_lists = self._candidate_lists(
             query,
             scope,
@@ -245,20 +348,54 @@ class MemoryService:
         )
         preselected = mmr(scored_again, limit=rerank_top_n, lambda_=self.config.mmr_lambda)
         preselected = self._preserve_high_signal_exact(scored_again, preselected, rerank_top_n)
+        preselected = self._preserve_scent_trail(scored_again, preselected, rerank_top_n)
+        preselected = self._preserve_broad_raw_recall(query, plan, scored_again, preselected, rerank_top_n)
+        if plan.query_type == "temporal_lookup":
+            preselected = self._preserve_temporal_coverage(scored_again, preselected, rerank_top_n)
+        if plan.query_type == "multi_session_reasoning":
+            preselected = self._preserve_aggregation_coverage(query, scored_again, preselected, rerank_top_n)
+            preselected = self._preserve_user_synthesis_anchors(scored_again, preselected, rerank_top_n)
+        if plan.query_type == "contradiction_resolution":
+            preselected = self._preserve_contradiction_claim_coverage(scored_again, preselected, rerank_top_n)
         preselected = self._preserve_high_ranked_summaries(scored_again, preselected, rerank_top_n)
         if plan.query_type == "event_ordering":
-            preselected = self._preserve_event_ordering_events(scored_again, preselected, rerank_top_n)
+            preselected = self._preserve_event_ordering_events(query, scored_again, preselected, rerank_top_n)
+            preselected = self._preserve_event_ordering_raw_facets(query, scored_again, preselected, rerank_top_n)
         rerank_applied = mode in {"balanced", "benchmark"}
         if rerank_applied:
             reranked = rerank_candidates(query, preselected, self.reranker)
             selected = self._preserve_quota_after_rerank(reranked, quota_result.selected_span_ids, limit)
             selected = self._preserve_high_signal_exact(scored_again, selected, limit)
+            selected = self._preserve_scent_trail(scored_again, selected, limit)
+            selected = self._preserve_broad_raw_recall(query, plan, scored_again, selected, limit)
+            if plan.query_type == "temporal_lookup":
+                selected = self._preserve_temporal_coverage(scored_again, selected, limit)
+            if plan.query_type == "multi_session_reasoning":
+                selected = self._preserve_aggregation_coverage(query, scored_again, selected, limit)
+                selected = self._preserve_user_synthesis_anchors(scored_again, selected, limit)
+            if plan.query_type == "contradiction_resolution":
+                selected = self._preserve_contradiction_claim_coverage(scored_again, selected, limit)
             selected = self._preserve_high_ranked_summaries(scored_again, selected, limit)
             if plan.query_type == "event_ordering":
-                selected = self._preserve_event_ordering_events(scored_again, selected, limit)
+                selected = self._preserve_event_ordering_events(query, scored_again, selected, limit)
+                selected = self._preserve_event_ordering_raw_facets(query, scored_again, selected, limit)
         else:
             selected = preselected[:limit]
         selected = self._apply_topic_scope_filter(query, plan, scored_again, selected, limit)
+        selected = self._apply_quality_fallback(query, plan, scope, scored_again, selected, limit, include_session=include_session)
+        selected = self._preserve_broad_raw_recall(query, plan, scored_again, selected, limit)
+        if plan.query_type == "temporal_lookup":
+            selected = self._preserve_temporal_coverage(scored_again, selected, limit)
+        if plan.query_type == "multi_session_reasoning":
+            selected = self._preserve_aggregation_coverage(query, scored_again, selected, limit)
+            selected = self._preserve_user_synthesis_anchors(scored_again, selected, limit)
+        if plan.query_type == "contradiction_resolution":
+            selected = self._preserve_contradiction_claim_coverage(scored_again, selected, limit)
+        if plan.query_type == "event_ordering":
+            selected = self._preserve_event_ordering_events(query, scored_again, selected, limit)
+            selected = self._preserve_event_ordering_raw_facets(query, scored_again, selected, limit)
+        selected = self._apply_topic_scope_filter(query, plan, scored_again, selected, limit)
+        selected = self._preserve_broad_raw_recall(query, plan, scored_again, selected, limit)
         for candidate in selected:
             self.store.insert_utility_example(utility_example(trace_id, query, plan, candidate))
         shadow_ranking = self.utility_scorer.rank_shadow(selected, plan) if self.utility_scorer.trained else []
@@ -267,10 +404,14 @@ class MemoryService:
             "source_span_quota_required": quota_result.required,
             "source_span_quota_selected": len(quota_result.selected_span_ids),
             "selected_span_ids": quota_result.selected_span_ids,
+            "selected_candidate_sources": list(dict.fromkeys(candidate.source for candidate in selected)),
+            "quality_fallback_selected": any(candidate.source == "quality_fallback" for candidate in selected),
             "source_span_quota_met": not quota_result.coverage_insufficient,
             "coverage_insufficient": quota_result.coverage_insufficient,
             "raw_quota_backfilled": quota_result.backfilled,
         }
+        if intent_telemetry:
+            coverage["query_intent_telemetry"] = intent_telemetry
         trace = {
             "operation": "search",
             "query": query,
@@ -303,6 +444,19 @@ class MemoryService:
                 "ranking": shadow_ranking,
             },
         }
+        for candidate in selected:
+            if plan.query_type == "contradiction_resolution" and "contradiction_claim_" in candidate.source:
+                claim_source = f"contradiction_claim_{candidate.metadata.get('claim_polarity') or 'uncertain'}"
+                trace["selected"].append(
+                    {
+                        "id": candidate.id,
+                        "type": candidate.type,
+                        "source": claim_source,
+                        "scores": candidate.scores,
+                        "source_span_ids": candidate.source_span_ids,
+                        "claim_polarity": candidate.metadata.get("claim_polarity"),
+                    }
+                )
         model_calls = self._model_calls_since(model_call_marks)
         trace["model_calls"] = model_calls
         self.store.save_trace(trace_id, trace, scope)
@@ -326,6 +480,23 @@ class MemoryService:
 
     def answer_context(self, query: str, scope: Scope, budget: dict[str, Any] | None = None) -> EvidencePack:
         budget = budget or {}
+        mode = budget.get("mode", "fast")
+        limit = budget.get("limit")
+        rerank_top_n = budget.get("rerank_top_n")
+        token_budget = budget.get("token_budget")
+        plan = self.planner.plan(query, query_type_hint=budget.get("query_type_hint"))
+        if mode == "benchmark":
+            if plan.query_type == "event_ordering":
+                limit = limit or max(self.config.retrieval_output_n, 24)
+                rerank_top_n = rerank_top_n or max(self.config.benchmark_mode_rerank_top_n, min(72, limit * 2))
+            else:
+                limit = limit or max(self.config.retrieval_output_n, 50)
+                rerank_top_n = rerank_top_n or max(self.config.benchmark_mode_rerank_top_n, min(160, limit * 3))
+            token_budget = token_budget or max(self.config.answer_context_budget_tokens, 24000)
+        else:
+            limit = limit or self.config.retrieval_output_n
+            token_budget = token_budget or self.config.answer_context_budget_tokens
+        intent_telemetry = self.planner.last_intent_telemetry
         scope.validate_for_read()
         self._authorize(
             "memory.answer_context",
@@ -333,23 +504,25 @@ class MemoryService:
             {
                 "query": query,
                 "allow_cross_session": bool(budget.get("allow_cross_session", False)),
-                "limit": budget.get("limit", self.config.retrieval_output_n),
-                "mode": budget.get("mode", "fast"),
-                "token_budget": budget.get("token_budget", self.config.answer_context_budget_tokens),
+                "limit": limit,
+                "mode": mode,
+                "token_budget": token_budget,
             },
         )
         result = self.search(
             query,
             scope,
             options={
-                "limit": budget.get("limit", self.config.retrieval_output_n),
-                "mode": budget.get("mode", "fast"),
-                "rerank_top_n": budget.get("rerank_top_n"),
+                "limit": limit,
+                "mode": mode,
+                "rerank_top_n": rerank_top_n,
                 "enabled_sources": budget.get("enabled_sources"),
                 "allow_cross_session": budget.get("allow_cross_session", False),
+                "query_type_hint": budget.get("query_type_hint"),
+                "_plan": plan,
+                "_intent_telemetry": intent_telemetry,
             },
         )
-        plan = self.planner.plan(query)
         trace = self.store.get_trace(result.trace_id, scope, include_session=bool(scope.session_id and not budget.get("allow_cross_session", False))) or {}
         return self.pack_builder.build(
             query,
@@ -357,7 +530,7 @@ class MemoryService:
             result.candidates,
             result.coverage,
             trace.get("selected", []),
-            token_budget=budget.get("token_budget", self.config.answer_context_budget_tokens),
+            token_budget=token_budget,
         )
 
     def get(
@@ -795,6 +968,39 @@ class MemoryService:
         report = self.utility_scorer.fit(self.store.list_utility_examples())
         return report
 
+    def clear(self, scope: Scope, allow_cross_session: bool = False) -> dict[str, Any]:
+        scope.validate_for_read()
+        include_session = bool(scope.session_id and not allow_cross_session)
+        self._authorize(
+            "memory.clear",
+            scope,
+            {
+                "allow_cross_session": allow_cross_session,
+                "include_session": include_session,
+            },
+        )
+        if not hasattr(self.store, "clear_scope"):
+            raise RuntimeError("memory store does not support clear")
+        result = self.store.clear_scope(scope, include_session=include_session)
+        audit_id = self.store.insert_audit_event(
+            scope,
+            "memory.clear",
+            object_type="scope",
+            payload={
+                "allow_cross_session": allow_cross_session,
+                "include_session": include_session,
+                "deleted": result.get("deleted", {}),
+            },
+        )
+        return {
+            "ok": True,
+            "operation": "clear_scope",
+            "allow_cross_session": allow_cross_session,
+            "include_session": include_session,
+            "audit_id": audit_id,
+            **result,
+        }
+
     def save_utility_scorer(self, path: str | Path) -> None:
         self.utility_scorer.save(path)
 
@@ -1044,178 +1250,33 @@ class MemoryService:
         enabled_sources: list[str] | set[str] | None = None,
         include_session: bool = False,
     ) -> list[list[Candidate]]:
-        enabled = set(enabled_sources) if enabled_sources is not None else None
-        candidate_lists: list[list[Candidate]] = []
-        speaker = plan.speaker_focus if plan.speaker_focus != "any" else None
-        if self._source_enabled("raw", enabled):
-            raw_span_results = self.store.search_spans(
-                self._retrieval_query(query, plan, "raw"),
-                scope,
-                limit=per_source_limit,
-                speaker=speaker,
-                include_session=include_session,
-            )
-            candidate_lists.append(
-                [
-                    Candidate(
-                        id=span.span_id,
-                        type="span",
-                        text=span.content,
-                        source="l0_raw_hybrid",
-                        scores=scores,
-                        source_span_ids=[span.span_id],
-                        metadata={"speaker": span.speaker, "span_type": span.span_type, "timestamp": span.timestamp.isoformat()},
-                    )
-                    for span, scores in raw_span_results
-                ]
-            )
-            topic_scoped = self._topic_scoped_raw_candidates(
-                query,
-                scope,
-                plan,
-                limit=max(per_source_limit * 2, per_source_limit + 12),
-                include_session=include_session,
-            )
-            if topic_scoped:
-                candidate_lists.append(topic_scoped)
-            if plan.query_type == "contradiction_resolution":
-                contradiction_claims = self._contradiction_claim_candidates(
-                    query,
-                    scope,
-                    plan,
-                    limit=max(per_source_limit, 12),
-                    include_session=include_session,
-                )
-                if contradiction_claims:
-                    candidate_lists.append(contradiction_claims)
-            if plan.query_type == "event_ordering":
-                candidate_lists.append(
-                    self._event_ordering_timeline_candidates(
-                        query,
-                        plan,
-                        scope,
-                        limit=max(per_source_limit * 3, per_source_limit + 12),
-                        include_session=include_session,
-                    )
-                )
-        if self._source_enabled("facts", enabled) and self._plan_uses_source(plan, "facts"):
-            fact_results = self.store.search_facts(
-                self._retrieval_query(query, plan, "facts"),
-                scope,
-                limit=per_source_limit,
-                include_session=include_session,
-            )
-            candidate_lists.append(
-                [
-                    Candidate(
-                        id=fact.fact_id,
-                        type="fact",
-                        text=fact.text,
-                        source="l1_fact_hybrid",
-                        scores={**scores, "view_or_profile_prior": 0.0},
-                        source_span_ids=fact.source_span_ids,
-                        metadata={"category": fact.category, "confidence": fact.confidence},
-                    )
-                    for fact, scores in fact_results
-                ]
-            )
-        if self._source_enabled("events", enabled) and self._plan_uses_source(plan, "events"):
-            if plan.query_type == "event_ordering":
-                event_results = self._event_ordering_event_candidates(
-                    query,
-                    scope,
-                    limit=max(per_source_limit * 2, 12),
-                    include_session=include_session,
-                )
-            else:
-                event_results = self.store.search_events(
-                    self._retrieval_query(query, plan, "events"),
-                    scope,
-                    limit=per_source_limit,
-                    include_session=include_session,
-                )
-            candidate_lists.append(
-                [
-                    Candidate(
-                        id=event.event_id,
-                        type="event",
-                        text=event.description,
-                        source="event_timeline_graph" if plan.query_type == "event_ordering" else "l2_event_graph",
-                        scores={**scores, "graph_proximity": 0.80 if plan.query_type == "event_ordering" else 0.55},
-                        source_span_ids=event.source_span_ids,
-                        metadata={
-                            "event_type": event.event_type,
-                            "time_start": (
-                                self._event_ordering_observed_at(event).isoformat()
-                                if plan.query_type == "event_ordering" and self._event_ordering_observed_at(event)
-                                else event.time_start.isoformat()
-                                if event.time_start
-                                else None
-                            ),
-                            "milestone_group": _event_milestone_group(event),
-                        },
-                    )
-                    for event, scores in event_results
-                ]
-            )
-        if self._source_enabled("views", enabled) and self._plan_uses_source(plan, "views"):
-            views = self.store.list_current_views(scope, include_session=include_session)
-            candidate_lists.append(
-                [
-                    Candidate(
-                        id=view.view_id,
-                        type="view",
-                        text=view.text,
-                        source="l3_current_view",
-                        scores={
-                            "bm25_score": keyword_score(query, view.text),
-                            "view_or_profile_prior": 0.85,
-                            "score": keyword_score(query, view.text) + 0.85,
-                        },
-                        source_span_ids=view.source_span_ids,
-                        metadata={"view_type": view.view_type, "confidence": view.confidence},
-                    )
-                    for view in views
-                ]
-            )
-        if self._source_enabled("profiles", enabled) and self._plan_uses_source(plan, "profiles"):
-            profile_results = self.store.search_entity_profiles(
-                self._retrieval_query(query, plan, "profiles"),
-                scope,
-                limit=per_source_limit,
-                include_session=include_session,
-            )
-            candidate_lists.append(
-                [
-                    Candidate(
-                        id=profile.profile_id,
-                        type="profile",
-                        text=profile.text,
-                        source="l3_entity_profile",
-                        scores={
-                            **scores,
-                            "view_or_profile_prior": 0.55,
-                            "score": scores.get("score", 0.0) + 0.55,
-                        },
-                        source_span_ids=profile.source_span_ids,
-                        metadata={"profile_type": profile.profile_type, "support_count": profile.support_count},
-                    )
-                    for profile, scores in profile_results
-                ]
-            )
-        if self._source_enabled("exact", enabled):
-            exact = self._exact_candidates(
-                self._retrieval_query(query, plan, "exact"),
-                scope,
-                per_source_limit,
-                plan=plan,
-                include_session=include_session,
-            )
-            candidate_lists.append(exact)
-        if self._source_enabled("entities", enabled):
-            entity = self._entity_candidates(self._retrieval_query(query, plan, "entities"), scope, per_source_limit, include_session=include_session)
-            candidate_lists.append(entity)
-        return candidate_lists
+        return build_candidate_lists(
+            self,
+            query,
+            scope,
+            plan,
+            per_source_limit,
+            enabled_sources=enabled_sources,
+            include_session=include_session,
+            event_milestone_group=_event_milestone_group,
+        )
+
+    def _event_ordering_graph_selector_candidates(
+        self,
+        query: str,
+        scope: Scope,
+        limit: int,
+        *,
+        include_session: bool = False,
+    ) -> list[Candidate]:
+        spans = [
+            span
+            for span in self.store.list_spans(scope, include_session=include_session)
+            if span.span_type in {"turn", "tool_result", "document_chunk"}
+            and span.speaker in {"user", "assistant", "agent", "document"}
+        ]
+        events = self.store.list_events(scope, include_session=include_session)
+        return select_event_ordering_timeline(query, spans, events, limit=limit)
 
     def _event_ordering_timeline_candidates(
         self,
@@ -1278,6 +1339,102 @@ class MemoryService:
             reverse=True,
         )
         return scored[:limit]
+
+    def _event_ordering_episode_recall_candidates(
+        self,
+        query: str,
+        scope: Scope,
+        plan: Any,
+        limit: int,
+        *,
+        include_session: bool = False,
+    ) -> list[Candidate]:
+        requested = _event_ordering_requested_count_for_service(query) or 0
+        spans = [
+            span
+            for span in self.store.list_spans(scope, include_session=include_session)
+            if span.span_type in {"turn", "tool_result", "document_chunk"}
+            and span.speaker in {"user", "document"}
+            and span.content
+        ]
+        if not spans:
+            return []
+        spans.sort(key=lambda span: (_natural_turn_key(span.source_uri), _natural_turn_key(span.turn_id), span.timestamp.isoformat(), span.span_id))
+        facet_terms = _event_ordering_query_facets_for_service(query)
+        anchor_terms = _event_ordering_anchor_terms_for_service(query)
+        broad_scope = bool(re.search(r"\b(?:throughout|across|during|over|chats?|conversations?)\b", query, flags=re.I))
+        scored: list[tuple[float, Candidate]] = []
+        for span in spans:
+            if _event_ordering_low_value_raw_facet_text(span.content):
+                continue
+            text_terms = _topic_scope_tokens(span.content)
+            expanded_terms = set(text_terms)
+            for term in list(text_terms):
+                expanded_terms.update(_event_ordering_term_variants_for_service(term))
+            facet_hits = facet_terms & expanded_terms
+            anchor_hits = anchor_terms & expanded_terms
+            topic_score = _topic_scope_score(query, span.content, plan)
+            exact = _exact_overlap_score(query, span.content)
+            episode_signal = _event_ordering_raw_episode_signal(span.content)
+            detail_signal = _event_ordering_referenceable_detail_signal(span.content)
+            support_option_signal = _event_ordering_support_option_signal(query, span.content)
+            if not facet_hits and not anchor_hits and topic_score < 0.12 and exact < 0.18 and support_option_signal < 0.30:
+                continue
+            if not broad_scope and not anchor_hits and topic_score < 0.22 and support_option_signal < 0.30:
+                continue
+            facet_score = min(1.0, len(facet_hits) / max(1, len(facet_terms)))
+            anchor_score = min(1.0, len(anchor_hits) / max(1, len(anchor_terms))) if anchor_terms else 0.0
+            score = (0.30 * facet_score) + (0.22 * anchor_score)
+            score += (
+                0.18 * topic_score
+                + 0.12 * exact
+                + 0.12 * episode_signal
+                + 0.06 * detail_signal
+                + 0.12 * support_option_signal
+            )
+            if len(facet_hits) >= 2 and episode_signal >= 0.35:
+                score += 0.10
+            if facet_hits and support_option_signal >= 0.45:
+                score += 0.08
+            if score < 0.16:
+                continue
+            scored.append(
+                (
+                    score,
+                    Candidate(
+                        id=span.span_id,
+                        type="span",
+                        text=span.content,
+                        source="event_ordering_episode_recall",
+                        scores={
+                            "semantic_score": max(topic_score, exact),
+                            "bm25_score": max(exact, keyword_score(query, span.content)),
+                            "exact_signal": min(1.0, exact + 0.10 * len(facet_hits)),
+                            "topic_scope_score": topic_score,
+                            "event_episode_signal": episode_signal,
+                            "event_detail_signal": detail_signal,
+                            "event_support_option_signal": support_option_signal,
+                            "event_facet_coverage": min(1.0, len(facet_hits) / max(1, len(facet_terms))),
+                            "score": min(1.0, score),
+                        },
+                        source_span_ids=[span.span_id],
+                        metadata={
+                            "speaker": span.speaker,
+                            "span_type": span.span_type,
+                            "timestamp": span.timestamp.isoformat(),
+                            "source_uri": span.source_uri,
+                            "turn_id": span.turn_id,
+                            "topic_group": _span_group_key(span),
+                            "event_ordering_episode_recall": True,
+                            "event_ordering_facet_hits": sorted(facet_hits)[:12],
+                            "event_ordering_anchor_hits": sorted(anchor_hits)[:8],
+                        },
+                    ),
+                )
+            )
+        if not scored:
+            return []
+        return _event_ordering_select_episode_recall_candidates(scored, limit, requested)
 
     def _event_ordering_event_candidates(
         self,
@@ -1412,6 +1569,100 @@ class MemoryService:
         out.sort(key=lambda candidate: candidate.scores.get("score", 0.0), reverse=True)
         return out[:limit]
 
+    def _temporal_coverage_candidates(
+        self,
+        query: str,
+        scope: Scope,
+        plan: Any,
+        limit: int,
+        *,
+        include_session: bool = False,
+    ) -> list[Candidate]:
+        spans = [
+            span
+            for span in self.store.list_spans(scope, include_session=include_session)
+            if span.span_type in {"turn", "tool_result", "document_chunk"} and span.speaker in {"user", "assistant", "agent", "document"}
+        ]
+        groups = _topic_scope_groups(query, plan, spans, max_groups=_topic_scope_group_limit(plan.query_type))
+        target_roles = _temporal_target_roles_for_service(query)
+        focus_terms = _temporal_focus_terms_for_service(query)
+        wants_duration = bool(re.search(r"\b(?:how many days|how long|did it take|duration)\b", query.lower()))
+        scored: list[Candidate] = []
+        for span in spans:
+            if groups and _span_group_key(span) not in groups:
+                continue
+            lower = span.content.lower()
+            roles = _temporal_roles_in_text(query, span.content)
+            role_hits = roles & target_roles
+            focus_hits = focus_terms & _topic_scope_tokens(span.content)
+            date_signal = _date_signal(span.content)
+            duration_signal = 1.0 if re.search(r"\b\d+(?:\.\d+)?\s*(?:days?|weeks?|months?)\b", lower) else 0.0
+            if not role_hits and not (wants_duration and duration_signal and focus_hits):
+                continue
+            if target_roles and not focus_hits and span.speaker not in {"user", "document"}:
+                continue
+            focus_score = len(focus_hits) / max(1, len(focus_terms)) if focus_terms else 0.0
+            role_score = len(role_hits) / max(1, len(target_roles)) if target_roles else 0.0
+            speaker_prior = 0.24
+            if span.speaker == "user":
+                speaker_prior = 0.60
+            elif span.speaker == "document":
+                speaker_prior = 0.48
+            score = (
+                0.36 * role_score
+                + 0.30 * focus_score
+                + 0.16 * date_signal
+                + 0.10 * duration_signal
+                + 0.08 * speaker_prior
+            )
+            if len(focus_hits) >= 2 and role_hits:
+                score += 0.18
+            if wants_duration and duration_signal and len(focus_hits) >= 2:
+                score += 0.16
+            if score <= 0.16:
+                continue
+            scored.append(
+                Candidate(
+                    id=span.span_id,
+                    type="span",
+                    text=span.content,
+                    source="temporal_coverage_raw",
+                    scores={
+                        "semantic_score": max(focus_score, role_score),
+                        "bm25_score": focus_score,
+                        "exact_signal": min(1.0, focus_score + role_score),
+                        "topic_scope_score": _topic_scope_score(query, span.content, plan),
+                        "temporal_fit": min(1.0, role_score + date_signal + duration_signal),
+                        "temporal_focus_score": focus_score,
+                        "temporal_role_score": role_score,
+                        "score": min(1.0, score),
+                    },
+                    source_span_ids=[span.span_id],
+                    metadata={
+                        "speaker": span.speaker,
+                        "span_type": span.span_type,
+                        "timestamp": span.timestamp.isoformat(),
+                        "source_uri": span.source_uri,
+                        "turn_id": span.turn_id,
+                        "topic_group": _span_group_key(span),
+                        "temporal_coverage": True,
+                        "temporal_roles": sorted(roles),
+                        "temporal_focus_terms": sorted(focus_hits),
+                    },
+                )
+            )
+        scored.sort(
+            key=lambda candidate: (
+                candidate.scores.get("score", 0.0),
+                1.0 if candidate.metadata.get("speaker") == "user" else 0.0,
+                candidate.scores.get("temporal_focus_score", 0.0),
+                _natural_turn_key(candidate.metadata.get("source_uri")),
+                _natural_turn_key(candidate.metadata.get("turn_id")),
+            ),
+            reverse=True,
+        )
+        return scored[:limit]
+
     def _event_ordering_sort_key(self, event: MemoryEvent) -> tuple[int, tuple[tuple[int, int | str], ...], tuple[tuple[int, int | str], ...], str, str]:
         span = self.store.get_span(event.source_span_ids[0]) if event.source_span_ids else None
         if span:
@@ -1476,6 +1727,9 @@ class MemoryService:
                 speaker_prior = 0.28
             if plan.query_type == "event_ordering" and span.speaker == "user":
                 speaker_prior = 0.65
+            synthesis_signal = 0.0
+            if plan.query_type == "multi_session_reasoning":
+                synthesis_signal = _synthesis_evidence_signal(query, span.content)
             score = (
                 0.46 * topic_score
                 + 0.18 * keyword
@@ -1484,6 +1738,8 @@ class MemoryService:
                 + 0.06 * date_signal
                 + 0.04 * speaker_prior
             )
+            if plan.query_type == "multi_session_reasoning":
+                score += 0.16 * synthesis_signal
             if plan.query_type == "summarization":
                 score = max(score, topic_score * 0.70 + speaker_prior * 0.10)
             if score <= 0.05:
@@ -1501,6 +1757,7 @@ class MemoryService:
                     "topic_group_prior": 0.85,
                     "temporal_fit": max(date_signal, role_signal),
                     "speaker_prior": speaker_prior,
+                    "synthesis_signal": synthesis_signal,
                     "score": score,
                 },
                 source_span_ids=[span.span_id],
@@ -1512,11 +1769,327 @@ class MemoryService:
                     "turn_id": span.turn_id,
                     "topic_group": group,
                     "topic_scope_score": topic_score,
+                    "synthesis_signal": synthesis_signal,
                 },
             )
             scored.append((candidate, (score, topic_score, _natural_turn_key(span.source_uri), _natural_turn_key(span.turn_id))))
         scored.sort(key=lambda item: item[1], reverse=True)
         return [candidate for candidate, _ in scored[:limit]]
+
+    def _raw_scent_trail_candidates(
+        self,
+        query: str,
+        scope: Scope,
+        plan: Any,
+        seed_candidates: list[Candidate],
+        limit: int,
+        *,
+        include_session: bool = False,
+    ) -> list[Candidate]:
+        if limit <= 0 or plan.query_type == "abstention":
+            return []
+        if plan.query_type not in {
+            "factual_exact",
+            "instruction",
+            "summarization",
+            "multi_session_reasoning",
+            "knowledge_update",
+            "temporal_lookup",
+            "contradiction_resolution",
+        }:
+            return []
+        seed_texts = [candidate.text for candidate in seed_candidates if candidate.type == "span" and candidate.text]
+        trail_queries = _scent_trail_queries(query, seed_texts)
+        if not trail_queries:
+            return []
+        out: list[Candidate] = []
+        seen: set[str] = set()
+        per_query_limit = max(4, min(10, limit))
+        for trail_query in trail_queries:
+            for span, scores in self.store.search_spans(
+                trail_query,
+                scope,
+                limit=per_query_limit,
+                include_session=include_session,
+            ):
+                if span.span_id in seen:
+                    continue
+                if span.span_type not in {"turn", "tool_result", "document_chunk"}:
+                    continue
+                topic_score = _topic_scope_score(query, span.content, plan)
+                exact = _exact_overlap_score(query, span.content)
+                trail_score = _scent_trail_score(trail_query, span.content)
+                if max(topic_score, exact, trail_score) <= 0.08:
+                    continue
+                score = (0.42 * trail_score) + (0.28 * topic_score) + (0.18 * exact) + (0.12 * float(scores.get("score", 0.0)))
+                out.append(
+                    Candidate(
+                        id=span.span_id,
+                        type="span",
+                        text=span.content,
+                        source="raw_scent_trail",
+                        scores={
+                            **scores,
+                            "semantic_score": max(float(scores.get("semantic_score", 0.0)), topic_score),
+                            "bm25_score": max(float(scores.get("bm25_score", 0.0)), exact, trail_score),
+                            "topic_scope_score": topic_score,
+                            "trail_score": trail_score,
+                            "score": score,
+                        },
+                        source_span_ids=[span.span_id],
+                        metadata={
+                            "speaker": span.speaker,
+                            "span_type": span.span_type,
+                            "timestamp": span.timestamp.isoformat(),
+                            "source_uri": span.source_uri,
+                            "turn_id": span.turn_id,
+                            "topic_group": _span_group_key(span),
+                            "trail_query": trail_query,
+                        },
+                    )
+                )
+                seen.add(span.span_id)
+                if len(out) >= limit:
+                    break
+            if len(out) >= limit:
+                break
+        out.sort(
+            key=lambda candidate: (
+                candidate.scores.get("score", 0.0),
+                candidate.metadata.get("speaker") == "user",
+                _natural_turn_key(candidate.metadata.get("source_uri")),
+                _natural_turn_key(candidate.metadata.get("turn_id")),
+            ),
+            reverse=True,
+        )
+        return out[:limit]
+
+    def _broad_raw_recall_candidates(
+        self,
+        query: str,
+        scope: Scope,
+        plan: Any,
+        limit: int,
+        *,
+        include_session: bool = False,
+    ) -> list[Candidate]:
+        if limit <= 0 or plan.query_type == "abstention":
+            return []
+        recall_queries = _broad_raw_recall_queries(query, plan)
+        if not recall_queries:
+            return []
+        speaker = plan.speaker_focus if plan.speaker_focus != "any" else None
+        per_query_limit = max(6, min(18, limit // max(1, len(recall_queries)) + 4))
+        best: dict[str, Candidate] = {}
+        for recall_index, recall_query in enumerate(recall_queries):
+            for span, scores in self.store.search_spans(
+                recall_query,
+                scope,
+                limit=per_query_limit,
+                speaker=speaker,
+                include_session=include_session,
+            ):
+                if span.span_type not in {"turn", "tool_result", "document_chunk"}:
+                    continue
+                topic_score = _topic_scope_score(query, span.content, plan)
+                exact = _exact_overlap_score(query, span.content)
+                recall_overlap = _exact_overlap_score(recall_query, span.content)
+                salience = _fallback_salience_score(span.content)
+                intent_signal = _intent_recall_signal(query, plan, span.content)
+                if max(topic_score, exact, recall_overlap, intent_signal) <= 0.035:
+                    continue
+                sparse = float(scores.get("bm25_score", 0.0) or 0.0)
+                dense = float(scores.get("semantic_score", 0.0) or 0.0)
+                source_score = float(scores.get("score", 0.0) or 0.0)
+                speaker_prior = 0.36 if span.speaker == "user" else 0.24 if span.speaker in {"assistant", "agent"} else 0.30
+                if plan.query_type == "event_ordering" and span.speaker == "user":
+                    speaker_prior = 0.62
+                score = (
+                    0.24 * max(topic_score, exact)
+                    + 0.22 * recall_overlap
+                    + 0.18 * intent_signal
+                    + 0.14 * min(1.0, source_score)
+                    + 0.10 * min(1.0, dense)
+                    + 0.07 * min(1.0, sparse)
+                    + 0.05 * salience
+                    + 0.03 * speaker_prior
+                )
+                if plan.query_type in {"knowledge_update", "temporal_lookup", "event_ordering"}:
+                    score += 0.05 * _date_signal(span.content)
+                candidate = Candidate(
+                    id=span.span_id,
+                    type="span",
+                    text=span.content,
+                    source="broad_raw_recall",
+                    scores={
+                        **scores,
+                        "semantic_score": max(dense, topic_score, intent_signal),
+                        "bm25_score": max(sparse, exact, recall_overlap),
+                        "exact_signal": max(exact, recall_overlap),
+                        "topic_scope_score": topic_score,
+                        "intent_recall_signal": intent_signal,
+                        "recall_query_overlap": recall_overlap,
+                        "salience_score": salience,
+                        "speaker_prior": speaker_prior,
+                        "score": min(1.0, score),
+                    },
+                    source_span_ids=[span.span_id],
+                    metadata={
+                        "speaker": span.speaker,
+                        "span_type": span.span_type,
+                        "timestamp": span.timestamp.isoformat(),
+                        "source_uri": span.source_uri,
+                        "turn_id": span.turn_id,
+                        "topic_group": _span_group_key(span),
+                        "recall_query": recall_query,
+                        "recall_query_index": recall_index,
+                        "broad_raw_recall": True,
+                    },
+                )
+                previous = best.get(span.span_id)
+                if previous is None or candidate.scores.get("score", 0.0) > previous.scores.get("score", 0.0):
+                    best[span.span_id] = candidate
+        out = list(best.values())
+        out.sort(
+            key=lambda candidate: (
+                candidate.scores.get("score", 0.0),
+                candidate.scores.get("intent_recall_signal", 0.0),
+                candidate.scores.get("topic_scope_score", 0.0),
+                candidate.metadata.get("speaker") == "user",
+                _natural_turn_key(candidate.metadata.get("source_uri")),
+                _natural_turn_key(candidate.metadata.get("turn_id")),
+            ),
+            reverse=True,
+        )
+        return out[:limit]
+
+    def _aggregation_coverage_candidates(
+        self,
+        query: str,
+        scope: Scope,
+        plan: Any,
+        limit: int,
+        *,
+        include_session: bool = False,
+    ) -> list[Candidate]:
+        spans = [
+            span
+            for span in self.store.list_spans(scope, include_session=include_session)
+            if span.span_type in {"turn", "tool_result", "document_chunk"} and span.speaker in {"user", "assistant", "agent", "document"}
+        ]
+        groups = _topic_scope_groups(query, plan, spans, max_groups=_topic_scope_group_limit(plan.query_type))
+        if not groups:
+            return []
+        query_terms = _aggregation_query_terms(query)
+        scored: list[tuple[float, Candidate, tuple[tuple[int, int | str], ...], tuple[tuple[int, int | str], ...]]] = []
+        ordered_spans = sorted(spans, key=lambda span: (_natural_turn_key(span.source_uri), _natural_turn_key(span.turn_id), span.timestamp.isoformat(), span.span_id))
+        adjacent_assistant_by_user_id = _adjacent_assistant_recommendation_spans(query, ordered_spans)
+        for span in spans:
+            group = _span_group_key(span)
+            if group not in groups:
+                continue
+            signal = _aggregation_signal(query, span.content, query_terms)
+            if signal <= 0:
+                continue
+            focus = _aggregation_focus_priority(query, span.content)
+            topic_score = _topic_scope_score(query, span.content, plan)
+            exact = _exact_overlap_score(query, span.content)
+            speaker_prior = 0.40 if span.speaker == "user" else 0.16
+            score = 0.46 * signal + 0.20 * topic_score + 0.14 * exact + 0.10 * speaker_prior + 0.10 * focus
+            candidate = Candidate(
+                id=span.span_id,
+                type="span",
+                text=span.content,
+                source="aggregation_coverage_raw",
+                scores={
+                    "semantic_score": max(topic_score, signal),
+                    "bm25_score": max(keyword_score(query, span.content), exact),
+                    "exact_signal": min(1.0, exact + signal),
+            "aggregation_signal": signal,
+            "aggregation_focus": focus,
+            "synthesis_signal": _synthesis_evidence_signal(query, span.content),
+            "topic_scope_score": topic_score,
+                    "topic_group_prior": 0.90,
+                    "speaker_prior": speaker_prior,
+                    "score": score,
+                },
+                source_span_ids=[span.span_id],
+                metadata={
+                    "speaker": span.speaker,
+                    "span_type": span.span_type,
+                    "timestamp": span.timestamp.isoformat(),
+                    "source_uri": span.source_uri,
+                    "turn_id": span.turn_id,
+                    "topic_group": group,
+                    "aggregation_coverage": True,
+                    "aggregation_signal": signal,
+                    "aggregation_focus": focus,
+                    "synthesis_signal": _synthesis_evidence_signal(query, span.content),
+                    "aggregation_keys": [
+                        *_aggregation_keys(query, span.content, speaker=span.speaker),
+                        *_aggregation_query_context_keys(query, span.content),
+                    ],
+                },
+            )
+            scored.append((score, candidate, _natural_turn_key(span.source_uri), _natural_turn_key(span.turn_id)))
+            for support_span in adjacent_assistant_by_user_id.get(span.span_id, []):
+                if _span_group_key(support_span) not in groups:
+                    continue
+                support_signal = _assistant_recommendation_list_signal(query, support_span.content)
+                if support_signal <= 0:
+                    continue
+                request_specificity = _recommendation_request_specificity(span.content)
+                support_topic_score = max(topic_score, _topic_scope_score(query, support_span.content, plan))
+                support_exact = _exact_overlap_score(query, support_span.content)
+                support_score = max(score * 0.92, 0.38 + 0.24 * support_signal + 0.18 * support_topic_score + 0.10 * support_exact + 0.18 * request_specificity)
+                support_candidate = Candidate(
+                    id=support_span.span_id,
+                    type="span",
+                    text=support_span.content,
+                    source="aggregation_context_support",
+                    scores={
+                        "semantic_score": max(support_topic_score, support_signal),
+                        "bm25_score": max(keyword_score(query, support_span.content), support_exact),
+                        "exact_signal": min(1.0, support_exact + support_signal),
+                        "aggregation_signal": support_signal,
+                        "aggregation_focus": max(focus, 0.55),
+                        "request_specificity": request_specificity,
+                        "synthesis_signal": _synthesis_evidence_signal(query, support_span.content),
+                        "topic_scope_score": support_topic_score,
+                        "topic_group_prior": 0.90,
+                        "speaker_prior": 0.18,
+                        "score": min(1.0, support_score),
+                    },
+                    source_span_ids=[support_span.span_id],
+                    metadata={
+                        "speaker": support_span.speaker,
+                        "span_type": support_span.span_type,
+                        "timestamp": support_span.timestamp.isoformat(),
+                        "source_uri": support_span.source_uri,
+                        "turn_id": support_span.turn_id,
+                        "topic_group": _span_group_key(support_span),
+                        "aggregation_coverage": True,
+                        "aggregation_context_support": True,
+                        "supports_request_span_id": span.span_id,
+                        "aggregation_signal": support_signal,
+                        "aggregation_focus": max(focus, 0.55),
+                        "synthesis_signal": _synthesis_evidence_signal(query, support_span.content),
+                        "aggregation_keys": [
+                            f"group_support:{span.span_id}",
+                            *_aggregation_query_context_keys(query, support_span.content),
+                        ],
+                    },
+                )
+                scored.append(
+                    (
+                        support_candidate.scores["score"],
+                        support_candidate,
+                        _natural_turn_key(support_span.source_uri),
+                        _natural_turn_key(support_span.turn_id),
+                    )
+                )
+        scored.sort(key=lambda item: (item[0], item[2], item[3]), reverse=True)
+        return _key_diverse_aggregation_candidates(scored, limit)
 
     def _retrieval_query(self, query: str, plan: Any, source: str) -> str:
         hints = [hint for hint in getattr(plan, "retrieval_hints", []) if hint]
@@ -1580,6 +2153,7 @@ class MemoryService:
         query_lower = query.lower()
         query_has_value_intent = _has_value_intent(query_lower)
         query_has_current_intent = _has_current_intent(query_lower) or getattr(plan, "query_type", None) in {"knowledge_update", "temporal_lookup"}
+        query_is_aggregation = getattr(plan, "query_type", None) == "multi_session_reasoning"
         out: list[Candidate] = []
         for span in spans:
             lower = span.content.lower()
@@ -1596,6 +2170,7 @@ class MemoryService:
             if exact_signal <= 0:
                 continue
             score = min(1.0, exact_signal)
+            aggregation_keys = _aggregation_keys(query, span.content, speaker=span.speaker) if query_is_aggregation else []
             out.append(
                 Candidate(
                     id=span.span_id,
@@ -1625,6 +2200,7 @@ class MemoryService:
                         "current_signal": current_signal,
                         "source_uri": span.source_uri,
                         "turn_id": span.turn_id,
+                        **({"aggregation_keys": aggregation_keys} if aggregation_keys else {}),
                     },
                 )
             )
@@ -1747,13 +2323,44 @@ class MemoryService:
                 break
         return out
 
-    def _preserve_event_ordering_events(self, candidates: list[Candidate], selected: list[Candidate], limit: int) -> list[Candidate]:
-        required = [candidate for candidate in candidates if candidate.type == "event" and "event_timeline_graph" in candidate.source]
-        if not required:
+    def _preserve_temporal_coverage(self, candidates: list[Candidate], selected: list[Candidate], limit: int) -> list[Candidate]:
+        required = [
+            candidate
+            for candidate in candidates
+            if candidate.type == "span"
+            and candidate.metadata.get("temporal_coverage")
+            and (
+                candidate.metadata.get("speaker") in {"user", "document"}
+                or candidate.scores.get("temporal_focus_score", 0.0) >= 0.45
+            )
+            and candidate.scores.get("temporal_focus_score", 0.0) >= 0.20
+        ]
+        required.sort(
+            key=lambda candidate: (
+                1.0 if candidate.metadata.get("speaker") == "user" else 0.0,
+                candidate.scores.get("temporal_focus_score", 0.0),
+                candidate.scores.get("temporal_role_score", 0.0),
+                candidate.scores.get("temporal_fit", 0.0),
+                candidate.scores.get("utility_score", 0.0),
+            ),
+            reverse=True,
+        )
+        diverse: list[Candidate] = []
+        seen_focus: set[str] = set()
+        for candidate in required:
+            focus_terms = tuple(candidate.metadata.get("temporal_focus_terms") or [])
+            focus_key = "_".join(focus_terms[:3]) or candidate.id
+            if focus_key in seen_focus:
+                continue
+            seen_focus.add(focus_key)
+            diverse.append(candidate)
+            if len(diverse) >= max(2, min(6, limit // 3)):
+                break
+        if not diverse:
             return selected
         out: list[Candidate] = []
         seen: set[tuple[str, str]] = set()
-        for candidate in required + selected + candidates:
+        for candidate in diverse + selected:
             key = (candidate.type, candidate.id)
             if key in seen:
                 continue
@@ -1763,20 +2370,582 @@ class MemoryService:
                 break
         return out
 
+    def _preserve_contradiction_claim_coverage(self, candidates: list[Candidate], selected: list[Candidate], limit: int) -> list[Candidate]:
+        if limit <= 0:
+            return selected
+        required: list[Candidate] = []
+        for polarity in ("positive", "negative"):
+            bucket = [
+                candidate
+                for candidate in candidates
+                if candidate.type == "span"
+                and candidate.metadata.get("claim_polarity") == polarity
+                and str(candidate.source).startswith("contradiction_claim_")
+                and (
+                    candidate.metadata.get("speaker") == "user"
+                    or candidate.scores.get("topic_scope_score", 0.0) >= 0.55
+                    or candidate.scores.get("exact_signal", 0.0) >= 0.75
+                )
+            ]
+            bucket.sort(
+                key=lambda candidate: (
+                    1.0 if candidate.metadata.get("speaker") == "user" else 0.0,
+                    candidate.scores.get("topic_scope_score", 0.0),
+                    candidate.scores.get("exact_signal", 0.0),
+                    candidate.scores.get("claim_polarity_score", 0.0),
+                    candidate.scores.get("utility_score", candidate.scores.get("score", 0.0)),
+                ),
+                reverse=True,
+            )
+            required.extend(bucket[:2])
+        if not required:
+            return selected
+        out: list[Candidate] = []
+        seen: set[tuple[str, str]] = set()
+        for candidate in required + selected:
+            key = (candidate.type, candidate.id)
+            if key in seen:
+                continue
+            out.append(candidate)
+            seen.add(key)
+            if len(out) >= limit:
+                break
+        return out
+
+    def _preserve_scent_trail(self, candidates: list[Candidate], selected: list[Candidate], limit: int) -> list[Candidate]:
+        required = [
+            candidate
+            for candidate in candidates
+            if candidate.type == "span"
+            and candidate.source == "raw_scent_trail"
+            and candidate.scores.get("trail_score", 0.0) >= 0.20
+        ]
+        required.sort(
+            key=lambda candidate: (
+                candidate.scores.get("trail_score", 0.0),
+                candidate.scores.get("topic_scope_score", 0.0),
+                candidate.scores.get("utility_score", 0.0),
+            ),
+            reverse=True,
+        )
+        required = required[: max(1, min(3, limit // 4))]
+        if not required:
+            return selected
+        out: list[Candidate] = []
+        seen: set[tuple[str, str]] = set()
+        for candidate in required + selected:
+            key = (candidate.type, candidate.id)
+            if key in seen:
+                continue
+            out.append(candidate)
+            seen.add(key)
+            if len(out) >= limit:
+                break
+        return out
+
+    def _preserve_event_ordering_raw_facets(self, query: str, candidates: list[Candidate], selected: list[Candidate], limit: int) -> list[Candidate]:
+        requested = _event_ordering_requested_count_for_service(query)
+        if requested is None or requested <= 0:
+            return selected
+        facet_terms = _event_ordering_query_facets_for_service(query)
+        if not facet_terms:
+            return selected
+        broad_episode_recall = _event_ordering_support_option_query(query)
+        pool = [
+            candidate
+            for candidate in candidates
+            if candidate.type == "span"
+            and candidate.metadata.get("speaker") in {"user", "document"}
+            and candidate.text
+        ]
+        scored: list[tuple[float, Candidate]] = []
+        for candidate in pool:
+            text_terms = _topic_scope_tokens(candidate.text)
+            expanded_text_terms = set(text_terms)
+            for term in list(text_terms):
+                expanded_text_terms.update(_event_ordering_term_variants_for_service(term))
+            facet_hits = facet_terms & expanded_text_terms
+            is_episode_recall = "event_ordering_episode_recall" in candidate.source
+            strong_episode_recall = is_episode_recall and (
+                candidate.scores.get("event_episode_signal", 0.0) >= 0.35
+                or candidate.scores.get("event_detail_signal", 0.0) >= 0.36
+                or candidate.scores.get("event_support_option_signal", 0.0) >= 0.30
+                or candidate.scores.get("event_facet_coverage", 0.0) >= 0.16
+            )
+            if not facet_hits and not strong_episode_recall:
+                continue
+            if _event_ordering_low_value_raw_facet_candidate(candidate):
+                continue
+            score = (
+                0.28 * min(1.0, len(facet_hits) / max(1, len(facet_terms)))
+                + 0.20 * float(candidate.scores.get("topic_scope_score", 0.0) or 0.0)
+                + 0.20 * float(candidate.scores.get("exact_signal", 0.0) or 0.0)
+                + 0.16 * float(candidate.scores.get("intent_recall_signal", 0.0) or 0.0)
+                + 0.10 * _event_ordering_raw_episode_signal(candidate.text)
+                + 0.08 * float(candidate.scores.get("event_support_option_signal", 0.0) or 0.0)
+                + 0.06 * float(candidate.scores.get("utility_score", candidate.scores.get("score", 0.0)) or 0.0)
+            )
+            if strong_episode_recall:
+                score = max(score, 0.18 + 0.12 * candidate.scores.get("event_detail_signal", 0.0))
+            if candidate.metadata.get("broad_raw_recall"):
+                score -= 0.05
+            if score >= 0.16:
+                scored.append((score, candidate))
+        if not scored:
+            return selected
+        episode_required = _event_ordering_select_episode_recall_candidates(
+            [
+                (score, candidate)
+                for score, candidate in scored
+                if "event_ordering_episode_recall" in candidate.source
+                and _event_ordering_raw_facet_episode_required(candidate, broad_episode_recall=broad_episode_recall)
+            ],
+            max(1, min(requested + 2 if broad_episode_recall else 2, limit // 2)),
+            requested,
+        )
+        scored.sort(
+            key=lambda item: (
+                item[0],
+                item[1].metadata.get("broad_raw_recall") is not True,
+                _natural_turn_key(item[1].metadata.get("source_uri")),
+                _natural_turn_key(item[1].metadata.get("turn_id")),
+            ),
+            reverse=True,
+        )
+        required: list[Candidate] = []
+        seen_ids: set[tuple[str, str]] = set()
+        seen_turns: set[tuple[tuple[tuple[int, int | str], ...], tuple[tuple[int, int | str], ...]]] = set()
+        for candidate in selected:
+            if not _event_ordering_episode_recall_candidate(candidate):
+                continue
+            if not broad_episode_recall and candidate.scores.get("event_support_option_signal", 0.0) < 0.30:
+                continue
+            key = (candidate.type, candidate.id)
+            turn_key = (
+                _natural_turn_key(candidate.metadata.get("source_uri")),
+                _natural_turn_key(candidate.metadata.get("turn_id")),
+            )
+            required.append(candidate)
+            seen_ids.add(key)
+            seen_turns.add(turn_key)
+        for candidate in episode_required:
+            key = (candidate.type, candidate.id)
+            turn_key = (
+                _natural_turn_key(candidate.metadata.get("source_uri")),
+                _natural_turn_key(candidate.metadata.get("turn_id")),
+            )
+            if key in seen_ids or turn_key in seen_turns:
+                continue
+            required.append(candidate)
+            seen_ids.add(key)
+            seen_turns.add(turn_key)
+        for _score, candidate in scored:
+            key = (candidate.type, candidate.id)
+            turn_key = (
+                _natural_turn_key(candidate.metadata.get("source_uri")),
+                _natural_turn_key(candidate.metadata.get("turn_id")),
+            )
+            if key in seen_ids or turn_key in seen_turns:
+                continue
+            required.append(candidate)
+            seen_ids.add(key)
+            seen_turns.add(turn_key)
+            if len(required) >= max(2, min(requested + 2, limit // 2)):
+                break
+        if not required:
+            return selected
+        out: list[Candidate] = []
+        seen: set[tuple[str, str]] = set()
+        for candidate in required + selected:
+            key = (candidate.type, candidate.id)
+            if key in seen:
+                continue
+            out.append(candidate)
+            seen.add(key)
+            if len(out) >= limit:
+                break
+        return out
+
+    def _preserve_broad_raw_recall(self, query: str, plan: Any, candidates: list[Candidate], selected: list[Candidate], limit: int) -> list[Candidate]:
+        required = [
+            candidate
+            for candidate in candidates
+            if candidate.type == "span"
+            and candidate.metadata.get("broad_raw_recall")
+            and _broad_recall_candidate_allowed(query, plan, candidate)
+            and (
+                candidate.scores.get("intent_recall_signal", 0.0) >= 0.16
+                or candidate.scores.get("topic_scope_score", 0.0) >= 0.22
+                or candidate.scores.get("exact_signal", 0.0) >= 0.45
+            )
+        ]
+        if not required:
+            return selected
+        required.sort(
+            key=lambda candidate: (
+                candidate.scores.get("intent_recall_signal", 0.0),
+                candidate.scores.get("topic_scope_score", 0.0),
+                candidate.scores.get("exact_signal", 0.0),
+                candidate.scores.get("utility_score", candidate.scores.get("score", 0.0)),
+                candidate.metadata.get("speaker") == "user",
+            ),
+            reverse=True,
+        )
+        diverse: list[Candidate] = []
+        seen_queries: set[str] = set()
+        for candidate in required:
+            recall_query = str(candidate.metadata.get("recall_query") or candidate.id)
+            if recall_query in seen_queries:
+                continue
+            seen_queries.add(recall_query)
+            diverse.append(candidate)
+            if len(diverse) >= max(2, min(5, limit // 5)):
+                break
+        out: list[Candidate] = []
+        seen: set[tuple[str, str]] = set()
+        for candidate in diverse + selected:
+            key = (candidate.type, candidate.id)
+            if key in seen:
+                continue
+            out.append(candidate)
+            seen.add(key)
+            if len(out) >= limit:
+                break
+        return out
+
+    def _preserve_aggregation_coverage(self, query: str, candidates: list[Candidate], selected: list[Candidate], limit: int) -> list[Candidate]:
+        coverage = [
+            candidate
+            for candidate in candidates
+            if candidate.type == "span"
+            and (candidate.metadata.get("aggregation_coverage") or _aggregation_context_support_candidate(candidate))
+        ]
+        group_support = [
+            candidate
+            for candidate in coverage
+            if _aggregation_group_support_specificity(candidate) > 0.0
+        ]
+        group_support.sort(
+            key=lambda candidate: (
+                _aggregation_group_support_specificity(candidate),
+                candidate.scores.get("score", 0.0),
+                candidate.scores.get("topic_scope_score", 0.0),
+                candidate.scores.get("aggregation_signal", 0.0),
+                candidate.metadata.get("timestamp") or "",
+            ),
+            reverse=True,
+        )
+        coverage.sort(
+            key=lambda candidate: (
+                _aggregation_query_date_support(query, candidate),
+                _aggregation_context_specificity(candidate),
+                _aggregation_context_support_candidate(candidate),
+                candidate.metadata.get("speaker") == "user",
+                candidate.scores.get("synthesis_signal", 0.0),
+                candidate.scores.get("request_specificity", candidate.metadata.get("request_specificity", 0.0)),
+                candidate.scores.get("aggregation_focus", 0.0),
+                candidate.scores.get("aggregation_signal", 0.0),
+                candidate.scores.get("topic_scope_score", 0.0),
+                candidate.metadata.get("timestamp") or "",
+            ),
+            reverse=True,
+        )
+        required: list[Candidate] = []
+        seen_ids: set[tuple[str, str]] = set()
+        group_support_budget = max(1, min(3, limit // 8 if limit >= 8 else 1))
+        for candidate in group_support[:group_support_budget]:
+            key = (candidate.type, candidate.id)
+            if key in seen_ids:
+                continue
+            required.append(candidate)
+            seen_ids.add(key)
+        scene_limit = max(1, min(8, limit // 4 if limit >= 4 else 1))
+        if _is_broad_exploration_aggregation_query(query.lower()):
+            scene_limit = max(scene_limit, min(8, limit))
+        scene_representatives = _aggregation_scene_representatives(coverage, limit=scene_limit)
+        for candidate in scene_representatives:
+            key = (candidate.type, candidate.id)
+            if key in seen_ids:
+                continue
+            required.append(candidate)
+            seen_ids.add(key)
+        seen_keys: set[str] = set()
+        for candidate in required:
+            for key in candidate.metadata.get("aggregation_keys") or []:
+                if key:
+                    seen_keys.add(str(key))
+        for candidate in coverage:
+            identity = (candidate.type, candidate.id)
+            if identity in seen_ids:
+                continue
+            keys = [str(key) for key in candidate.metadata.get("aggregation_keys") or [] if key]
+            keys.extend(_aggregation_query_context_keys(query, candidate.text))
+            synthesis_key = _synthesis_candidate_key(candidate)
+            if synthesis_key:
+                keys.append(synthesis_key)
+            if not keys:
+                keys = [candidate.id]
+            if all(key in seen_keys for key in keys) and not _aggregation_context_support_candidate(candidate):
+                continue
+            required.append(candidate)
+            seen_ids.add(identity)
+            seen_keys.update(keys)
+            if len(required) >= max(4, min(12, limit)):
+                break
+        if len(required) < max(2, min(4, limit // 3)):
+            for candidate in coverage:
+                identity = (candidate.type, candidate.id)
+                if identity in seen_ids:
+                    continue
+                if candidate in required:
+                    continue
+                required.append(candidate)
+                seen_ids.add(identity)
+                if len(required) >= max(4, min(12, limit)):
+                    break
+        required = required[: max(4, min(12, limit))]
+        if not required:
+            return selected
+        out: list[Candidate] = []
+        seen: set[tuple[str, str]] = set()
+        for candidate in required + selected:
+            key = (candidate.type, candidate.id)
+            if key in seen:
+                continue
+            out.append(candidate)
+            seen.add(key)
+            if len(out) >= limit:
+                break
+        return out
+
+    def _preserve_user_synthesis_anchors(self, candidates: list[Candidate], selected: list[Candidate], limit: int) -> list[Candidate]:
+        required = [
+            candidate
+            for candidate in candidates
+            if candidate.type == "span"
+            and candidate.metadata.get("speaker") == "user"
+            and (
+                float(candidate.scores.get("synthesis_signal", 0.0) or 0.0) > 0
+                or bool(candidate.metadata.get("aggregation_keys"))
+            )
+        ]
+        required.sort(
+            key=lambda candidate: (
+                float(candidate.scores.get("synthesis_signal", 0.0) or 0.0),
+                float(candidate.scores.get("topic_scope_score", 0.0) or 0.0),
+                float(candidate.scores.get("utility_score", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        diversified: list[Candidate] = []
+        seen_synthesis_keys: set[str] = set()
+        target = max(2, min(8, limit))
+        for candidate in required:
+            synthesis_key = _synthesis_candidate_key(candidate) or candidate.id
+            if synthesis_key in seen_synthesis_keys:
+                continue
+            diversified.append(candidate)
+            seen_synthesis_keys.add(synthesis_key)
+            if len(diversified) >= target:
+                break
+        if len(diversified) < target:
+            for candidate in required:
+                if candidate in diversified:
+                    continue
+                diversified.append(candidate)
+                if len(diversified) >= target:
+                    break
+        required = diversified[:target]
+        if not required:
+            return selected
+        out = list(selected[:limit])
+        seen = {(candidate.type, candidate.id) for candidate in out}
+        for candidate in required:
+            key = (candidate.type, candidate.id)
+            if key in seen:
+                continue
+            if len(out) >= limit:
+                replace_index = _replaceable_low_synthesis_index(out)
+                if replace_index is None:
+                    break
+                seen.discard((out[replace_index].type, out[replace_index].id))
+                out.pop(replace_index)
+            out.append(candidate)
+            seen.add(key)
+        return out
+
+    def _preserve_event_ordering_events(self, query: str, candidates: list[Candidate], selected: list[Candidate], limit: int) -> list[Candidate]:
+        coverage_anchors = [
+            candidate
+            for candidate in candidates
+            if "event_ordering_coverage" in candidate.source
+            and candidate.metadata.get("timeline_role") in {"user_aspect_anchor", "user_introduced_topic"}
+            and candidate.type != "event"
+        ]
+        coverage_anchors = sorted(
+            enumerate(coverage_anchors),
+            key=lambda item: (
+                0 if item[1].metadata.get("coverage_origin") == "query_required_facet" else 1,
+                item[0],
+            ),
+        )
+        coverage_anchors = [candidate for _index, candidate in coverage_anchors]
+        coverage_support = [
+            candidate
+            for candidate in candidates
+            if "event_ordering_coverage" in candidate.source
+            and candidate.metadata.get("timeline_role") == "supporting_context"
+            and candidate.type != "event"
+        ]
+        event_required = [
+            candidate
+            for candidate in candidates
+            if candidate.type == "event" and "event_timeline_graph" in candidate.source
+        ]
+        event_required.sort(
+            key=lambda candidate: (
+                0 if candidate.metadata.get("milestone_group") else 1,
+                candidate.metadata.get("time_start") or "",
+                candidate.id,
+            )
+        )
+        selector_required = [
+            candidate
+            for candidate in candidates
+            if (
+                "event_ordering_graph_selector" in candidate.source
+                or "event_ordering_coverage" in candidate.source
+            )
+            and candidate.type != "event"
+            and candidate not in coverage_anchors
+            and candidate not in coverage_support
+        ]
+        event_required = _dedupe_event_ordering_support_events(event_required)
+        requested = _event_ordering_requested_count_for_service(query) or 0
+        broad_episode_recall = _event_ordering_support_option_query(query)
+        episode_scored = [
+            (
+                _event_ordering_episode_preserve_score(candidate),
+                candidate,
+            )
+            for candidate in candidates
+            if _event_ordering_episode_recall_candidate(candidate)
+            and (broad_episode_recall or candidate.scores.get("event_facet_coverage", 0.0) >= 0.20)
+        ]
+        if episode_scored and limit > 0:
+            episode_cap = requested + 1 if broad_episode_recall and requested else 6 if broad_episode_recall else 2
+            episode_budget = max(
+                1,
+                min(
+                    len(episode_scored),
+                    episode_cap,
+                    max(2, limit // 2),
+                    limit,
+                ),
+            )
+            episode_required = _event_ordering_select_episode_recall_candidates(
+                episode_scored,
+                limit=episode_budget,
+                requested=requested,
+            )
+        else:
+            episode_budget = 0
+            episode_required = []
+        remaining_after_episode = max(0, limit - episode_budget)
+        anchor_cap = max(1, remaining_after_episode)
+        if episode_budget and remaining_after_episode >= 3:
+            anchor_cap = max(1, min(anchor_cap, remaining_after_episode - 1))
+        anchor_budget = max(1, min(len(coverage_anchors), anchor_cap)) if coverage_anchors and limit > 0 else 0
+        support_budget = max(0, min(len(coverage_support), min(2, limit - episode_budget - anchor_budget)))
+        event_budget = max(0, min(len(event_required), limit - episode_budget - anchor_budget - support_budget))
+        selector_budget = max(0, limit - episode_budget - anchor_budget - support_budget - event_budget)
+        required = (
+            coverage_anchors[:anchor_budget]
+            + episode_required
+            + coverage_support[:support_budget]
+            + event_required[:event_budget]
+            + selector_required[:selector_budget]
+        )
+        if not required:
+            return selected
+        out: list[Candidate] = []
+        seen: set[tuple[str, str]] = set()
+        anchor_groups = {
+            str(candidate.metadata.get("topic_group"))
+            for candidate in coverage_anchors
+            if candidate.metadata.get("topic_group")
+        }
+        anchor_positions = [
+            position
+            for candidate in coverage_anchors
+            for position in [self._candidate_timeline_position(candidate)]
+            if position is not None
+        ]
+        anchor_min = min(anchor_positions) if anchor_positions else None
+        anchor_max = max(anchor_positions) if anchor_positions else None
+        fallback_pool = [
+            candidate
+            for candidate in selected + candidates
+            if not anchor_groups or self._candidate_in_topic_groups(candidate, anchor_groups)
+            if _candidate_in_timeline_window(
+                self._candidate_timeline_position(candidate),
+                anchor_min,
+                anchor_max,
+            )
+        ]
+        pool = required + fallback_pool
+        for candidate in pool:
+            key = (candidate.type, candidate.id)
+            if key in seen:
+                continue
+            out.append(candidate)
+            seen.add(key)
+            if len(out) >= limit:
+                break
+        return out
+
+    def _candidate_timeline_position(self, candidate: Candidate) -> tuple[tuple[tuple[int, int | str], ...], tuple[tuple[int, int | str], ...], str] | None:
+        source_uri = candidate.metadata.get("source_uri")
+        turn_id = candidate.metadata.get("turn_id")
+        timestamp = candidate.metadata.get("timestamp") or candidate.metadata.get("time_start") or ""
+        if source_uri or turn_id:
+            return (_natural_turn_key(source_uri), _natural_turn_key(turn_id), str(timestamp))
+        for span_id in candidate.source_span_ids:
+            span = self.store.get_span(span_id)
+            if span:
+                return (_natural_turn_key(span.source_uri), _natural_turn_key(span.turn_id), span.timestamp.isoformat())
+        return None
+
     def _apply_topic_scope_filter(self, query: str, plan: Any, candidates: list[Candidate], selected: list[Candidate], limit: int) -> list[Candidate]:
         if plan.query_type == "abstention":
+            return selected
+        if plan.query_type == "multi_session_reasoning" and _is_broad_exploration_aggregation_query(query.lower()):
             return selected
         topic_groups = {
             str(candidate.metadata.get("topic_group"))
             for candidate in candidates
-            if candidate.metadata.get("topic_group") and "topic_scope" in candidate.source
+            if candidate.metadata.get("topic_group")
+            and (
+                "topic_scope" in candidate.source
+                or (plan.query_type == "event_ordering" and "event_ordering_coverage" in candidate.source)
+            )
         }
         if not topic_groups:
             return selected
-        in_scope = [candidate for candidate in selected if self._candidate_in_topic_groups(candidate, topic_groups)]
+        in_scope = [
+            candidate
+            for candidate in selected
+            if self._candidate_in_topic_groups(candidate, topic_groups)
+            or (plan.query_type == "event_ordering" and _event_ordering_topic_scope_preserved_candidate(candidate))
+        ]
         if len(in_scope) == len(selected):
             return selected
-        replacements = [candidate for candidate in candidates if self._candidate_in_topic_groups(candidate, topic_groups)]
+        replacements = [
+            candidate
+            for candidate in candidates
+            if self._candidate_in_topic_groups(candidate, topic_groups)
+            or (plan.query_type == "event_ordering" and _event_ordering_topic_scope_preserved_candidate(candidate))
+        ]
         out: list[Candidate] = []
         seen: set[tuple[str, str]] = set()
         for candidate in in_scope + replacements:
@@ -1790,6 +2959,128 @@ class MemoryService:
         if len(out) < max(1, min(limit, len(selected)) // 2):
             return selected
         return out
+
+    def _apply_quality_fallback(
+        self,
+        query: str,
+        plan: Any,
+        scope: Scope,
+        candidates: list[Candidate],
+        selected: list[Candidate],
+        limit: int,
+        *,
+        include_session: bool = False,
+    ) -> list[Candidate]:
+        if not selected or len(selected) < 3:
+            return self._quality_fallback_candidates(query, plan, scope, candidates, selected, limit, include_session=include_session)
+        top_scores = [candidate.scores.get("utility_score", candidate.scores.get("score", 0.0)) for candidate in selected[:5]]
+        if not top_scores:
+            return selected
+        avg_score = sum(float(score or 0.0) for score in top_scores) / len(top_scores)
+        unique_texts = {candidate.text[:120] for candidate in selected[:5] if candidate.text}
+        if avg_score > 0.12 and len(unique_texts) >= 3:
+            return selected
+        return self._quality_fallback_candidates(query, plan, scope, candidates, selected, limit, include_session=include_session)
+
+    def _quality_fallback_candidates(
+        self,
+        query: str,
+        plan: Any,
+        scope: Scope,
+        candidates: list[Candidate],
+        selected: list[Candidate],
+        limit: int,
+        *,
+        include_session: bool = False,
+    ) -> list[Candidate]:
+        if plan.query_type == "abstention":
+            return selected
+        fallback_terms = _quality_fallback_terms(query)
+        if not fallback_terms:
+            return selected
+        if plan.query_type in {"event_ordering", "knowledge_update"}:
+            fallback_limit = max(limit, 6)
+        elif plan.query_type == "multi_session_reasoning":
+            fallback_limit = max(limit, 8)
+        else:
+            fallback_limit = max(limit, 5)
+        existing_ids = {candidate.id for candidate in selected}
+        fallback_results: list[Candidate] = []
+        seen_terms: set[str] = set()
+        for term in fallback_terms:
+            if term in seen_terms:
+                continue
+            seen_terms.add(term)
+            for span, scores in self.store.search_spans(
+                term,
+                scope,
+                limit=fallback_limit,
+                include_session=include_session,
+            ):
+                if span.span_id in existing_ids:
+                    continue
+                if span.span_type not in {"turn", "tool_result", "document_chunk"}:
+                    continue
+                topic_score = _topic_scope_score(query, span.content, plan)
+                exact = _exact_overlap_score(query, span.content)
+                if max(topic_score, exact) <= 0.04:
+                    continue
+                salience = _fallback_salience_score(span.content)
+                score = (0.34 * float(scores.get("score", 0.0))) + (0.28 * topic_score) + (0.18 * exact) + (0.20 * salience)
+                fallback_results.append(
+                    Candidate(
+                        id=span.span_id,
+                        type="span",
+                        text=span.content,
+                        source="quality_fallback",
+                        scores={
+                            **scores,
+                            "semantic_score": max(float(scores.get("semantic_score", 0.0)), topic_score),
+                            "bm25_score": max(float(scores.get("bm25_score", 0.0)), exact),
+                            "topic_scope_score": topic_score,
+                            "salience_score": salience,
+                            "score": score,
+                        },
+                        source_span_ids=[span.span_id],
+                        metadata={
+                            "speaker": span.speaker,
+                            "span_type": span.span_type,
+                            "timestamp": span.timestamp.isoformat(),
+                            "source_uri": span.source_uri,
+                            "turn_id": span.turn_id,
+                            "topic_group": _span_group_key(span),
+                            "fallback_term": term,
+                            "quality_fallback": True,
+                        },
+                    )
+                )
+                existing_ids.add(span.span_id)
+                if len(fallback_results) >= fallback_limit:
+                    break
+            if len(fallback_results) >= fallback_limit:
+                break
+        if not fallback_results:
+            return selected
+        fallback_results.sort(
+            key=lambda candidate: (
+                candidate.scores.get("score", 0.0),
+                candidate.scores.get("salience_score", 0.0),
+                candidate.scores.get("topic_scope_score", 0.0),
+                candidate.metadata.get("timestamp") or "",
+            ),
+            reverse=True,
+        )
+        merged: list[Candidate] = []
+        seen: set[tuple[str, str]] = set()
+        for candidate in fallback_results + selected:
+            key = (candidate.type, candidate.id)
+            if key in seen:
+                continue
+            merged.append(candidate)
+            seen.add(key)
+            if len(merged) >= limit:
+                break
+        return merged
 
     def _candidate_in_topic_groups(self, candidate: Candidate, topic_groups: set[str]) -> bool:
         if candidate.metadata.get("topic_group") in topic_groups:
@@ -1858,602 +3149,10 @@ class MemoryService:
         return self.store.get_event_edge(from_event_id, to_event_id)
 
 
-def _source_coverage(items: list[Any]) -> float:
-    if not items:
-        return 0.0
-    covered = 0
-    for item in items:
-        if isinstance(item, dict):
-            source_span_ids = item.get("source_span_ids") or item.get("candidate", {}).get("source_span_ids") or []
-        else:
-            source_span_ids = getattr(item, "source_span_ids", [])
-        covered += int(bool(source_span_ids))
-    return covered / len(items)
-
-
-TOPIC_SCOPE_STOPWORDS = {
-    "answer",
-    "about",
-    "across",
-    "after",
-    "also",
-    "and",
-    "application",
-    "aspect",
-    "aspects",
-    "based",
-    "been",
-    "before",
-    "between",
-    "brought",
-    "can",
-    "conversation",
-    "conversations",
-    "before",
-    "concern",
-    "concerns",
-    "challenge",
-    "challenges",
-    "comprehensive",
-    "currently",
-    "deadline",
-    "deadlines",
-    "different",
-    "developed",
-    "development",
-    "does",
-    "ever",
-    "feature",
-    "features",
-    "final",
-    "finish",
-    "finished",
-    "finishing",
-    "for",
-    "from",
-    "give",
-    "have",
-    "happened",
-    "help",
-    "how",
-    "include",
-    "including",
-    "information",
-    "into",
-    "item",
-    "items",
-    "key",
-    "list",
-    "made",
-    "make",
-    "management",
-    "many",
-    "mention",
-    "mentioned",
-    "need",
-    "new",
-    "only",
-    "order",
-    "our",
-    "over",
-    "previous",
-    "project",
-    "projects",
-    "question",
-    "request",
-    "requests",
-    "say",
-    "said",
-    "should",
-    "so",
-    "summary",
-    "target",
-    "targets",
-    "the",
-    "through",
-    "throughout",
-    "used",
-    "using",
-    "want",
-    "wanted",
-    "walk",
-    "way",
-    "ways",
-    "week",
-    "weeks",
-    "were",
-    "which",
-    "with",
-    "work",
-    "worked",
-    "you",
-}
-
-TOPIC_SCOPE_EQUIVALENTS = {
-    "auth": {"auth", "authentication", "login", "logout", "session"},
-    "authentication": {"auth", "authentication", "login", "logout", "session"},
-    "columns": {"column", "columns", "field", "fields"},
-    "deadline": {"deadline", "deadlines", "due", "target"},
-    "deployment": {"deployment", "deploy", "deployed", "launch", "production", "render", "gunicorn"},
-    "features": {"feature", "features", "module", "modules", "functionality"},
-    "financial": {"financial", "finance", "budget", "money", "cost", "costs", "income", "expense", "expenses"},
-    "finish": {"finish", "finished", "complete", "completed", "completion", "end", "ended"},
-    "latency": {"latency", "response", "time", "ms", "milliseconds"},
-    "profession": {"profession", "job", "career", "role", "work"},
-    "sprint": {"sprint", "sprints", "phase", "milestone"},
-    "stress": {"stress", "stressed", "burnout", "overwhelmed", "workload"},
-    "transaction": {"transaction", "transactions", "crud", "income", "expense", "expenses"},
-}
-
-
-def _topic_scope_group_limit(query_type: str) -> int:
-    if query_type in {"event_ordering", "temporal_lookup", "summarization"}:
-        return 1
-    if query_type in {"contradiction_resolution", "knowledge_update", "multi_session_reasoning"}:
-        return 2
-    return 1
-
-
-def _topic_scope_groups(query: str, plan: Any, spans: list[EvidenceSpan], *, max_groups: int) -> set[str]:
-    query_tokens = _topic_scope_tokens(query)
-    if not query_tokens:
-        return set()
-    group_scores: dict[str, float] = {}
-    group_top_scores: dict[str, list[float]] = {}
-    group_tokens: dict[str, set[str]] = {}
-    group_hits: dict[str, int] = {}
-    for span in spans:
-        group = _span_group_key(span)
-        if not group:
-            continue
-        score = _topic_scope_score(query, span.content, plan)
-        if score <= 0.04:
-            continue
-        tokens = _topic_scope_tokens(span.content)
-        group_tokens.setdefault(group, set()).update(tokens)
-        group_hits[group] = group_hits.get(group, 0) + 1
-        group_top_scores.setdefault(group, []).append(min(score, 0.75))
-        group_scores[group] = max(group_scores.get(group, 0.0), score)
-    if not group_scores:
-        return set()
-    ranked: list[tuple[str, float]] = []
-    for group, score in group_scores.items():
-        coverage = len(query_tokens & group_tokens.get(group, set())) / max(1, len(query_tokens))
-        top_scores = sorted(group_top_scores.get(group, []), reverse=True)[:8]
-        top_mass = sum(top_scores) / max(1, len(top_scores))
-        density = min(0.16, 0.015 * min(group_hits.get(group, 0), 12))
-        ranked.append((group, (0.35 * score) + (0.35 * top_mass) + (1.10 * coverage) + density))
-    ranked.sort(key=lambda item: item[1], reverse=True)
-    if not ranked or ranked[0][1] < 0.30:
-        return set()
-    selected = {ranked[0][0]}
-    for group, score in ranked[1:max_groups]:
-        if score >= max(0.35, ranked[0][1] * 0.72):
-            selected.add(group)
-    return selected
-
-
-def _topic_scope_score(query: str, text: str, plan: Any | None = None) -> float:
-    query_tokens = _topic_scope_tokens(query)
-    if not query_tokens:
-        return 0.0
-    text_tokens = _topic_scope_tokens(text)
-    if not text_tokens:
-        return 0.0
-    expanded_query = _expand_topic_tokens(query_tokens)
-    expanded_text = _expand_topic_tokens(text_tokens)
-    direct = len(query_tokens & text_tokens) / max(1, len(query_tokens))
-    expanded = len(expanded_query & expanded_text) / max(1, len(expanded_query))
-    phrase_bonus = _topic_phrase_bonus(query, text)
-    value_bonus = 0.0
-    query_lower = query.lower()
-    text_lower = text.lower()
-    if _has_value_intent(query_lower) and _compatible_value_mention(query_lower, text_lower):
-        value_bonus = 0.08
-    if getattr(plan, "query_type", None) == "temporal_lookup" and _date_signal(text) > 0:
-        value_bonus += 0.08
-    return min(1.0, (0.62 * direct) + (0.26 * expanded) + phrase_bonus + value_bonus)
-
-
-def _exact_overlap_score(query: str, text: str) -> float:
-    query_tokens = _topic_scope_tokens(query)
-    if not query_tokens:
-        return 0.0
-    text_tokens = _topic_scope_tokens(text)
-    if not text_tokens:
-        return 0.0
-    return len(query_tokens & text_tokens) / max(1, len(query_tokens))
-
-
-def _surface_claim_polarity(query: str, text: str) -> str:
-    lower = text.lower()
-    query_tokens = _topic_scope_tokens(query)
-    if query_tokens and len(query_tokens & _topic_scope_tokens(text)) == 0:
-        return "uncertain"
-    negative_patterns = [
-        r"\bnever\b",
-        r"\bnot\s+(?:yet\s+)?(?:used|integrated|worked|read|listened|met|downloaded|placed|attended|completed|tested|made|drafted|managed)\b",
-        r"\bhaven['’]?t\b",
-        r"\bhave\s+not\b",
-        r"\bno\s+experience\b",
-        r"\bwithout\s+(?:using|having|integrating|testing)\b",
-    ]
-    if any(re.search(pattern, lower) for pattern in negative_patterns):
-        return "negative"
-    positive_patterns = [
-        r"\b(?:used|integrated|worked|read|listened|met|downloaded|placed|attended|completed|tested|made|drafted|managed)\b",
-        r"\bstarted\s+(?:using|listening|reading|working|testing)\b",
-        r"\bhas\s+been\s+(?:used|integrated|tested|completed)\b",
-        r"\balready\s+(?:used|integrated|tested|completed|started|drafted)\b",
-    ]
-    if any(re.search(pattern, lower) for pattern in positive_patterns):
-        return "positive"
-    return "uncertain"
-
-
-def _topic_phrase_bonus(query: str, text: str) -> float:
-    query_lower = query.lower()
-    text_lower = text.lower()
-    phrases = []
-    for match in re.finditer(r"\b([a-z0-9]+(?:\s+[a-z0-9]+){1,3})\b", query_lower):
-        phrase = match.group(1)
-        terms = [term for term in phrase.split() if term not in TOPIC_SCOPE_STOPWORDS and len(term) >= 3]
-        if len(terms) >= 2:
-            phrases.append(" ".join(terms))
-    hits = sum(1 for phrase in dict.fromkeys(phrases) if phrase in text_lower)
-    return min(0.18, 0.06 * hits)
-
-
-def _topic_scope_tokens(text: str) -> set[str]:
-    raw = re.findall(r"[a-zA-Z][a-zA-Z0-9_+-]*|\d+(?:\.\d+)?", text.lower())
-    tokens: set[str] = set()
-    for token in raw:
-        token = token.strip("_+-")
-        if len(token) < 3 or token in TOPIC_SCOPE_STOPWORDS:
-            continue
-        tokens.add(token)
-        if token.endswith("s") and len(token) > 4:
-            tokens.add(token[:-1])
-        if token.endswith("ing") and len(token) > 6:
-            tokens.add(token[:-3])
-        if token.endswith("ed") and len(token) > 5:
-            tokens.add(token[:-2])
-    return tokens
-
-
-def _expand_topic_tokens(tokens: set[str]) -> set[str]:
-    expanded = set(tokens)
-    for token in list(tokens):
-        equivalents = TOPIC_SCOPE_EQUIVALENTS.get(token)
-        if equivalents:
-            expanded.update(equivalents)
-    return expanded
-
-
-def _span_group_key(span: EvidenceSpan) -> str:
-    for value in (span.source_uri, span.turn_id):
-        if not value:
-            continue
-        text = str(value)
-        match = re.match(r"^(beam:[^:]+:\d+):", text)
-        if match:
-            return match.group(1)
-        if "#" in text:
-            return text.split("#", 1)[0]
-    return span.scope.session_id or span.scope.run_id or span.scope.workspace_id or ""
-
-
-def _date_signal(text: str) -> float:
-    lower = text.lower()
-    if re.search(r"\b20\d{2}[-/]\d{1,2}[-/]\d{1,2}\b", lower):
-        return 1.0
-    if re.search(r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s+20\d{2})?\b", lower):
-        return 0.9
-    if re.search(r"\b\d+(?:\.\d+)?\s*(?:days?|weeks?|months?)\b", lower):
-        return 0.55
-    return 0.0
-
-
-def _temporal_target_roles_for_service(query: str) -> set[str]:
+def _event_ordering_requested_count_for_service(query: str) -> int | None:
     lower = query.lower()
-    roles: set[str] = set()
-    if "deployment" in lower or "deploy" in lower or "launch" in lower:
-        roles.add("deployment_deadline")
-    if re.search(r"\bfinish|finishing|complete|completed|completion|features?\b", lower):
-        roles.add("feature_finish_date")
-    if "sprint" in lower and re.search(r"\bend|first\b", lower):
-        roles.add("sprint_end_date")
-    if "start" in lower:
-        roles.add("start_date")
-    return roles
-
-
-def _temporal_roles_in_text(query: str, text: str) -> set[str]:
-    lower = text.lower()
-    roles: set[str] = set()
-    if ("deployment" in lower or "deploy" in lower or "launch" in lower or "production" in lower) and (
-        "deadline" in lower or "by " in lower or "target" in lower or _date_signal(lower)
-    ):
-        roles.add("deployment_deadline")
-    if (
-        re.search(r"\bfinish|finished|complete|completed|completion|end|ended\b", lower)
-        and ("feature" in lower or "features" in lower or len(_topic_scope_tokens(query) & _topic_scope_tokens(text)) >= 2)
-    ):
-        roles.add("feature_finish_date")
-    if "sprint" in lower and re.search(r"\bend|ends|ended|first\b", lower):
-        roles.add("sprint_end_date")
-    if re.search(r"\bstart|starts|started|begin|begins\b", lower):
-        roles.add("start_date")
-    return roles
-
-
-def _exact_query_terms(query: str) -> list[str]:
-    raw = re.findall(r"[A-Za-z0-9_./#:-]+", query.lower())
-    terms: list[str] = []
-    for token in raw:
-        normalized = token.strip(".,;:!?()[]{}")
-        if len(normalized) < 3:
-            continue
-        if normalized in EVENT_ORDERING_STOPWORDS or normalized in {"what", "when", "many", "much", "does", "have", "between"}:
-            continue
-        terms.append(normalized)
-        if "_" in normalized:
-            terms.extend(part for part in normalized.split("_") if len(part) >= 3)
-    return list(dict.fromkeys(terms[:16]))
-
-
-def _has_value_intent(query_lower: str) -> bool:
-    return bool(
-        re.search(r"\b(?:how many|how much|average|count|number|version|date|deadline|duration|weeks?|days?|time|response time)\b", query_lower)
-    )
-
-
-def _has_current_intent(query_lower: str) -> bool:
-    return bool(
-        re.search(r"\b(?:current|currently|now|latest|recent|recently|final|finally|updated|reached|reduced|improved|switched)\b", query_lower)
-        or re.search(r"\bwhat\s+is\s+(?:the\s+)?(?:average|status|value|count|number|version|response time)\b", query_lower)
-    )
-
-
-def _compatible_value_mention(query_lower: str, lower: str) -> bool:
-    if re.search(r"\b(?:response time|latency|average.*time|time.*average)\b", query_lower):
-        return bool(re.search(r"\b\d+(?:\.\d+)?\s*(?:ms|s|sec|seconds?)\b", lower) or "response time" in lower)
-    if "version" in query_lower:
-        return bool(re.search(r"\bv?\d+\.\d+(?:\.\d+)?\b", lower))
-    if re.search(r"\b(?:date|deadline|weeks?|days?|duration|between)\b", query_lower):
-        return bool(
-            re.search(r"\b\d+(?:\.\d+)?\s*(?:days?|weeks?)\b", lower)
-            or re.search(r"\b20\d{2}[-/]\d{1,2}[-/]\d{1,2}\b", lower)
-            or re.search(r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}\b", lower)
-        )
-    if re.search(r"\b(?:how many|count|number)\b", query_lower):
-        return bool(re.search(r"\b\d+\b", lower))
-    return bool(re.search(r"\b\d", lower))
-
-
-def _value_signal(query_lower: str, lower: str) -> float:
-    signal = 0.0
-    if re.search(r"\b\d+(?:\.\d+)?\s*(?:ms|s|sec|seconds?|minutes?|hours?)\b", lower):
-        signal += 0.45 if re.search(r"\b(?:response time|latency|average.*time|time.*average)\b", query_lower) else 0.30
-    if re.search(r"\b(?:date|deadline|weeks?|days?|duration|between)\b", query_lower) and re.search(r"\b\d+(?:\.\d+)?\s*(?:days?|weeks?)\b", lower):
-        signal += 0.35
-    if re.search(r"\b(?:how many|count|number)\b", query_lower) and re.search(r"\b\d+(?:\.\d+)?\s*(?:%|commits?)\b", lower):
-        signal += 0.35
-    if "version" in query_lower and re.search(r"\bv?\d+\.\d+(?:\.\d+)?\b", lower):
-        signal += 0.35
-    if re.search(r"\b(?:date|deadline|weeks?|days?|duration|between)\b", query_lower) and re.search(r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}\b", lower):
-        signal += 0.25
-    if re.search(r"\b(?:date|deadline|weeks?|days?|duration|between)\b", query_lower) and re.search(r"\b20\d{2}[-/]\d{1,2}[-/]\d{1,2}\b", lower):
-        signal += 0.25
-    return min(0.60, signal)
-
-
-def _current_state_signal(lower: str) -> float:
-    signal = 0.0
-    if re.search(r"\b(?:now|currently|latest|recently|final|finalized|updated|current)\b", lower):
-        signal += 0.22
-    if re.search(r"\b(?:reached|reduced to|improved to|switched to|moved to|is now|has now|now reached)\b", lower):
-        signal += 0.28
-    if re.search(r"\b(?:initially|previously|before|was originally|used to)\b", lower):
-        signal -= 0.10
-    return max(0.0, min(0.45, signal))
-
-
-def _code_identifier_signal(query_lower: str, lower: str) -> float:
-    identifiers = [
-        token
-        for token in re.findall(r"[a-z][a-z0-9_]{2,}", query_lower)
-        if "_" in token or token in {"api", "crud", "auth", "pytest", "flask", "sqlalchemy", "dashboard", "transactions"}
-    ]
-    if not identifiers:
-        return 0.0
-    hits = sum(1 for token in dict.fromkeys(identifiers) if token in lower)
-    return min(0.25, 0.08 * hits)
-
-
-SOFTWARE_ASPECT_TERMS = {
-    "analytics",
-    "api",
-    "auth",
-    "authentication",
-    "authorization",
-    "cache",
-    "ci",
-    "config",
-    "configuration",
-    "coverage",
-    "crud",
-    "database",
-    "deployment",
-    "endpoint",
-    "endpoints",
-    "error",
-    "errors",
-    "flask",
-    "gunicorn",
-    "integration",
-    "login",
-    "migrate",
-    "migration",
-    "performance",
-    "port",
-    "postgresql",
-    "render",
-    "response",
-    "schema",
-    "security",
-    "server",
-    "setup",
-    "sqlite",
-    "test",
-    "tests",
-    "transaction",
-    "transactions",
-    "validation",
-    "worker",
-}
-
-EVENT_ACTION_TERMS = {
-    "add",
-    "added",
-    "configure",
-    "configured",
-    "debug",
-    "debugged",
-    "deploy",
-    "deployed",
-    "fix",
-    "fixed",
-    "implement",
-    "implemented",
-    "improve",
-    "improved",
-    "optimize",
-    "optimized",
-    "plan",
-    "planned",
-    "review",
-    "reviewed",
-    "setup",
-    "test",
-    "tested",
-}
-
-EVENT_ORDERING_STOPWORDS = {
-    "about",
-    "across",
-    "after",
-    "also",
-    "and",
-    "application",
-    "aspect",
-    "aspects",
-    "before",
-    "brought",
-    "can",
-    "conversation",
-    "conversations",
-    "different",
-    "for",
-    "from",
-    "help",
-    "how",
-    "into",
-    "list",
-    "mention",
-    "mentioned",
-    "only",
-    "order",
-    "our",
-    "project",
-    "through",
-    "throughout",
-    "walk",
-    "which",
-    "with",
-    "you",
-}
-
-
-def _event_ordering_milestone_score(text: str) -> float:
-    lower = text.lower()
-    group_scores = [
-        _event_group_score(
-            lower,
-            anchors=("setup", "schema", "server", "mvp", "core functionality", "initial project", "local development"),
-            required_any=(),
-        ),
-        _event_group_score(
-            lower,
-            anchors=("transaction", "transactions"),
-            required_any=(
-                "crud",
-                "error",
-                "errors",
-                "exception",
-                "exceptions",
-                "response",
-                "handling",
-                "validation",
-                "post /transactions",
-                "create_transaction",
-                "created successfully",
-            ),
-        ),
-        _event_group_score(
-            lower,
-            anchors=("deployment", "deploy", "render", "gunicorn", "port", "worker"),
-            required_any=(
-                "render",
-                "gunicorn",
-                "port",
-                "worker",
-                "configuration",
-                "config",
-                "settings",
-                "server",
-                "hosting",
-                "environment",
-                "production",
-            ),
-        ),
-        _event_group_score(
-            lower,
-            anchors=("integration test", "integration tests", "coverage", "test suite", "endpoint", "endpoints"),
-            required_any=("test", "tests", "coverage", "suite", "endpoint", "endpoints"),
-        ),
-        _event_group_score(
-            lower,
-            anchors=("security", "auth", "authentication", "authorization", "password", "argon2", "login"),
-            required_any=("security", "password", "argon2", "authentication", "authorization", "login"),
-        ),
-    ]
-    group_hits = sum(1 for score in group_scores if score > 0)
-    if group_hits == 0:
-        return 0.0
-    action_bonus = 0.0
-    if re.search(
-        r"\b(?:trying|implement|implemented|working|worked|set up|setup|configure|configured|review|reviewing|add|added|switch|switched|decide|decided|plan|planned)\b",
-        lower,
-    ):
-        action_bonus = 0.15
-    return min(1.0, sum(group_scores) + action_bonus)
-
-
-def _event_group_score(lower: str, *, anchors: tuple[str, ...], required_any: tuple[str, ...]) -> float:
-    anchor_hits = sum(1 for phrase in anchors if phrase in lower)
-    if anchor_hits == 0:
-        return 0.0
-    if required_any and not any(phrase in lower for phrase in required_any):
-        return 0.0
-    return min(0.45, 0.24 + 0.07 * min(anchor_hits, 3))
-
-
-def _query_item_limit(lower: str) -> int | None:
-    digit = re.search(r"\b(?:only\s+and\s+only\s+)?([2-9])\s+items?\b", lower)
-    if digit:
-        return int(digit.group(1))
-    words = {
+    word_numbers = {
+        "one": 1,
         "two": 2,
         "three": 3,
         "four": 4,
@@ -2462,294 +3161,305 @@ def _query_item_limit(lower: str) -> int | None:
         "seven": 7,
         "eight": 8,
         "nine": 9,
+        "ten": 10,
     }
-    for word, value in words.items():
-        if re.search(rf"\b(?:only\s+and\s+only\s+)?{word}\s+items?\b", lower):
-            return value
-    return None
-
-
-def _select_event_ordering_representatives(query: str, events: list[MemoryEvent], limit: int, sort_key) -> list[MemoryEvent]:
-    if not events:
-        return []
-    desired = _query_item_limit(query.lower()) or min(limit, 8)
-    desired = max(1, min(desired, limit))
-    scored = [
-        (event, _event_ordering_event_relevance(query, event))
-        for event in events
-    ]
-    phase_selected = _select_phase_coverage_events(scored, desired, sort_key)
-    if len(phase_selected) >= desired:
-        return phase_selected[:desired]
-    selected: list[MemoryEvent] = []
-    seen_groups: set[str] = set()
-    seen_families: set[str] = set()
-    seen_spans: set[str] = set()
-    ranked = sorted(scored, key=lambda item: (item[1], _reverse_order_key(sort_key(item[0]))), reverse=True)
-    for event, relevance in ranked:
-        group = _event_milestone_group(event) or _event_aspect_signature(event.description)
-        family = _event_group_family(group)
-        span_key = next(iter(event.source_span_ids), event.event_id)
-        if relevance <= 0.0:
-            continue
-        if span_key in seen_spans and group in seen_groups:
-            continue
-        if family in seen_families and len(seen_families) < desired:
-            continue
-        selected.append(event)
-        seen_groups.add(group)
-        seen_families.add(family)
-        seen_spans.add(span_key)
-        if len(selected) >= desired:
-            break
-    if len(selected) < desired:
-        for event, relevance in ranked:
-            if event in selected or relevance <= 0.0:
-                continue
-            selected.append(event)
-            if len(selected) >= desired:
-                break
-    selected.sort(key=sort_key)
-    return selected
-
-
-def _select_phase_coverage_events(scored: list[tuple[MemoryEvent, float]], desired: int, sort_key) -> list[MemoryEvent]:
-    viable = [(event, relevance) for event, relevance in scored if relevance > 0.0 and _event_milestone_group(event)]
-    if not viable:
-        return []
-    by_phase: dict[str, list[tuple[MemoryEvent, float]]] = {}
-    for event, relevance in viable:
-        group = _event_milestone_group(event) or ""
-        phase = _event_phase_family(group)
-        by_phase.setdefault(phase, []).append((event, relevance))
-    selected: list[MemoryEvent] = []
-    used_ids: set[str] = set()
-    for phase in _event_phase_order(desired):
-        candidates = by_phase.get(phase, [])
-        if not candidates:
-            continue
-        event = _best_phase_representative(candidates, desired, sort_key)
-        if event.event_id in used_ids:
-            continue
-        selected.append(event)
-        used_ids.add(event.event_id)
-        if len(selected) >= desired:
-            break
-    if len(selected) < desired:
-        for event, _relevance in sorted(viable, key=lambda item: sort_key(item[0])):
-            if event.event_id in used_ids:
-                continue
-            selected.append(event)
-            used_ids.add(event.event_id)
-            if len(selected) >= desired:
-                break
-    selected.sort(key=sort_key)
-    return selected
-
-
-def _event_phase_order(desired: int) -> list[str]:
-    if desired <= 3:
-        return ["foundation", "transaction", "deployment", "testing", "security", "deployment_improvement"]
-    return ["foundation", "transaction", "deployment", "testing", "deployment_improvement", "security"]
-
-
-def _event_phase_family(group: str) -> str:
-    if group in {"core_functionality", "initial_project_setup", "setup_debugging"}:
-        return "foundation"
-    if group in {"transaction_crud_implementation", "transaction_error_handling"}:
-        return "transaction"
-    if group in {"deployment_configuration", "security_and_deployment"}:
-        return "deployment"
-    if group == "deployment_and_test_improvements":
-        return "deployment_improvement"
-    if group == "integration_test_coverage":
-        return "testing"
-    if group == "security_auth":
-        return "security"
-    return group
-
-
-def _best_phase_representative(candidates: list[tuple[MemoryEvent, float]], desired: int, sort_key) -> MemoryEvent:
-    def key(item: tuple[MemoryEvent, float]) -> tuple[float, float, tuple[Any, ...]]:
-        event, relevance = item
-        group = _event_milestone_group(event) or ""
-        return (
-            _phase_group_preference(group, desired),
-            relevance,
-            _reverse_order_key(sort_key(event)),
+    match = re.search(
+        r"\b(?:only|exactly|mention|list|name)\s+(?:and\s+)?(?:only\s+)?"
+        r"(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten)\b",
+        lower,
+    )
+    if not match:
+        match = re.search(
+            r"\b(\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
+            r"(?:items?|aspects?|steps?|phases?)\b",
+            lower,
         )
-
-    return max(candidates, key=key)[0]
-
-
-def _phase_group_preference(group: str, desired: int) -> float:
-    if desired <= 3 and group == "core_functionality":
-        return 1.0
-    if desired > 3 and group == "initial_project_setup":
-        return 1.0
-    if group in {"transaction_error_handling", "security_and_deployment", "deployment_and_test_improvements"}:
-        return 0.95
-    if group in {"transaction_crud_implementation", "deployment_configuration", "integration_test_coverage"}:
-        return 0.90
-    if group in {"core_functionality", "initial_project_setup"}:
-        return 0.85
-    return 0.70
+    if not match:
+        return None
+    raw = match.group(1)
+    try:
+        value = int(raw)
+    except ValueError:
+        value = word_numbers.get(raw)
+    return max(1, min(value, 12)) if value is not None else None
 
 
-def _event_ordering_event_relevance(query: str, event: MemoryEvent) -> float:
-    group = _event_milestone_group(event)
-    description = event.description
-    base = keyword_score(query, description)
-    aspect = _event_group_query_fit(query.lower(), group, description)
-    if group:
-        aspect = max(aspect, 0.22)
-    return base + aspect
+def _event_ordering_query_facets_for_service(query: str) -> set[str]:
+    terms = _topic_scope_tokens(query)
+    terms -= TOPIC_SCOPE_STOPWORDS
+    terms -= {
+        "different",
+        "related",
+        "throughout",
+        "conversation",
+        "conversations",
+        "chats",
+        "items",
+        "aspects",
+        "order",
+        "only",
+        "mention",
+        "walk",
+        "list",
+        "ways",
+        "concepts",
+        "details",
+        "plans",
+        "personal",
+        "professional",
+        "work",
+    }
+    facets = {term for term in terms if len(term) >= 3}
+    expanded = set(facets)
+    for term in list(facets):
+        expanded.update(_event_ordering_term_variants_for_service(term))
+    return expanded
 
 
-def _event_aspect_signature(text: str) -> str:
+def _event_ordering_anchor_terms_for_service(query: str) -> set[str]:
+    lower = query.lower()
+    anchors: list[str] = []
+    patterns = [
+        r"\b(?:aspects of|features of|concerns about|topics related to|ideas related to|plans involving|interactions with)\s+(?:implementing|developing|building|creating|setting up|working on|handling|managing|using|balancing)?\s*(?:my|the|this|that)?\s*([a-z0-9][a-z0-9 +#./'&-]{4,90}?)(?:\s+throughout|\s+across|\s+during|\s+in order|\?|$)",
+        r"\b(?:my|the|this|that)\s+([a-z0-9][a-z0-9 +#./'&-]*(?:feature|app|application|website|tracker|dashboard|project|system|tool|api|code|statement|workload|marathon|process|plans?))\b",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, lower):
+            anchors.append(match.group(1))
+    if not anchors:
+        return set()
+    terms = _topic_scope_tokens(anchors[0])
+    terms -= TOPIC_SCOPE_STOPWORDS
+    terms -= {"different", "aspects", "features", "concerns", "topics", "ideas", "plans", "personal", "professional", "work"}
+    expanded = set(terms)
+    for term in list(terms):
+        expanded.update(_event_ordering_term_variants_for_service(term))
+    return {term for term in expanded if len(term) >= 3}
+
+
+def _event_ordering_raw_episode_signal(text: str) -> float:
     lower = text.lower()
-    tokens = re.findall(r"[a-z0-9_]+", lower)
-    keep = [token for token in tokens if len(token) > 3 and token not in {"milestone", "evidence", "trying", "with", "this", "that", "have"}]
-    return "_".join(keep[:3]) if keep else lower[:40]
+    score = 0.0
+    if re.search(
+        r"\b(?:i|we)\s+(?:am|was|were|have|had|'m|'re|'ve)\b|\b(?:i|we)\s+(?:started|used|implemented|configured|fixed|planned|decided|chose|selected|met|shared|asked|tried|tracked|tracking)\b",
+        lower,
+    ):
+        score += 0.35
+    if re.search(r"\b(?:started|using|used|implemented|configured|fixed|debug|debugged|planned|planning|decided|chose|selected|compared|reviewed|updated|improved|tracking|met|shared|recommended|suggested)\b", lower):
+        score += 0.25
+    if re.search(r"\b(?:issue|problem|bug|error|concern|concerns|deadline|meeting|feedback|advice|result|progress|budget|goal|decision)\b", lower):
+        score += 0.18
+    if re.search(r"\b[A-Z][A-Za-z0-9.+#&-]{2,}\b|\$[\d,]+|\d+(?:\.\d+)?%?\b", text):
+        score += 0.12
+    if re.search(r"\b(?:thanks|thank you|sounds good|got it|sure,?|ok(?:ay)?)\b", lower):
+        score -= 0.20
+    return max(0.0, min(1.0, score))
 
 
-def _event_group_family(group: str) -> str:
-    if group in {"initial_project_setup", "setup_debugging"}:
-        return "setup"
-    if group in {"transaction_crud_implementation", "transaction_error_handling"}:
-        return "transaction"
-    if group in {"deployment_configuration", "security_and_deployment"}:
-        return "deployment"
-    if group in {"deployment_and_test_improvements"}:
-        return "deployment_improvement"
-    if group in {"integration_test_coverage"}:
-        return "tests"
-    if group in {"security_auth"}:
-        return "security"
-    if group in {"core_functionality"}:
-        return "core"
-    return group
+def _event_ordering_referenceable_detail_signal(text: str) -> float:
+    score = 0.0
+    if re.search(r"\b[A-Z][A-Za-z0-9.+#&-]{2,}\b", text):
+        score += 0.20
+    if re.search(r"\$[\d,]+|v?\d+(?:\.\d+){1,3}|\d+(?:\.\d+)?%", text, flags=re.I):
+        score += 0.20
+    if re.search(r"\b\d+(?:\.\d+)?\s*(?:minutes?|hours?|days?|weeks?|months?|items?|people|attendees?|interviews?|candidates?)\b", text, flags=re.I):
+        score += 0.18
+    if re.search(r"[`'\"][^`'\"]{3,80}[`'\"]|[a-z][a-z0-9]+(?:[-_][a-z0-9]+)+", text):
+        score += 0.18
+    if re.search(r"\b(?:recommended|suggested|advised|told|feedback|review meeting|hired|started|finalized|upgraded|adjusted|scheduled|coordinated)\b", text, flags=re.I):
+        score += 0.18
+    return min(1.0, score)
 
 
-def _event_group_query_fit(query_lower: str, group: str | None, description: str) -> float:
-    lower = description.lower()
-    query_tokens = _event_ordering_tokens(query_lower)
-    event_tokens = _event_ordering_tokens(lower)
-    group_tokens = _event_ordering_tokens((group or "").replace("_", " "))
-    if not event_tokens and not group_tokens:
+def _event_ordering_support_option_signal(query: str, text: str) -> float:
+    query_lower = query.lower()
+    if not _event_ordering_support_option_query(query):
         return 0.0
-    overlap = len(query_tokens.intersection(event_tokens.union(group_tokens))) / max(1, len(query_tokens))
-    salient_hits = sum(1 for token in event_tokens.union(group_tokens) if token in SOFTWARE_ASPECT_TERMS)
-    action_hits = sum(1 for token in event_tokens if token in EVENT_ACTION_TERMS)
-    compound_bonus = 0.10 if len(group_tokens) >= 2 else 0.0
-    return min(1.0, (0.55 * overlap) + (0.06 * min(salient_hits, 5)) + (0.04 * min(action_hits, 3)) + compound_bonus)
+    lower = text.lower()
+    score = 0.0
+    if re.search(r"\b(?:hire[ds]?|hiring|brought on|bring(?:ing)? on|contract(?:ed)?|outsourc(?:e|ed|ing)|delegate[ds]?|delegating|delegation)\b", lower):
+        score += 0.36
+    if re.search(r"\b(?:assistant|agency|mentor|coach|consultant|advisor|adviser|specialist|contractor|service|team|colleague|partner)\b", lower):
+        score += 0.26
+    if re.search(r"\b(?:tool|tools|board|boards|calendar|reminder|workflow|automation|software|app|platform|system|template|checklist)\b", lower):
+        score += 0.24
+    if re.search(r"\b(?:advice|recommended|suggested|strategy|strategies|approach|plan|process|method|option|support)\b", lower):
+        score += 0.18
+    if re.search(r"\b\d+(?:\.\d+)?\s*(?:hours?|hrs?|/week|per week)\b|\$[\d,]+(?:\.\d+)?(?:/hour|/month| per hour| monthly)?\b", lower):
+        score += 0.14
+    return min(1.0, score)
 
 
-def _event_ordering_tokens(text: str) -> set[str]:
-    raw = re.findall(r"[a-z0-9_]+", text.lower())
-    tokens: set[str] = set()
-    for token in raw:
-        if len(token) < 3 or token in EVENT_ORDERING_STOPWORDS:
+def _event_ordering_support_option_query(query: str) -> bool:
+    return bool(re.search(r"\b(?:strateg(?:y|ies)|support|options?|resources?|tools?|help|ways?)\b", query.lower()))
+
+
+def _event_ordering_term_variants_for_service(term: str) -> set[str]:
+    variants = {term}
+    if len(term) > 5 and term.endswith("ing"):
+        stem = term[:-3]
+        variants.add(stem)
+        variants.add(stem + "e")
+    if len(term) > 4 and term.endswith("ed"):
+        stem = term[:-2]
+        variants.add(stem)
+        variants.add(stem + "e")
+    if len(term) > 4 and term.endswith("e"):
+        variants.add(term[:-1])
+    if term.endswith("iz") or term.endswith("is"):
+        variants.add(term + "e")
+    if term.endswith("izing"):
+        variants.add(term[:-5])
+        variants.add(term[:-3])
+    if term.endswith("ization"):
+        variants.add(term[:-7])
+        variants.add(term[:-5])
+    return {variant for variant in variants if len(variant) >= 3}
+
+
+def _event_ordering_select_episode_recall_candidates(
+    scored: list[tuple[float, Candidate]],
+    limit: int,
+    requested: int,
+) -> list[Candidate]:
+    if not scored:
+        return []
+    ordered = sorted(
+        scored,
+        key=lambda item: (
+            _natural_turn_key(item[1].metadata.get("source_uri")),
+            _natural_turn_key(item[1].metadata.get("turn_id")),
+            item[1].metadata.get("timestamp") or "",
+            item[1].id,
+        ),
+    )
+    if limit <= 0:
+        return []
+    target = max(requested * 3, requested + 8) if requested else limit
+    desired = min(limit, max(1, target))
+    selected: list[tuple[float, Candidate]] = []
+    seen_ids: set[str] = set()
+    total = len(ordered)
+    buckets = max(1, min(desired, total))
+    for bucket in range(buckets):
+        start = round(bucket * total / buckets)
+        end = round((bucket + 1) * total / buckets)
+        if end <= start:
+            end = min(total, start + 1)
+        window = [item for item in ordered[start:end] if item[1].id not in seen_ids]
+        if not window:
             continue
-        tokens.add(token)
-        if token.endswith("s") and len(token) > 4:
-            tokens.add(token[:-1])
-    return tokens
+        choice = max(
+            window,
+            key=lambda item: (
+                item[0],
+                item[1].scores.get("event_facet_coverage", 0.0),
+                item[1].scores.get("event_support_option_signal", 0.0),
+                item[1].scores.get("event_episode_signal", 0.0),
+                item[1].scores.get("event_detail_signal", 0.0),
+            ),
+        )
+        selected.append(choice)
+        seen_ids.add(choice[1].id)
+        if len(selected) >= desired:
+            break
+    if len(selected) < desired:
+        for item in sorted(
+            scored,
+            key=lambda value: (
+                value[0],
+                value[1].scores.get("event_facet_coverage", 0.0),
+                value[1].scores.get("event_support_option_signal", 0.0),
+                value[1].scores.get("event_episode_signal", 0.0),
+                value[1].scores.get("event_detail_signal", 0.0),
+            ),
+            reverse=True,
+        ):
+            if item[1].id in seen_ids:
+                continue
+            selected.append(item)
+            seen_ids.add(item[1].id)
+            if len(selected) >= desired:
+                break
+    selected_candidates = [candidate for _score, candidate in selected]
+    selected_candidates.sort(
+        key=lambda candidate: (
+            _natural_turn_key(candidate.metadata.get("source_uri")),
+            _natural_turn_key(candidate.metadata.get("turn_id")),
+            candidate.metadata.get("timestamp") or "",
+            candidate.id,
+        )
+    )
+    return selected_candidates[:limit]
 
 
-def _reverse_order_key(value: tuple[Any, ...]) -> tuple[int, ...]:
-    encoded = "|".join(str(part) for part in value)
-    return tuple(-ord(char) for char in encoded)
+def _event_ordering_episode_recall_candidate(candidate: Candidate) -> bool:
+    if "event_ordering_episode_recall" not in candidate.source:
+        return False
+    if candidate.type != "span":
+        return False
+    return (
+        float(candidate.scores.get("event_episode_signal", 0.0) or 0.0) >= 0.35
+        or float(candidate.scores.get("event_detail_signal", 0.0) or 0.0) >= 0.30
+        or float(candidate.scores.get("event_support_option_signal", 0.0) or 0.0) >= 0.30
+        or float(candidate.scores.get("event_facet_coverage", 0.0) or 0.0) >= 0.12
+        or bool(candidate.metadata.get("event_ordering_facet_hits"))
+        or bool(candidate.metadata.get("event_ordering_anchor_hits"))
+    )
 
 
-def _natural_turn_key(value: object) -> tuple[tuple[int, int | str], ...]:
-    text = "" if value is None else str(value)
-    parts: list[tuple[int, int | str]] = []
-    for part in re.split(r"(\d+)", text):
-        if not part:
-            continue
-        parts.append((0, int(part)) if part.isdigit() else (1, part))
-    return tuple(parts)
+def _event_ordering_episode_preserve_score(candidate: Candidate) -> float:
+    return min(
+        1.0,
+        float(candidate.scores.get("score", 0.0) or 0.0)
+        + 0.18 * float(candidate.scores.get("event_facet_coverage", 0.0) or 0.0)
+        + 0.12 * float(candidate.scores.get("event_support_option_signal", 0.0) or 0.0)
+        + 0.12 * float(candidate.scores.get("event_episode_signal", 0.0) or 0.0)
+        + 0.10 * float(candidate.scores.get("event_detail_signal", 0.0) or 0.0),
+    )
 
 
-def _event_milestone_group(event: MemoryEvent) -> str | None:
-    text = event.description
-    match = re.search(r"Milestone \[([a-z0-9_]+)\]", text)
-    if match:
-        return match.group(1)
-    for participant in event.participants:
-        if re.fullmatch(r"[a-z]+(?:_[a-z0-9]+)+", str(participant)):
-            return str(participant)
-    return None
+def _event_ordering_topic_scope_preserved_candidate(candidate: Candidate) -> bool:
+    if not _event_ordering_episode_recall_candidate(candidate):
+        return False
+    if candidate.metadata.get("speaker") not in {"user", "document"}:
+        return False
+    if _event_ordering_low_value_raw_facet_candidate(candidate):
+        return False
+    return True
 
 
-def _sanitize_model_call(component: str, source: Any, call: dict[str, Any]) -> dict[str, Any]:
-    model = call.get("model") or getattr(source, "model", None)
-    model_version = getattr(source, "version", None) or model or source.__class__.__name__
-    out: dict[str, Any] = {
-        "component": component,
-        "model_version": model_version,
-    }
-    if model:
-        out["model"] = model
-    prompt_version = call.get("prompt_version") or call.get("prompt")
-    if isinstance(prompt_version, str):
-        prompt_version = prompt_version.splitlines()[0]
-        out["prompt_version"] = prompt_version
-    latency_ms = call.get("latency_ms")
-    if isinstance(latency_ms, int | float):
-        out["latency_ms"] = latency_ms
-    usage = call.get("usage")
-    if isinstance(usage, dict):
-        out["usage"] = usage
-    cost = call.get("cost")
-    if isinstance(cost, int | float):
-        out["cost"] = cost
-    for key in ("text_count", "doc_count"):
-        if isinstance(call.get(key), int):
-            out[key] = call[key]
-    return out
+def _event_ordering_raw_facet_episode_required(candidate: Candidate, *, broad_episode_recall: bool) -> bool:
+    if broad_episode_recall:
+        return (
+            float(candidate.scores.get("event_support_option_signal", 0.0) or 0.0) >= 0.30
+            or float(candidate.scores.get("event_episode_signal", 0.0) or 0.0) >= 0.35
+            or float(candidate.scores.get("event_detail_signal", 0.0) or 0.0) >= 0.36
+            or float(candidate.scores.get("event_facet_coverage", 0.0) or 0.0) >= 0.20
+        )
+    return (
+        float(candidate.scores.get("event_facet_coverage", 0.0) or 0.0) >= 0.20
+        and float(candidate.scores.get("event_episode_signal", 0.0) or 0.0) >= 0.35
+    )
 
 
-def _model_call_summary(model_calls: list[dict[str, Any]]) -> dict[str, Any]:
-    usage_totals: dict[str, float] = {}
-    for call in model_calls:
-        usage = call.get("usage")
-        if not isinstance(usage, dict):
-            continue
-        for key, value in usage.items():
-            if isinstance(value, int | float):
-                usage_totals[key] = usage_totals.get(key, 0.0) + float(value)
-    return {
-        "count": len(model_calls),
-        "model_versions": sorted({str(call.get("model_version")) for call in model_calls if call.get("model_version")}),
-        "total_latency_ms": sum(float(call.get("latency_ms", 0.0)) for call in model_calls if isinstance(call.get("latency_ms"), int | float)),
-        "usage": usage_totals,
-    }
+def _event_ordering_low_value_raw_facet_candidate(candidate: Candidate) -> bool:
+    lower = (candidate.text or "").lower()
+    if candidate.metadata.get("speaker") not in {"user", "document"}:
+        return True
+    if re.fullmatch(r"\s*(?:thanks|thank you|sounds good|ok(?:ay)?|sure)[.!]?\s*", lower):
+        return True
+    if re.search(r"\balways provide\b|\bwhen i ask\b", lower) and len(_topic_scope_tokens(lower)) <= 6:
+        return True
+    return False
 
 
-def _labeled_precision(items: list[dict[str, Any]], labels: dict[str, bool], *, positive: bool) -> float | None:
-    known = 0
-    correct = 0
-    for item in items:
-        candidate = item.get("candidate", {})
-        keys = [item.get("decision_id"), candidate.get("local_id"), candidate.get("text")]
-        label = next((labels[key] for key in keys if key in labels), None)
-        if label is None:
-            continue
-        known += 1
-        correct += int(label is positive)
-    return correct / known if known else None
-
-
-ORDER_RE = re.compile(r"\b(after|before)\s+(?:the\s+)?(.+?)(?:,|\.|;|\bthen\b|\bi\s+|\bwe\s+|$)", re.I)
-
-
-def _explicit_order_mentions(text: str) -> list[tuple[str, str]]:
-    mentions: list[tuple[str, str]] = []
-    for match in ORDER_RE.finditer(text):
-        direction = match.group(1).lower()
-        target = match.group(2).strip()
-        if target:
-            mentions.append((target, direction))
-    return mentions
+def _event_ordering_low_value_raw_facet_text(text: str) -> bool:
+    lower = text.lower()
+    if re.fullmatch(r"\s*(?:thanks|thank you|sounds good|ok(?:ay)?|sure)[.!]?\s*", lower):
+        return True
+    if re.search(r"\balways provide\b|\bwhen i ask\b", lower) and len(_topic_scope_tokens(lower)) <= 6:
+        return True
+    if re.fullmatch(r"\s*(?:yes|yeah|no|maybe|okay|ok)[,.! ]{0,8}\s*", lower):
+        return True
+    return False

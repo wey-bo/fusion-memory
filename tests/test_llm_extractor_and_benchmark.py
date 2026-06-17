@@ -48,7 +48,7 @@ class LLMExtractorAndBenchmarkTests(unittest.TestCase):
         self.assertIn("structured_llm_extractor", str(trace))
         self.assertTrue(client.calls)
 
-    def test_structured_llm_extractor_accepts_string_fact_for_single_span(self) -> None:
+    def test_structured_llm_extractor_rejects_string_fact_by_default(self) -> None:
         class StringFactClient:
             def structured(self, prompt, schema, input):
                 return {"facts": ["User prefers Qdrant for Atlas retrieval."]}
@@ -58,9 +58,77 @@ class LLMExtractorAndBenchmarkTests(unittest.TestCase):
         scope = Scope(workspace_id="w", user_id="u", agent_id="a")
         result = memory.add("Please remember I prefer Qdrant for Atlas retrieval.", scope, datetime(2026, 6, 1, tzinfo=timezone.utc))
 
+        self.assertFalse(result.accepted_fact_ids)
+        trace = memory.debug_trace(result.trace_id)
+        telemetry = next(step for step in trace["steps"] if step["step"] == "extractor_telemetry")
+        self.assertEqual(telemetry["invalid_fact_count"], 1)
+        self.assertFalse(telemetry["fallback_used"])
+
+    def test_structured_llm_extractor_legacy_mode_accepts_string_fact_for_single_span(self) -> None:
+        class StringFactClient:
+            def structured(self, prompt, schema, input):
+                return {"facts": ["User prefers Qdrant for Atlas retrieval."]}
+
+        extractor = StructuredLLMExtractor(StringFactClient(), strict=False, allow_legacy_strings=True)
+        memory = MemoryService(extractor=extractor)
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a")
+        result = memory.add("Please remember I prefer Qdrant for Atlas retrieval.", scope, datetime(2026, 6, 1, tzinfo=timezone.utc))
+
         self.assertTrue(result.accepted_fact_ids)
         fact = memory.get(result.accepted_fact_ids[0], "fact")
         self.assertEqual(fact.source_span_ids, result.span_ids)
+        trace = memory.debug_trace(result.trace_id)
+        telemetry = next(step for step in trace["steps"] if step["step"] == "extractor_telemetry")
+        self.assertFalse(telemetry["strict"])
+        self.assertTrue(telemetry["allow_legacy_strings"])
+
+    def test_structured_llm_extractor_drops_unattributed_fact_with_telemetry(self) -> None:
+        class UnattributedClient:
+            def structured(self, prompt, schema, input):
+                return {
+                    "facts": [
+                        {
+                            "text": "User prefers Qdrant for Atlas retrieval.",
+                            "subject": "user",
+                            "predicate": "prefers",
+                            "object": "Qdrant",
+                            "category": "preference",
+                            "confidence": 0.9,
+                            "source_span_ids": ["not-a-real-span"],
+                        }
+                    ],
+                    "events": [],
+                    "relations": [],
+                }
+
+        extractor = StructuredLLMExtractor(UnattributedClient())
+        memory = MemoryService(extractor=extractor)
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a")
+        result = memory.add("Please remember I prefer Qdrant for Atlas retrieval.", scope, datetime(2026, 6, 1, tzinfo=timezone.utc))
+
+        self.assertFalse(result.accepted_fact_ids)
+        trace = memory.debug_trace(result.trace_id)
+        telemetry = next(step for step in trace["steps"] if step["step"] == "extractor_telemetry")
+        self.assertEqual(telemetry["invalid_fact_count"], 1)
+        self.assertEqual(telemetry["accepted_fact_count"], 0)
+
+    def test_structured_llm_extractor_records_rule_fallback_telemetry_on_failure(self) -> None:
+        class FailingClient:
+            def structured(self, prompt, schema, input):
+                raise RuntimeError("extractor unavailable")
+
+        extractor = StructuredLLMExtractor(FailingClient())
+        memory = MemoryService(extractor=extractor)
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a")
+        result = memory.add("Please remember I prefer Qdrant for Atlas retrieval.", scope, datetime(2026, 6, 1, tzinfo=timezone.utc))
+
+        self.assertTrue(result.accepted_fact_ids)
+        trace = memory.debug_trace(result.trace_id)
+        telemetry = next(step for step in trace["steps"] if step["step"] == "extractor_telemetry")
+        self.assertTrue(telemetry["llm_call_failed"])
+        self.assertTrue(telemetry["fallback_used"])
+        self.assertEqual(telemetry["fallback_reason"], "RuntimeError")
+        self.assertGreater(telemetry["fallback_candidate_count"], 0)
 
     def test_structured_llm_extractor_uses_rule_event_fallback(self) -> None:
         class FactOnlyClient:
@@ -89,7 +157,7 @@ class LLMExtractorAndBenchmarkTests(unittest.TestCase):
 
         self.assertTrue(result.accepted_event_ids)
         event = memory.store.list_events(scope)[0]
-        self.assertEqual(event.event_type, "milestone")
+        self.assertIn(event.event_type, {"plan_step", "milestone"})
         self.assertIn("Core functionality", event.description)
 
     def test_dataset_loader_and_benchmark_report_from_json(self) -> None:

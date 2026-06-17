@@ -214,6 +214,7 @@ class QueryPlan:
     needs_current_state: bool = False
     needs_source_evidence: bool = True
     must_include_sources: list[str] = field(default_factory=list)
+    intent: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
