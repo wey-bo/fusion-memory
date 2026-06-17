@@ -1,5 +1,5 @@
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
-import { DEFAULT_BASE_URL, DEFAULT_TIMEOUT_MS, normalizeBaseUrl, safeFailure } from "./helpers.js";
+import { DEFAULT_BASE_URL, normalizeBaseUrl, normalizeTimeoutMs, safeFailure } from "./helpers.js";
 
 async function postJson(baseUrl, path, payload, timeoutMs) {
   const controller = new AbortController();
@@ -32,10 +32,10 @@ function scopeFromContext(ctx) {
 }
 
 function configFromContext(ctx) {
-  const config = ctx?.config?.plugins?.entries?.["fusion-memory"]?.config || {};
+  const config = ctx?.pluginConfig || ctx?.config?.plugins?.entries?.["fusion-memory"]?.config || {};
   return {
     baseUrl: normalizeBaseUrl(process.env.FUSION_MEMORY_BASE_URL || config.baseUrl || DEFAULT_BASE_URL),
-    timeoutMs: Number(process.env.FUSION_MEMORY_TIMEOUT_MS || config.timeoutMs || DEFAULT_TIMEOUT_MS),
+    timeoutMs: normalizeTimeoutMs(process.env.FUSION_MEMORY_TIMEOUT_MS || config.timeoutMs),
   };
 }
 
