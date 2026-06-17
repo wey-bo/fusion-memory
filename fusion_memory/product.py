@@ -32,6 +32,16 @@ class ProductPaths:
     backup_dir: Path
 
 
+def runtime_status_payload(*, storage_backend: str = "sqlite") -> dict[str, Any]:
+    return {
+        "ok": True,
+        "service": "running",
+        "database": {"ok": True, "backend": storage_backend or "sqlite"},
+        "models": {"ok": True},
+        "version": CONFIG_VERSION,
+    }
+
+
 def product_paths(home: str | Path | None = None) -> ProductPaths:
     root = Path(home).expanduser() if home else _default_home()
     return ProductPaths(

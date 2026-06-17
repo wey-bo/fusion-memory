@@ -10,6 +10,38 @@ from fusion_memory.server import serve
 
 
 class ServerTests(unittest.TestCase):
+    def test_status_endpoint_reports_readiness(self) -> None:
+        ready = threading.Event()
+        holder = {}
+
+        def run_server() -> None:
+            service = MemoryService()
+            server = serve(service, host="127.0.0.1", port=0)
+            holder["service"] = service
+            holder["server"] = server
+            ready.set()
+            try:
+                server.serve_forever()
+            finally:
+                server.server_close()
+                service.close()
+
+        thread = threading.Thread(target=run_server, daemon=True)
+        thread.start()
+        self.assertTrue(ready.wait(timeout=5))
+        server = holder["server"]
+        try:
+            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            status = _post_or_get(f"{base_url}/status")
+            self.assertTrue(status["ok"])
+            self.assertEqual(status["service"], "running")
+            self.assertTrue(status["database"]["ok"])
+            self.assertTrue(status["models"]["ok"])
+            self.assertIn("version", status)
+        finally:
+            server.shutdown()
+            thread.join(timeout=2)
+
     def test_persistent_http_server_adds_and_searches_memory(self) -> None:
         ready = threading.Event()
         holder = {}
@@ -84,6 +116,48 @@ class ServerTests(unittest.TestCase):
                 },
             )
             self.assertTrue(delete_alias["ok"])
+        finally:
+            server.shutdown()
+            thread.join(timeout=2)
+
+    def test_post_errors_are_sanitized_for_beginner_clients(self) -> None:
+        ready = threading.Event()
+        holder = {}
+
+        def run_server() -> None:
+            service = MemoryService()
+            server = serve(service, host="127.0.0.1", port=0)
+            holder["service"] = service
+            holder["server"] = server
+            ready.set()
+            try:
+                server.serve_forever()
+            finally:
+                server.server_close()
+                service.close()
+
+        thread = threading.Thread(target=run_server, daemon=True)
+        thread.start()
+        self.assertTrue(ready.wait(timeout=5))
+        server = holder["server"]
+        try:
+            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            req = request.Request(
+                f"{base_url}/search",
+                data=json.dumps({"query": "missing scope"}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                request.urlopen(req, timeout=5)
+                self.fail("expected HTTPError")
+            except Exception as exc:
+                response = exc.fp.read().decode("utf-8")
+                payload = json.loads(response)
+            self.assertEqual(payload["error"], "request_failed")
+            self.assertIn("fusion-memory doctor", payload["message"])
+            self.assertNotIn("ValueError", json.dumps(payload))
+            self.assertNotIn("scope is required", json.dumps(payload))
         finally:
             server.shutdown()
             thread.join(timeout=2)

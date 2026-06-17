@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 from fusion_memory import Scope
 from fusion_memory.api.service import MemoryService
 from fusion_memory.core.runtime_config import memory_service_from_env
+from fusion_memory.product import runtime_status_payload
 
 
 class MemoryServerState:
@@ -30,6 +31,14 @@ def make_handler(state: MemoryServerState) -> type[BaseHTTPRequestHandler]:
             path = urlparse(self.path).path
             if path == "/health":
                 self._write_json(200, {"ok": True})
+                return
+            if path == "/status":
+                self._write_json(
+                    200,
+                    runtime_status_payload(
+                        storage_backend=self.server.storage_backend if hasattr(self.server, "storage_backend") else "sqlite"
+                    ),
+                )
                 return
             self._write_json(404, {"error": "not_found"})
 
@@ -66,8 +75,14 @@ def make_handler(state: MemoryServerState) -> type[BaseHTTPRequestHandler]:
                         self._write_json(404, {"error": "not_found"})
                         return
                 self._write_json(200, _jsonable(result))
-            except Exception as exc:
-                self._write_json(400, {"error": exc.__class__.__name__, "message": str(exc)})
+            except Exception:
+                self._write_json(
+                    400,
+                    {
+                        "error": "request_failed",
+                        "message": "Fusion Memory could not complete that request. Run fusion-memory doctor.",
+                    },
+                )
 
         def log_message(self, format: str, *args: Any) -> None:
             if os.getenv("FUSION_MEMORY_SERVER_LOG_REQUESTS", "").lower() in {"1", "true", "yes"}:
@@ -102,6 +117,7 @@ def serve(
 ) -> HTTPServer:
     state = MemoryServerState(service)
     server = HTTPServer((host, port), make_handler(state))
+    server.storage_backend = getattr(service, "storage_backend", "sqlite")  # type: ignore[attr-defined]
     return server
 
 
