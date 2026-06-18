@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 from fusion_memory import MemoryService
@@ -19,10 +19,66 @@ class ChronologySelectorTests(unittest.TestCase):
     def test_persisted_graph_selector_returns_topic_scoped_ordered_candidates(self) -> None:
         memory = MemoryService()
         scope = Scope(workspace_id="graph-select", user_id="u", agent_id="a", session_id="s")
-        base = datetime(2026, 6, 18, 10, 0, tzinfo=timezone.utc)
-        memory.add("I first set up the budget tracker schema.", scope, base, {"source_uri": "m1"})
-        memory.add("Then I implemented transaction CRUD validation.", scope, base + timedelta(minutes=5), {"source_uri": "m2"})
-        memory.add("Unrelated: I changed my lunch plan.", scope, base + timedelta(minutes=10), {"source_uri": "m3"})
+        created_at = datetime(2026, 6, 18, 10, 0, tzinfo=timezone.utc)
+        budget_topic = ChronologyTopic(
+            topic_id="topic-budget",
+            scope=scope,
+            canonical_label="budget tracker",
+            aliases=["budget tracker work"],
+            language="en",
+            taxonomy_tags=[],
+            source_span_ids=[],
+            confidence=0.95,
+            created_at=created_at,
+        )
+        lunch_topic = ChronologyTopic(
+            topic_id="topic-lunch",
+            scope=scope,
+            canonical_label="lunch plans",
+            aliases=[],
+            language="en",
+            taxonomy_tags=[],
+            source_span_ids=[],
+            confidence=0.5,
+            created_at=created_at,
+        )
+        for topic in (budget_topic, lunch_topic):
+            memory.store.upsert_chronology_topic(topic)
+            memory.store.upsert_chronology_phase(
+                ChronologyPhase(
+                    phase_id=f"phase-{topic.topic_id}",
+                    topic_id=topic.topic_id,
+                    phase_type="implementation",
+                    order_hint=10,
+                    source_span_ids=[],
+                    confidence=0.9,
+                    created_at=created_at,
+                )
+            )
+        for node_id, topic_id, text, timestamp, marker in (
+            ("node-budget-1", "topic-budget", "I first set up the budget tracker schema.", "2026-06-18T10:00:00+00:00", "first"),
+            ("node-budget-2", "topic-budget", "Then I implemented transaction CRUD validation.", "2026-06-18T10:05:00+00:00", "then"),
+            ("node-lunch", "topic-lunch", "Unrelated: I changed my lunch plan.", "2026-06-18T10:10:00+00:00", None),
+        ):
+            memory.store.upsert_chronology_event_node(
+                ChronologyEventNode(
+                    node_id=node_id,
+                    scope=scope,
+                    actor="user",
+                    action="implemented",
+                    object="budget tracker",
+                    topic_id=topic_id,
+                    phase_id=f"phase-{topic_id}",
+                    timestamp=ts(timestamp),
+                    source_span_id=None,
+                    source_turn_id=None,
+                    text=text,
+                    language="en",
+                    confidence=0.9,
+                    explicit_order_marker=marker,
+                    created_at=created_at,
+                )
+            )
 
         candidates, telemetry = select_persisted_graph_event_ordering_candidates(
             "List the budget tracker work in order.",
@@ -113,6 +169,81 @@ class ChronologySelectorTests(unittest.TestCase):
 
         self.assertEqual(telemetry["selected_driver"], "persisted_graph")
         self.assertEqual({candidate.metadata["graph_topic_id"] for candidate in candidates}, {"topic-budget"})
+        self.assertTrue(all("lunch" not in candidate.text.lower() for candidate in candidates))
+
+    def test_single_topic_anchor_does_not_chain_complete_from_other_topic(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="graph-select-single-anchor", user_id="u", agent_id="a", session_id="s")
+        created_at = ts("2026-06-18T10:00:00+00:00")
+        budget_topic = ChronologyTopic(
+            topic_id="topic-budget",
+            scope=scope,
+            canonical_label="budget tracker",
+            aliases=["budget tracker work"],
+            language="en",
+            taxonomy_tags=[],
+            source_span_ids=[],
+            confidence=0.95,
+            created_at=created_at,
+        )
+        lunch_topic = ChronologyTopic(
+            topic_id="topic-lunch",
+            scope=scope,
+            canonical_label="lunch plans",
+            aliases=["meal break"],
+            language="en",
+            taxonomy_tags=[],
+            source_span_ids=[],
+            confidence=0.40,
+            created_at=created_at,
+        )
+        for topic in (budget_topic, lunch_topic):
+            memory.store.upsert_chronology_topic(topic)
+            memory.store.upsert_chronology_phase(
+                ChronologyPhase(
+                    phase_id=f"phase-{topic.topic_id}",
+                    topic_id=topic.topic_id,
+                    phase_type="implementation",
+                    order_hint=10,
+                    source_span_ids=[],
+                    confidence=0.9,
+                    created_at=created_at,
+                )
+            )
+        for node_id, topic_id, text, timestamp, marker in (
+            ("node-budget-1", "topic-budget", "I first set up the budget tracker schema.", "2026-06-18T10:00:00+00:00", "first"),
+            ("node-lunch", "topic-lunch", "Then I chose a budget-friendly lunch bowl.", "2026-06-18T10:10:00+00:00", "then"),
+        ):
+            memory.store.upsert_chronology_event_node(
+                ChronologyEventNode(
+                    node_id=node_id,
+                    scope=scope,
+                    actor="user",
+                    action="planned",
+                    object="budget",
+                    topic_id=topic_id,
+                    phase_id=f"phase-{topic_id}",
+                    timestamp=ts(timestamp),
+                    source_span_id=None,
+                    source_turn_id=None,
+                    text=text,
+                    language="en",
+                    confidence=0.9,
+                    explicit_order_marker=marker,
+                    created_at=created_at,
+                )
+            )
+
+        candidates, telemetry = select_persisted_graph_event_ordering_candidates(
+            "List the budget tracker work in order.",
+            scope,
+            memory.store,
+            limit=5,
+            include_session=True,
+        )
+
+        self.assertEqual(telemetry["selected_driver"], "persisted_graph")
+        self.assertEqual([candidate.metadata["graph_topic_id"] for candidate in candidates], ["topic-budget"])
         self.assertTrue(all("lunch" not in candidate.text.lower() for candidate in candidates))
 
     def test_service_uses_query_time_graph_selector_when_persisted_graph_is_unavailable(self) -> None:
