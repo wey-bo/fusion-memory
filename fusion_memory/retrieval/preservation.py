@@ -63,6 +63,9 @@ def preserve_required_candidates(
                 "must_preserve_reasons": must_preserve_reasons(candidate),
                 "evidence_role": candidate.metadata.get(_EVIDENCE_ROLE_KEY, "answer"),
                 "source": candidate.source,
+                "occupying_candidate_ids": [selected_candidate.id for selected_candidate in preserved],
+                "occupying_candidate_sources": [selected_candidate.source for selected_candidate in preserved],
+                "replaced_by": [selected_candidate.id for selected_candidate in preserved],
             }
         )
     return preserved, dropped

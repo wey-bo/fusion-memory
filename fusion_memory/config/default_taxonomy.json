@@ -1,4 +1,5 @@
 [
+  {"label": "budget tracker", "aliases": ["budget tracker", "budget app"], "tags": ["software"], "language": "en"},
   {"label": "flask", "aliases": ["Flask", "Flask app"], "tags": ["framework"], "language": "en"},
   {"label": "render", "aliases": ["Render", "Render.com"], "tags": ["deployment"], "language": "en"},
   {"label": "crud", "aliases": ["CRUD", "create read update delete"], "tags": ["software"], "language": "en"},

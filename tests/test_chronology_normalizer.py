@@ -96,6 +96,9 @@ class ChronologyNormalizerTests(unittest.TestCase):
         self.assertTrue(
             any(edge.edge_type == "before" and edge.evidence_type == "explicit_marker" for edge in batch.edges)
         )
+        budget_topic = next(topic for topic in batch.topics if topic.canonical_label == "budget tracker")
+        self.assertIn("budget app", budget_topic.aliases)
+        self.assertIn("software", budget_topic.taxonomy_tags)
 
     def test_chinese_order_markers_are_supported_without_llm(self) -> None:
         scope = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s")
@@ -142,6 +145,43 @@ class ChronologyNormalizerTests(unittest.TestCase):
         self.assertEqual(batch.nodes[0].explicit_order_marker, "first")
         self.assertEqual(batch.nodes[1].explicit_order_marker, "then")
         self.assertTrue(batch.edges)
+        memory_topic = next(topic for topic in batch.topics if topic.canonical_label == "memory system")
+        self.assertIn("记忆系统", memory_topic.aliases)
+        self.assertIn("memory", memory_topic.taxonomy_tags)
+
+    def test_taxonomy_alias_match_persists_aliases_and_tags_for_non_hardcoded_topic_labels(self) -> None:
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s")
+        base = datetime(2026, 6, 18, 10, 0, tzinfo=timezone.utc)
+        spans = [
+            EvidenceSpan(
+                span_id="s1",
+                scope=scope,
+                turn_id="t1",
+                speaker="user",
+                span_type="turn",
+                content="I first set up the budget app schema.",
+                content_hash=stable_hash("s1-budget-app"),
+                timestamp=base,
+            ),
+        ]
+        events = [
+            MemoryEvent(
+                event_id="e1",
+                scope=scope,
+                event_type="user_action",
+                description=spans[0].content,
+                participants=["user"],
+                source_span_ids=["s1"],
+                time_start=base,
+                confidence=0.8,
+            ),
+        ]
+
+        batch = build_chronology_write_batch(scope, spans, events)
+
+        self.assertEqual([topic.canonical_label for topic in batch.topics], ["budget tracker"])
+        self.assertIn("budget app", batch.topics[0].aliases)
+        self.assertIn("software", batch.topics[0].taxonomy_tags)
 
     def test_timestamp_only_unknown_phase_adjacency_is_suppressed(self) -> None:
         scope = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s")

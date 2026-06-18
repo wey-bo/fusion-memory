@@ -81,6 +81,9 @@ class RetrievalPreservationTests(unittest.TestCase):
         self.assertEqual([candidate.id for candidate in preserved], ["top"])
         self.assertEqual(dropped[0]["candidate_id"], "graph")
         self.assertEqual(dropped[0]["reason"], "budget_limit")
+        self.assertEqual(dropped[0]["occupying_candidate_ids"], ["top"])
+        self.assertEqual(dropped[0]["occupying_candidate_sources"], ["l0_raw_hybrid"])
+        self.assertEqual(dropped[0]["replaced_by"], ["top"])
 
     def test_evidence_pack_preserves_dropped_high_signal_telemetry(self) -> None:
         scope = Scope(workspace_id="ws")

@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from fusion_memory.core.chronology import ChronologyEventEdge, ChronologyEventNode, ChronologyPhase, ChronologyTopic
 from fusion_memory.core.models import EvidenceSpan, MemoryEvent, Scope
 from fusion_memory.core.text import compact_summary, stable_hash, tokenize
+from fusion_memory.retrieval.taxonomy import TaxonomyEntry, taxonomy_entry_for_text
 
 
 @dataclass
@@ -76,11 +77,12 @@ def build_chronology_write_batch(
         span = _first_source_span(event, span_by_id)
         text = span.content if span is not None else event.description
         language = _infer_language(text)
-        topic_label, topic_is_strong = _infer_topic_label(text)
+        topic_label, topic_is_strong, taxonomy_entry = _infer_topic_label(text)
         if not topic_is_strong and last_topic_label is not None and _infer_order_marker(text) is not None:
             topic_label = last_topic_label
+            taxonomy_entry = None
         last_topic_label = topic_label
-        topic = _get_topic(scope, topics_by_label, topic_label, language, event, span, created_at)
+        topic = _get_topic(scope, topics_by_label, topic_label, language, event, span, created_at, taxonomy_entry)
         phase_type = _infer_phase_type(text)
         phase = _get_phase(phases_by_key, topic, phase_type, event, span, created_at)
         actor = event.participants[0] if event.participants else "unknown"
@@ -164,21 +166,18 @@ def _contains_phrase(lowered_text: str, phrase: str) -> bool:
     return re.search(rf"\b{re.escape(phrase)}\b", lowered_text) is not None
 
 
-def _infer_topic_label(text: str) -> tuple[str, bool]:
-    lowered = text.lower()
-    if "budget" in lowered and "tracker" in lowered:
-        return "budget tracker", True
-    if "memory" in lowered or "记忆系统" in lowered:
-        return "memory system", True
-
+def _infer_topic_label(text: str) -> tuple[str, bool, TaxonomyEntry | None]:
+    taxonomy_entry = taxonomy_entry_for_text(text)
+    if taxonomy_entry is not None:
+        return taxonomy_entry.label, _taxonomy_match_is_strong(taxonomy_entry), taxonomy_entry
     meaningful_tokens = [
         token
         for token in tokenize(text)
         if token not in STOPWORDS and len(token) > 1 and not re.search(r"[\u4e00-\u9fff]", token)
     ]
     if meaningful_tokens:
-        return " ".join(meaningful_tokens[:4]), False
-    return compact_summary(text, limit=40).lower() or "unknown", False
+        return " ".join(meaningful_tokens[:4]), False, None
+    return compact_summary(text, limit=40).lower() or "unknown", False, None
 
 
 def _get_topic(
@@ -189,27 +188,51 @@ def _get_topic(
     event: MemoryEvent,
     span: EvidenceSpan | None,
     created_at: datetime,
+    taxonomy_entry: TaxonomyEntry | None,
 ) -> ChronologyTopic:
     topic = topics_by_label.get(topic_label)
     if topic is not None:
         if span is not None and span.span_id not in topic.source_span_ids:
             topic.source_span_ids.append(span.span_id)
+        if taxonomy_entry is not None:
+            _merge_topic_taxonomy(topic, taxonomy_entry)
         return topic
 
     source_span_ids = [span.span_id] if span is not None else list(event.source_span_ids)
+    aliases = list(dict.fromkeys(taxonomy_entry.aliases)) if taxonomy_entry is not None else []
+    taxonomy_tags = list(dict.fromkeys(taxonomy_entry.tags)) if taxonomy_entry is not None else []
+    topic_language = taxonomy_entry.language if taxonomy_entry is not None and taxonomy_entry.language != "unknown" else language
     topic = ChronologyTopic(
         topic_id=_id("chron_topic", scope, topic_label),
         scope=scope,
         canonical_label=topic_label,
-        aliases=[],
-        language=language,
-        taxonomy_tags=[],
+        aliases=aliases,
+        language=topic_language,
+        taxonomy_tags=taxonomy_tags,
         source_span_ids=source_span_ids,
         confidence=event.confidence,
         created_at=created_at,
     )
     topics_by_label[topic_label] = topic
     return topic
+
+
+def _merge_topic_taxonomy(topic: ChronologyTopic, taxonomy_entry: TaxonomyEntry) -> None:
+    for alias in taxonomy_entry.aliases:
+        if alias not in topic.aliases:
+            topic.aliases.append(alias)
+    for tag in taxonomy_entry.tags:
+        if tag not in topic.taxonomy_tags:
+            topic.taxonomy_tags.append(tag)
+    if topic.language == "unknown" and taxonomy_entry.language != "unknown":
+        topic.language = taxonomy_entry.language
+
+
+def _taxonomy_match_is_strong(entry: TaxonomyEntry) -> bool:
+    label = entry.label.strip()
+    if re.search(r"[\u4e00-\u9fff]", label):
+        return True
+    return len(label.split()) >= 2
 
 
 def _get_phase(

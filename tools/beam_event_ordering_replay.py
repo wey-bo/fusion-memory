@@ -87,6 +87,7 @@ def run_replay(args: argparse.Namespace) -> dict[str, Any]:
                         "query_id": query.id,
                         "query": query.query,
                         "reference": reference,
+                        "coverage": hybrid_coverage,
                         "paths": {
                             "graph": {
                                 "items": graph_items,
@@ -258,9 +259,10 @@ def _sequence_item_text(item: Any) -> str:
 
 
 def _aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
+    diagnostics_records = [record if "graph_fallback" in record else _with_record_diagnostics(dict(record)) for record in records]
     out: dict[str, Any] = {}
     for path in ("graph", "legacy", "hybrid"):
-        metrics = [record["paths"][path]["metrics"] for record in records]
+        metrics = [record["paths"][path]["metrics"] for record in diagnostics_records]
         out[path] = {
             "precision": _mean(metrics, "precision"),
             "recall": _mean(metrics, "recall"),
@@ -274,7 +276,18 @@ def _aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
     gate = evaluate_gate(out)
     out["graph_vs_legacy_passed"] = gate["passed"]
     out["gate_failures"] = gate["failures"]
-    out["path_wins"] = _path_wins(records)
+    out["path_wins"] = _path_wins(diagnostics_records)
+    out["graph_fallback_rate"] = (
+        sum(1 for record in diagnostics_records if record.get("graph_fallback")) / len(diagnostics_records)
+        if diagnostics_records
+        else 0.0
+    )
+    out["dropped_high_signal_candidate_count"] = sum(
+        int(record.get("dropped_high_signal_candidate_count") or 0) for record in diagnostics_records
+    )
+    out["over_abstract_label_count"] = sum(
+        int(record.get("over_abstract_label_count") or 0) for record in diagnostics_records
+    )
     return out
 
 
@@ -317,20 +330,30 @@ def _with_record_diagnostics(record: dict[str, Any]) -> dict[str, Any]:
 
 def _record_diagnostics(record: dict[str, Any]) -> dict[str, Any]:
     graph = record.get("paths", {}).get("graph", {})
+    coverage = record.get("coverage", {}) if isinstance(record.get("coverage"), dict) else {}
+    shadow = coverage.get("event_ordering_shadow", {}) if isinstance(coverage.get("event_ordering_shadow"), dict) else {}
     items = [str(item) for item in graph.get("items", []) if str(item).strip()]
     normalized_items = [_normalized_loose(item) for item in items]
     reference_tokens: set[str] = set()
     for item in record.get("reference", []):
         reference_tokens.update(_diagnostic_tokens(str(item)))
+    over_abstract_label_count = sum(1 for item in items if _is_over_abstract_label(item))
     topic_drift_count = sum(
         1
         for item in items
-        if reference_tokens and not reference_tokens.intersection(_diagnostic_tokens(item))
+        if not _is_over_abstract_label(item)
+        and reference_tokens
+        and not reference_tokens.intersection(_diagnostic_tokens(item))
     )
     return {
         "topic_drift_count": topic_drift_count,
         "duplicate_label_count": len(normalized_items) - len(set(normalized_items)),
         "graph_empty": int(graph.get("metrics", {}).get("system_count") or 0) == 0,
+        "graph_fallback": bool(shadow) and str(shadow.get("selected_driver") or "none") != "graph",
+        "dropped_high_signal_candidate_count": len(coverage.get("dropped_high_signal_candidates", []))
+        if isinstance(coverage.get("dropped_high_signal_candidates"), list)
+        else 0,
+        "over_abstract_label_count": over_abstract_label_count,
     }
 
 
@@ -349,6 +372,7 @@ def _compact_coverage(coverage: dict[str, Any]) -> dict[str, Any]:
         "event_ordering_graph",
         "event_ordering_shadow",
         "coverage_insufficient",
+        "dropped_high_signal_candidates",
     ]
     return {key: coverage.get(key) for key in keys if key in coverage}
 
@@ -371,6 +395,26 @@ def _split_csv(value: str | None) -> list[str]:
 
 def _normalized_loose(value: str) -> str:
     return " ".join(re.findall(r"[a-zA-Z0-9]+", value.lower()))
+
+
+def _is_over_abstract_label(value: str) -> bool:
+    tokens = _diagnostic_tokens(value)
+    if not tokens:
+        return False
+    abstract_tokens = {
+        "implementation",
+        "summary",
+        "phase",
+        "work",
+        "progress",
+        "project",
+        "timeline",
+        "milestone",
+        "event",
+        "step",
+        "update",
+    }
+    return tokens.issubset(abstract_tokens)
 
 
 if __name__ == "__main__":

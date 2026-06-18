@@ -50,15 +50,23 @@ class BeamEventOrderingGateTests(unittest.TestCase):
     def test_aggregate_reports_gate_fields_and_path_wins(self) -> None:
         records = [
             {
+                "coverage": {
+                    "event_ordering_shadow": {"selected_driver": "graph"},
+                    "dropped_high_signal_candidates": [{"candidate_id": "g1"}],
+                },
                 "paths": {
-                    "graph": {"metrics": {"precision": 1.0, "recall": 1.0, "f1": 0.8, "kendall_tau": 0.4, "kendall_tau_norm": 0.7, "system_count": 2, "matched": 2}},
+                    "graph": {"items": ["Implementation summary", "Schema setup"], "metrics": {"precision": 1.0, "recall": 1.0, "f1": 0.8, "kendall_tau": 0.4, "kendall_tau_norm": 0.7, "system_count": 2, "matched": 2}},
                     "legacy": {"metrics": {"precision": 0.5, "recall": 0.5, "f1": 0.5, "kendall_tau": 0.0, "kendall_tau_norm": 0.5, "system_count": 2, "matched": 1}},
                     "hybrid": {"metrics": {"precision": 0.6, "recall": 0.6, "f1": 0.6, "kendall_tau": 0.2, "kendall_tau_norm": 0.6, "system_count": 2, "matched": 1}},
                 },
             },
             {
+                "coverage": {
+                    "event_ordering_shadow": {"selected_driver": "legacy_fallback"},
+                    "dropped_high_signal_candidates": [{"candidate_id": "g2"}, {"candidate_id": "g3"}],
+                },
                 "paths": {
-                    "graph": {"metrics": {"precision": 0.4, "recall": 0.4, "f1": 0.4, "kendall_tau": -0.2, "kendall_tau_norm": 0.4, "system_count": 1, "matched": 1}},
+                    "graph": {"items": ["Implementation summary"], "metrics": {"precision": 0.4, "recall": 0.4, "f1": 0.4, "kendall_tau": -0.2, "kendall_tau_norm": 0.4, "system_count": 1, "matched": 1}},
                     "legacy": {"metrics": {"precision": 0.8, "recall": 0.8, "f1": 0.8, "kendall_tau": 0.6, "kendall_tau_norm": 0.8, "system_count": 1, "matched": 1}},
                     "hybrid": {"metrics": {"precision": 0.7, "recall": 0.7, "f1": 0.7, "kendall_tau": 0.4, "kendall_tau_norm": 0.7, "system_count": 1, "matched": 1}},
                 },
@@ -71,13 +79,20 @@ class BeamEventOrderingGateTests(unittest.TestCase):
         self.assertIn("graph_f1_below_legacy", summary["gate_failures"])
         self.assertEqual(summary["path_wins"]["f1"], {"graph": 1, "legacy": 1, "hybrid": 0})
         self.assertEqual(summary["path_wins"]["kendall_tau_norm"], {"graph": 1, "legacy": 1, "hybrid": 0})
+        self.assertAlmostEqual(summary["graph_fallback_rate"], 0.5)
+        self.assertEqual(summary["dropped_high_signal_candidate_count"], 3)
+        self.assertEqual(summary["over_abstract_label_count"], 2)
 
-    def test_record_diagnostics_reports_topic_drift_duplicate_labels_and_empty_graph(self) -> None:
+    def test_record_diagnostics_reports_topic_drift_duplicate_labels_empty_graph_and_new_counters(self) -> None:
         record = {
             "reference": ["Alpha build", "Beta launch"],
+            "coverage": {
+                "event_ordering_shadow": {"selected_driver": "legacy_fallback"},
+                "dropped_high_signal_candidates": [{"candidate_id": "g1"}, {"candidate_id": "g2"}],
+            },
             "paths": {
                 "graph": {
-                    "items": ["Alpha build", "Alpha build", "Unrelated billing note"],
+                    "items": ["Alpha build", "Alpha build", "Implementation summary", "Unrelated billing note"],
                     "metrics": {"system_count": 3},
                 },
             },
@@ -88,6 +103,9 @@ class BeamEventOrderingGateTests(unittest.TestCase):
         self.assertEqual(diagnostics["topic_drift_count"], 1)
         self.assertEqual(diagnostics["duplicate_label_count"], 1)
         self.assertFalse(diagnostics["graph_empty"])
+        self.assertTrue(diagnostics["graph_fallback"])
+        self.assertEqual(diagnostics["dropped_high_signal_candidate_count"], 2)
+        self.assertEqual(diagnostics["over_abstract_label_count"], 1)
 
     def test_graph_items_only_count_persisted_graph_candidates(self) -> None:
         service = SimpleNamespace(

@@ -14,30 +14,79 @@ def select_persisted_graph_event_ordering_candidates(
     *,
     include_session: bool = False,
 ) -> tuple[list[Candidate], dict[str, object]]:
-    topics = store.list_chronology_topics(scope, include_session=include_session)
-    scored_topics = [
-        (keyword_score(query, topic.canonical_label + " " + " ".join(topic.aliases)), topic)
-        for topic in topics
-    ]
-    scored_topics = [(score, topic) for score, topic in scored_topics if score > 0]
-    scored_topics.sort(key=lambda item: (-item[0], item[1].canonical_label))
-    topic_ids = [topic.topic_id for _score, topic in scored_topics[:3]]
-    if not topic_ids:
-        return [], {"selected_driver": "none", "fallback_reason": "no_topic"}
-    phases = {phase.phase_id: phase for phase in store.list_chronology_phases(topic_ids)}
-    nodes = store.list_chronology_event_nodes(scope, include_session=include_session, topic_ids=topic_ids)
-    nodes = _expand_relevant_nodes(query, scope, store, nodes, topic_ids=topic_ids, include_session=include_session)
-    if not nodes:
-        return [], {"selected_driver": "none", "fallback_reason": "no_nodes", "topic_ids": topic_ids}
-    node_ids = [node.node_id for node in nodes]
-    phase_ids = [node.phase_id for node in nodes if node.phase_id and node.phase_id not in phases]
-    if phase_ids:
-        phases.update({phase.phase_id: phase for phase in store.list_chronology_phases(list({node.topic_id for node in nodes if node.topic_id}))})
+    try:
+        topics = store.list_chronology_topics(scope, include_session=include_session)
+        scored_topics = [
+            (keyword_score(query, topic.canonical_label + " " + " ".join(topic.aliases)), topic)
+            for topic in topics
+        ]
+        scored_topics = [(score, topic) for score, topic in scored_topics if score > 0]
+        scored_topics.sort(key=lambda item: (-item[0], item[1].canonical_label))
+        topic_ids = [topic.topic_id for _score, topic in scored_topics[:3]]
+        if not topic_ids:
+            return [], {"selected_driver": "none", "fallback_reason": "no_topic"}
+        phases = {phase.phase_id: phase for phase in store.list_chronology_phases(topic_ids)}
+        nodes = store.list_chronology_event_nodes(scope, include_session=include_session, topic_ids=topic_ids)
+        nodes = _expand_relevant_nodes(query, scope, store, nodes, topic_ids=topic_ids, include_session=include_session)
+        if not nodes:
+            return [], {"selected_driver": "none", "fallback_reason": "no_nodes", "topic_ids": topic_ids}
+        node_ids = [node.node_id for node in nodes]
+        if any(node.phase_id and node.phase_id not in phases for node in nodes):
+            phases.update(
+                {
+                    phase.phase_id: phase
+                    for phase in store.list_chronology_phases(list({node.topic_id for node in nodes if node.topic_id}))
+                }
+            )
+        edges = list(store.list_chronology_event_edges(node_ids))
+    except Exception as exc:
+        if _is_missing_chronology_table_error(exc):
+            return [], {
+                "selected_driver": "none",
+                "fallback_reason": "graph_unavailable",
+                "error": type(exc).__name__,
+            }
+        raise
+
+    deduped_nodes = _dedupe_nodes(nodes)
+    if len(deduped_nodes) < 2:
+        return [], {
+            "selected_driver": "none",
+            "fallback_reason": "too_few_nodes",
+            "topic_ids": topic_ids,
+            "node_count": len(deduped_nodes),
+        }
+
     edge_count_by_node: dict[str, int] = {node_id: 0 for node_id in node_ids}
-    for edge in store.list_chronology_event_edges(node_ids):
+    usable_edges = []
+    for edge in edges:
+        if edge.from_node_id not in edge_count_by_node or edge.to_node_id not in edge_count_by_node:
+            continue
+        usable_edges.append(edge)
         edge_count_by_node[edge.from_node_id] = edge_count_by_node.get(edge.from_node_id, 0) + 1
         edge_count_by_node[edge.to_node_id] = edge_count_by_node.get(edge.to_node_id, 0) + 1
-    nodes.sort(
+    if not usable_edges:
+        return [], {
+            "selected_driver": "none",
+            "fallback_reason": "no_edges",
+            "topic_ids": topic_ids,
+            "node_count": len(deduped_nodes),
+        }
+
+    source_span_ids = {node.source_span_id for node in deduped_nodes if node.source_span_id}
+    for edge in usable_edges:
+        source_span_ids.update(span_id for span_id in edge.source_span_ids if span_id)
+    if len(source_span_ids) < 2:
+        return [], {
+            "selected_driver": "none",
+            "fallback_reason": "weak_coverage",
+            "topic_ids": topic_ids,
+            "node_count": len(deduped_nodes),
+            "edge_count": len(usable_edges),
+            "source_span_count": len(source_span_ids),
+        }
+
+    deduped_nodes.sort(
         key=lambda node: (
             node.timestamp is None,
             node.timestamp.isoformat() if node.timestamp else "",
@@ -46,7 +95,7 @@ def select_persisted_graph_event_ordering_candidates(
         )
     )
     candidates: list[Candidate] = []
-    for index, node in enumerate(_dedupe_nodes(nodes), start=1):
+    for index, node in enumerate(deduped_nodes, start=1):
         edge_count = edge_count_by_node.get(node.node_id, 0)
         score = 0.55 + keyword_score(query, f"{node.text} {node.action} {node.object}") + min(0.2, edge_count * 0.05)
         candidates.append(
@@ -74,7 +123,9 @@ def select_persisted_graph_event_ordering_candidates(
     return candidates[:limit], {
         "selected_driver": "persisted_graph",
         "topic_ids": topic_ids,
-        "node_count": len(nodes),
+        "node_count": len(deduped_nodes),
+        "edge_count": len(usable_edges),
+        "source_span_count": len(source_span_ids),
         "candidate_count": min(len(candidates), limit),
     }
 
@@ -180,3 +231,18 @@ def _candidate_text(node: Any, phase: Any | None = None) -> str:
         prefix = f"{phase_type}: " if phase_type and phase_type != "unknown" else ""
         return f"{prefix}{action} {obj}"
     return text
+
+
+def _is_missing_chronology_table_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    if "chronology_" not in message:
+        return False
+    return any(
+        token in message
+        for token in (
+            "does not exist",
+            "undefinedtable",
+            "no such table",
+            "missing table",
+        )
+    )

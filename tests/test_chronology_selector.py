@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from unittest.mock import patch
 
 from fusion_memory import MemoryService
-from fusion_memory.core.chronology import ChronologyEventNode, ChronologyPhase, ChronologyTopic
+from fusion_memory.core.chronology import ChronologyEventEdge, ChronologyEventNode, ChronologyPhase, ChronologyTopic
 from fusion_memory.core.models import Candidate
 from fusion_memory.core.models import Scope
 from fusion_memory.retrieval.chronology_selector import select_persisted_graph_event_ordering_candidates
@@ -71,8 +71,8 @@ class ChronologySelectorTests(unittest.TestCase):
                     topic_id=topic_id,
                     phase_id=f"phase-{topic_id}",
                     timestamp=ts(timestamp),
-                    source_span_id=None,
-                    source_turn_id=None,
+                    source_span_id=f"span-{node_id}",
+                    source_turn_id=f"turn-{node_id}",
                     text=text,
                     language="en",
                     confidence=0.9,
@@ -80,6 +80,18 @@ class ChronologySelectorTests(unittest.TestCase):
                     created_at=created_at,
                 )
             )
+        memory.store.insert_chronology_event_edge(
+            ChronologyEventEdge(
+                edge_id="edge-budget",
+                from_node_id="node-budget-1",
+                to_node_id="node-budget-2",
+                edge_type="before",
+                evidence_type="explicit_marker",
+                source_span_ids=["span-node-budget-1", "span-node-budget-2"],
+                confidence=0.9,
+                created_at=created_at,
+            )
+        )
 
         candidates, telemetry = select_persisted_graph_event_ordering_candidates(
             "List the budget tracker work in order.",
@@ -150,8 +162,8 @@ class ChronologySelectorTests(unittest.TestCase):
                     topic_id=topic_id,
                     phase_id=f"phase-{topic_id}",
                     timestamp=ts(timestamp),
-                    source_span_id=None,
-                    source_turn_id=None,
+                    source_span_id=f"span-{node_id}",
+                    source_turn_id=f"turn-{node_id}",
                     text=text,
                     language="en",
                     confidence=0.9,
@@ -159,6 +171,18 @@ class ChronologySelectorTests(unittest.TestCase):
                     created_at=created_at,
                 )
             )
+        memory.store.insert_chronology_event_edge(
+            ChronologyEventEdge(
+                edge_id="edge-budget",
+                from_node_id="node-budget-1",
+                to_node_id="node-budget-2",
+                edge_type="before",
+                evidence_type="explicit_marker",
+                source_span_ids=["span-node-budget-1", "span-node-budget-2"],
+                confidence=0.9,
+                created_at=created_at,
+            )
+        )
 
         candidates, telemetry = select_persisted_graph_event_ordering_candidates(
             "List the budget tracker work in order.",
@@ -243,9 +267,8 @@ class ChronologySelectorTests(unittest.TestCase):
             include_session=True,
         )
 
-        self.assertEqual(telemetry["selected_driver"], "persisted_graph")
-        self.assertEqual([candidate.metadata["graph_topic_id"] for candidate in candidates], ["topic-budget"])
-        self.assertTrue(all("lunch" not in candidate.text.lower() for candidate in candidates))
+        self.assertEqual(candidates, [])
+        self.assertEqual(telemetry["fallback_reason"], "too_few_nodes")
 
     def test_service_uses_query_time_graph_selector_when_persisted_graph_is_unavailable(self) -> None:
         memory = MemoryService()
@@ -294,6 +317,242 @@ class ChronologySelectorTests(unittest.TestCase):
         self.assertTrue(all(candidate.source != "event_ordering_graph_selector" for candidate in candidates))
         self.assertTrue(any(candidate.source.startswith("event_ordering_coverage") for candidate in candidates))
         self.assertEqual(candidates[0].metadata["persisted_graph_telemetry"]["fallback_reason"], "no_topic")
+
+    def test_service_falls_back_when_chronology_tables_are_missing(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="graph-fallback-missing-tables", user_id="u", agent_id="a", session_id="s")
+        memory.add("I set up the schema first.", scope, ts("2026-06-18T10:00:00+00:00"))
+
+        class MissingChronologyStore:
+            def __init__(self, wrapped) -> None:
+                self.wrapped = wrapped
+
+            def __getattr__(self, name: str):
+                return getattr(self.wrapped, name)
+
+            def list_chronology_topics(self, *args, **kwargs):
+                raise RuntimeError('relation "chronology_topics" does not exist')
+
+        memory.store = MissingChronologyStore(memory.store)
+
+        def fake_graph_selector(query, spans, events, limit):
+            return [
+                Candidate(
+                    id="graph-candidate",
+                    type="event",
+                    text="query-time graph candidate",
+                    source="event_ordering_graph_selector",
+                    scores={"score": 1.0},
+                    source_span_ids=[],
+                    metadata={"timeline_index": 1},
+                )
+            ]
+
+        with patch("fusion_memory.api.service.select_graph_first_event_ordering_candidates", fake_graph_selector):
+            candidates = memory._event_ordering_graph_selector_candidates(
+                "List the schema work in order.",
+                scope,
+                limit=5,
+                include_session=True,
+            )
+
+        self.assertEqual(candidates[0].source, "event_ordering_graph_selector")
+        self.assertEqual(candidates[0].metadata["persisted_graph_telemetry"]["fallback_reason"], "graph_unavailable")
+        self.assertEqual(candidates[0].metadata["persisted_graph_telemetry"]["error"], "RuntimeError")
+
+    def test_selector_returns_no_candidates_for_single_sparse_node(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="graph-sparse-single-node", user_id="u", agent_id="a", session_id="s")
+        created_at = ts("2026-06-18T10:00:00+00:00")
+        topic = ChronologyTopic(
+            topic_id="topic-budget",
+            scope=scope,
+            canonical_label="budget tracker",
+            aliases=["budget app"],
+            language="en",
+            taxonomy_tags=["software"],
+            source_span_ids=["s1"],
+            confidence=0.95,
+            created_at=created_at,
+        )
+        memory.store.upsert_chronology_topic(topic)
+        memory.store.upsert_chronology_phase(
+            ChronologyPhase(
+                phase_id="phase-budget",
+                topic_id=topic.topic_id,
+                phase_type="setup",
+                order_hint=10,
+                source_span_ids=["s1"],
+                confidence=0.9,
+                created_at=created_at,
+            )
+        )
+        memory.store.upsert_chronology_event_node(
+            ChronologyEventNode(
+                node_id="node-budget-1",
+                scope=scope,
+                actor="user",
+                action="set up",
+                object="budget tracker",
+                topic_id=topic.topic_id,
+                phase_id="phase-budget",
+                timestamp=created_at,
+                source_span_id="s1",
+                source_turn_id="t1",
+                text="I first set up the budget tracker schema.",
+                language="en",
+                confidence=0.9,
+                explicit_order_marker="first",
+                created_at=created_at,
+            )
+        )
+
+        candidates, telemetry = select_persisted_graph_event_ordering_candidates(
+            "List the budget tracker work in order.",
+            scope,
+            memory.store,
+            limit=5,
+            include_session=True,
+        )
+
+        self.assertEqual(candidates, [])
+        self.assertEqual(telemetry["fallback_reason"], "too_few_nodes")
+
+    def test_selector_returns_no_candidates_when_graph_has_no_edges(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="graph-sparse-no-edges", user_id="u", agent_id="a", session_id="s")
+        created_at = ts("2026-06-18T10:00:00+00:00")
+        topic = ChronologyTopic(
+            topic_id="topic-budget",
+            scope=scope,
+            canonical_label="budget tracker",
+            aliases=["budget app"],
+            language="en",
+            taxonomy_tags=["software"],
+            source_span_ids=["s1", "s2"],
+            confidence=0.95,
+            created_at=created_at,
+        )
+        memory.store.upsert_chronology_topic(topic)
+        memory.store.upsert_chronology_phase(
+            ChronologyPhase(
+                phase_id="phase-budget",
+                topic_id=topic.topic_id,
+                phase_type="unknown",
+                order_hint=None,
+                source_span_ids=["s1", "s2"],
+                confidence=0.9,
+                created_at=created_at,
+            )
+        )
+        for node_id, span_id, text in (
+            ("node-budget-1", "s1", "Budget tracker category notes."),
+            ("node-budget-2", "s2", "Budget tracker report notes."),
+        ):
+            memory.store.upsert_chronology_event_node(
+                ChronologyEventNode(
+                    node_id=node_id,
+                    scope=scope,
+                    actor="user",
+                    action="noted",
+                    object="budget tracker",
+                    topic_id=topic.topic_id,
+                    phase_id="phase-budget",
+                    timestamp=None,
+                    source_span_id=span_id,
+                    source_turn_id=f"t-{span_id}",
+                    text=text,
+                    language="en",
+                    confidence=0.9,
+                    explicit_order_marker=None,
+                    created_at=created_at,
+                )
+            )
+
+        candidates, telemetry = select_persisted_graph_event_ordering_candidates(
+            "List the budget tracker work in order.",
+            scope,
+            memory.store,
+            limit=5,
+            include_session=True,
+        )
+
+        self.assertEqual(candidates, [])
+        self.assertEqual(telemetry["fallback_reason"], "no_edges")
+
+    def test_selector_returns_no_candidates_for_weak_source_span_coverage(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="graph-sparse-weak-coverage", user_id="u", agent_id="a", session_id="s")
+        created_at = ts("2026-06-18T10:00:00+00:00")
+        topic = ChronologyTopic(
+            topic_id="topic-budget",
+            scope=scope,
+            canonical_label="budget tracker",
+            aliases=["budget app"],
+            language="en",
+            taxonomy_tags=["software"],
+            source_span_ids=["s1"],
+            confidence=0.95,
+            created_at=created_at,
+        )
+        memory.store.upsert_chronology_topic(topic)
+        memory.store.upsert_chronology_phase(
+            ChronologyPhase(
+                phase_id="phase-budget",
+                topic_id=topic.topic_id,
+                phase_type="implementation",
+                order_hint=20,
+                source_span_ids=["s1"],
+                confidence=0.9,
+                created_at=created_at,
+            )
+        )
+        for node_id, marker, offset in (
+            ("node-budget-1", "first", 0),
+            ("node-budget-2", "then", 5),
+        ):
+            memory.store.upsert_chronology_event_node(
+                ChronologyEventNode(
+                    node_id=node_id,
+                    scope=scope,
+                    actor="user",
+                    action="implemented",
+                    object="budget tracker",
+                    topic_id=topic.topic_id,
+                    phase_id="phase-budget",
+                    timestamp=ts(f"2026-06-18T10:{offset:02d}:00+00:00"),
+                    source_span_id="s1",
+                    source_turn_id=f"t-{node_id}",
+                    text=f"{marker.title()} I updated the budget tracker.",
+                    language="en",
+                    confidence=0.9,
+                    explicit_order_marker=marker,
+                    created_at=created_at,
+                )
+            )
+        memory.store.insert_chronology_event_edge(
+            type("Edge", (), {
+                "edge_id": "edge-budget",
+                "from_node_id": "node-budget-1",
+                "to_node_id": "node-budget-2",
+                "edge_type": "before",
+                "evidence_type": "explicit_marker",
+                "source_span_ids": ["s1"],
+                "confidence": 0.9,
+                "created_at": created_at,
+            })()
+        )
+
+        candidates, telemetry = select_persisted_graph_event_ordering_candidates(
+            "List the budget tracker work in order.",
+            scope,
+            memory.store,
+            limit=5,
+            include_session=True,
+        )
+
+        self.assertEqual(candidates, [])
+        self.assertEqual(telemetry["fallback_reason"], "weak_coverage")
 
 
 class TaxonomyTests(unittest.TestCase):
