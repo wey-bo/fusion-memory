@@ -148,7 +148,7 @@ class BeamEventOrderingGateTests(unittest.TestCase):
                         source="event_ordering_persisted_graph",
                         text="persisted graph candidate",
                         metadata={
-                            "persisted_graph_telemetry": {"selected_driver": "graph"},
+                            "persisted_graph_telemetry": {"selected_driver": "persisted_graph"},
                         },
                     )
                 ]

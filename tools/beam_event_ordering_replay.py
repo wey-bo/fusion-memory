@@ -388,7 +388,7 @@ def _record_graph_fallback(record: dict[str, Any], graph: dict[str, Any], shadow
     if sources:
         return any(source != "event_ordering_persisted_graph" for source in sources)
     if shadow:
-        return str(shadow.get("selected_driver") or "none") != "graph"
+        return str(shadow.get("selected_driver") or "none") not in {"graph", "persisted_graph"}
     return False
 
 
@@ -402,7 +402,7 @@ def _graph_fallback(candidates: list[Candidate]) -> bool:
         telemetry = metadata.get("graph_selector_telemetry") or metadata.get("persisted_graph_telemetry")
         if isinstance(telemetry, dict):
             selected_driver = str(telemetry.get("selected_driver") or "none")
-            if selected_driver != "graph":
+            if selected_driver not in {"graph", "persisted_graph"}:
                 return True
     return False
 
