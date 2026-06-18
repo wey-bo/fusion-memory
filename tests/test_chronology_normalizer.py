@@ -9,6 +9,33 @@ from fusion_memory.core.text import stable_hash
 from fusion_memory.retrieval.chronology_normalizer import build_chronology_write_batch
 
 
+def _derived_written_chronology_graph(memory: MemoryService, result, scope: Scope) -> dict:
+    trace = memory.debug_trace(result.trace_id, scope)
+    assert trace is not None
+    for step in trace["steps"]:
+        if step.get("step") == "derived_written":
+            return step["chronology_graph"]
+    raise AssertionError("derived_written chronology_graph trace step not found")
+
+
+class FailingChronologyReadStore:
+    def __init__(self, wrapped) -> None:
+        self.wrapped = wrapped
+        self.fail_chronology_read = False
+
+    def __getattr__(self, name: str):
+        return getattr(self.wrapped, name)
+
+    def insert_event(self, event) -> None:
+        self.wrapped.insert_event(event)
+        self.fail_chronology_read = True
+
+    def list_events(self, *args, **kwargs):
+        if self.fail_chronology_read and kwargs.get("include_session") is True:
+            raise RuntimeError("chronology list failed")
+        return self.wrapped.list_events(*args, **kwargs)
+
+
 class ChronologyNormalizerTests(unittest.TestCase):
     def test_build_chronology_batch_extracts_action_object_phase_topic_and_order_edges(self) -> None:
         scope = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s")
@@ -207,3 +234,41 @@ class ChronologyServiceIntegrationTests(unittest.TestCase):
         nodes = memory.store.list_chronology_event_nodes(scope, include_session=True)
         self.assertGreaterEqual(len(nodes), 1)
         self.assertTrue(any(node.source_span_id in result.span_ids for node in nodes))
+
+    def test_add_trace_includes_chronology_graph_counts(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="graph-trace-success", user_id="u", agent_id="a", session_id="s")
+        result = memory.add(
+            "I first set up the graph schema. Then I implemented the selector.",
+            scope,
+            datetime(2026, 6, 18, 10, 0, tzinfo=timezone.utc),
+            {"source_uri": "test:graph-trace-success"},
+        )
+
+        chronology_graph = _derived_written_chronology_graph(memory, result, scope)
+
+        self.assertTrue(chronology_graph["enabled"])
+        self.assertGreaterEqual(chronology_graph["node_count"], 1)
+        self.assertGreaterEqual(chronology_graph["topic_count"], 1)
+        self.assertGreaterEqual(chronology_graph["phase_count"], 1)
+        self.assertIn("edge_count", chronology_graph)
+        self.assertNotIn("error", chronology_graph)
+
+    def test_add_trace_records_chronology_graph_error_non_fatally(self) -> None:
+        memory = MemoryService()
+        memory.store = FailingChronologyReadStore(memory.store)
+        scope = Scope(workspace_id="graph-trace-error", user_id="u", agent_id="a", session_id="s")
+
+        result = memory.add(
+            "I first set up the graph schema. Then I implemented the selector.",
+            scope,
+            datetime(2026, 6, 18, 10, 0, tzinfo=timezone.utc),
+            {"source_uri": "test:graph-trace-error"},
+        )
+
+        self.assertTrue(result.span_ids)
+        chronology_graph = _derived_written_chronology_graph(memory, result, scope)
+        self.assertTrue(chronology_graph["enabled"])
+        self.assertEqual(chronology_graph["error"], "RuntimeError")
+        self.assertEqual(chronology_graph["node_count"], 0)
+        self.assertEqual(chronology_graph["edge_count"], 0)

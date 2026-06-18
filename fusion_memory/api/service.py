@@ -1244,13 +1244,13 @@ class MemoryService:
         if not spans:
             return empty_counts
 
-        accepted_event_id_set = set(accepted_event_ids)
-        events = [
-            event
-            for event in self.store.list_events(scope, include_session=True)
-            if event.event_id in accepted_event_id_set
-        ]
         try:
+            accepted_event_id_set = set(accepted_event_ids)
+            events = [
+                event
+                for event in self.store.list_events(scope, include_session=True)
+                if event.event_id in accepted_event_id_set
+            ]
             batch = build_chronology_write_batch(scope, spans, events)
             for topic in batch.topics:
                 self.store.upsert_chronology_topic(topic)
