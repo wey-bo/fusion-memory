@@ -100,14 +100,15 @@ class RuleAuditTests(unittest.TestCase):
         self.assertEqual(taxonomy_row["recommendation"], "migrate_to_taxonomy")
 
         legacy_row = next(item for item in audit if item["rule_id"] == "event_ordering.legacy.tie_breaker")
-        self.assertEqual(legacy_row["recommendation"], "delete_candidate")
+        self.assertEqual(legacy_row["recommendation"], "legacy_shadow")
 
-    def test_build_rule_audit_marks_contributing_event_ordering_legacy_rules_as_legacy_shadow(self) -> None:
+    def test_build_rule_audit_marks_event_ordering_legacy_rules_as_legacy_shadow(self) -> None:
         records = [
             {
                 "query_id": "q1",
                 "rule_hits": [
                     {"rule_id": "event_ordering.legacy.tie_breaker", "contributed_candidate_id": "c9"},
+                    {"rule_id": "event_ordering.legacy.unused", "contributed_candidate_id": None},
                 ],
                 "paths": {"hybrid": {"sources": ["timeline"]}},
                 "coverage": {},
@@ -118,6 +119,8 @@ class RuleAuditTests(unittest.TestCase):
 
         legacy_row = next(item for item in audit if item["rule_id"] == "event_ordering.legacy.tie_breaker")
         self.assertEqual(legacy_row["recommendation"], "legacy_shadow")
+        unused_row = next(item for item in audit if item["rule_id"] == "event_ordering.legacy.unused")
+        self.assertEqual(unused_row["recommendation"], "legacy_shadow")
 
     def test_cli_writes_deterministic_json_and_csv_for_object_input(self) -> None:
         payload = {

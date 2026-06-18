@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from hashlib import sha1
+from typing import Iterator
 
 
 @dataclass(frozen=True)
@@ -25,7 +28,7 @@ class RuleHit:
 
 
 _RULE_REGISTRY: dict[str, RuleDefinition] = {}
-_RULE_HITS: list[RuleHit] = []
+_ACTIVE_RULE_HITS: ContextVar[list[RuleHit] | None] = ContextVar("fusion_memory_rule_hits", default=None)
 _SENSITIVE_METADATA_KEY_PARTS = (
     "raw_text",
     "text",
@@ -63,18 +66,49 @@ def record_rule_hit(
         stage=stage,
         metadata=_sanitize_metadata(metadata),
     )
-    _RULE_HITS.append(hit)
+    _current_hits().append(hit)
     return hit
 
 
 def drain_rule_hits() -> list[RuleHit]:
-    hits = list(_RULE_HITS)
-    _RULE_HITS.clear()
+    current = _current_hits()
+    hits = list(current)
+    current.clear()
     return hits
 
 
 def registered_rules() -> list[RuleDefinition]:
     return list(_RULE_REGISTRY.values())
+
+
+@contextmanager
+def collect_rule_hits() -> Iterator[RuleHitCollector]:
+    hits: list[RuleHit] = []
+    token = _ACTIVE_RULE_HITS.set(hits)
+    collector = RuleHitCollector(hits)
+    try:
+        yield collector
+    finally:
+        hits.clear()
+        _ACTIVE_RULE_HITS.reset(token)
+
+
+class RuleHitCollector:
+    def __init__(self, hits: list[RuleHit]) -> None:
+        self._hits = hits
+
+    def drain(self) -> list[RuleHit]:
+        hits = list(self._hits)
+        self._hits.clear()
+        return hits
+
+
+def _current_hits() -> list[RuleHit]:
+    active = _ACTIVE_RULE_HITS.get()
+    if active is None:
+        active = []
+        _ACTIVE_RULE_HITS.set(active)
+    return active
 
 
 def _sanitize_metadata(metadata: dict[str, object] | None) -> dict[str, object]:

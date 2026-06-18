@@ -9,6 +9,7 @@ from fusion_memory import MemoryService, Scope
 from fusion_memory.core.models import EvidencePack, QueryPlan, SearchResult
 from fusion_memory.retrieval.rule_registry import (
     RuleDefinition,
+    collect_rule_hits,
     drain_rule_hits,
     record_rule_hit,
     register_rule,
@@ -111,6 +112,45 @@ class RuleRegistryTests(unittest.TestCase):
         self.assertRegex(str(hit.metadata["raw_text"]), r"^[0-9a-f]{12}$")
         self.assertRegex(str(hit.metadata["span_message"]), r"^[0-9a-f]{12}$")
         self.assertNotIn("I initially used SQLite.", hit.text_hash)
+
+    def test_collect_rule_hits_isolates_and_clears_on_exception(self) -> None:
+        record_rule_hit(
+            rule_id="outer.rule",
+            query="outer",
+            text="outer text",
+            stage="setup",
+        )
+
+        with self.assertRaises(RuntimeError):
+            with collect_rule_hits() as collector:
+                record_rule_hit(
+                    rule_id="inner.rule",
+                    query="inner",
+                    text="inner text",
+                    stage="search",
+                )
+                self.assertEqual([hit.rule_id for hit in collector.drain()], ["inner.rule"])
+                record_rule_hit(
+                    rule_id="inner.leaked",
+                    query="inner",
+                    text="inner leaked text",
+                    stage="search",
+                )
+                raise RuntimeError("boom")
+
+        self.assertEqual([hit.rule_id for hit in drain_rule_hits()], ["outer.rule"])
+
+    def test_collect_rule_hits_nested_context_restores_parent_collector(self) -> None:
+        with collect_rule_hits() as outer:
+            record_rule_hit("outer.one", query="", text="outer one", stage="outer")
+            with collect_rule_hits() as inner:
+                record_rule_hit("inner.one", query="", text="inner one", stage="inner")
+                self.assertEqual([hit.rule_id for hit in inner.drain()], ["inner.one"])
+            record_rule_hit("outer.two", query="", text="outer two", stage="outer")
+
+            self.assertEqual([hit.rule_id for hit in outer.drain()], ["outer.one", "outer.two"])
+
+        self.assertEqual(drain_rule_hits(), [])
 
 
 class RuleInstrumentationTests(unittest.TestCase):

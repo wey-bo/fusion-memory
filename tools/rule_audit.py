@@ -55,12 +55,12 @@ def _dropped_candidate_ids(record: dict[str, object]) -> set[str]:
 
 
 def _recommendation_for_rule(rule_id: str, hit_count: int, contribution_count: int, categories: set[str]) -> str:
+    if rule_id.startswith("event_ordering.legacy"):
+        return "legacy_shadow"
     if hit_count == 0 or contribution_count == 0:
         return "delete_candidate"
     if ".domain_label" in rule_id or "taxonomy_candidate" in categories:
         return "migrate_to_taxonomy"
-    if rule_id.startswith("event_ordering.legacy"):
-        return "legacy_shadow"
     return "keep"
 
 
