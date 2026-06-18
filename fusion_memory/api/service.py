@@ -52,7 +52,7 @@ from fusion_memory.retrieval.aggregation_keys import (
 from fusion_memory.retrieval.mmr import mmr
 from fusion_memory.retrieval.query_planner import QueryPlanner
 from fusion_memory.retrieval.raw_evidence_quota import RawEvidenceQuota
-from fusion_memory.retrieval.preservation import preserve_required_candidates
+from fusion_memory.retrieval.preservation import annotate_runtime_preservation_candidates, preserve_required_candidates
 from fusion_memory.retrieval.reranker import LexicalCrossEncoderReranker, Reranker, rerank_candidates
 from fusion_memory.retrieval.rrf import reciprocal_rank_fusion
 from fusion_memory.retrieval.scoring import score_candidate
@@ -407,7 +407,9 @@ class MemoryService:
             selected = self._preserve_event_ordering_raw_facets(query, scored_again, selected, limit)
         selected = self._apply_topic_scope_filter(query, plan, scored_again, selected, limit)
         selected = self._preserve_broad_raw_recall(query, plan, scored_again, selected, limit)
-        selected, dropped_high_signal = preserve_required_candidates(scored_again, selected, limit)
+        selected = self._filter_stale_current_value_candidates(query, plan, selected)
+        annotated_candidates = annotate_runtime_preservation_candidates(scored_again)
+        selected, dropped_high_signal = preserve_required_candidates(annotated_candidates, selected, limit)
         for candidate in selected:
             self.store.insert_utility_example(utility_example(trace_id, query, plan, candidate))
         shadow_ranking = self.utility_scorer.rank_shadow(selected, plan) if self.utility_scorer.trained else []

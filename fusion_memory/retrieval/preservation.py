@@ -7,6 +7,21 @@ from fusion_memory.core.models import Candidate
 
 _MUST_PRESERVE_REASON_KEY = "must_preserve_reason"
 _EVIDENCE_ROLE_KEY = "evidence_role"
+_RUNTIME_PRESERVATION_RULES = {
+    "event_ordering_persisted_graph": "graph_chronology_anchor",
+    "l3_current_view": "current_value",
+}
+
+
+def annotate_runtime_preservation_candidates(candidates: list[Candidate]) -> list[Candidate]:
+    annotated: list[Candidate] = []
+    for candidate in candidates:
+        reason = _RUNTIME_PRESERVATION_RULES.get(candidate.source)
+        if reason is None:
+            annotated.append(candidate)
+            continue
+        annotated.append(mark_must_preserve(candidate, reason))
+    return annotated
 
 
 def mark_must_preserve(candidate: Candidate, reason: str, evidence_role: str = "answer") -> Candidate:
