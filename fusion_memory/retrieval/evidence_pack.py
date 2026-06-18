@@ -1274,6 +1274,15 @@ def _is_stale_historical_current_value_span(text: str) -> bool:
         lower,
     ):
         return False
+    if re.search(
+        r"(?:不是之前说的|不再是|改(?:成|为)|更新(?:为|成)|变(?:成|为)|切换(?:为|成))",
+        text,
+    ):
+        return False
+    if re.search(r"(?:从[^。！？\n]{0,40}(?:改(?:成|为)|更新(?:为|成)|变(?:成|为)|切换(?:为|成)))", text):
+        return False
+    if re.search(r"(?:\b(?:updated?|revised?|changed?|switched|migrat(?:e|ed|ing))\b.*\b(?:from|to)\b)", lower):
+        return False
     return bool(
         re.search(
             r"\b(?:initially|previously|formerly|originally|used to|before the switch|at first)\b",
