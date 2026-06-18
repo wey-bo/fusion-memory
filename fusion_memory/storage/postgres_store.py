@@ -6,6 +6,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from fusion_memory.core.chronology import (
+    ChronologyEventEdge,
+    ChronologyEventNode,
+    ChronologyPhase,
+    ChronologyTopic,
+)
 from fusion_memory.core.embedding import DeterministicEmbedder, Embedder
 from fusion_memory.core.models import (
     CurrentView,
@@ -38,6 +44,10 @@ POSTGRES_TABLES = [
     "debug_traces",
     "audit_events",
     "background_tasks",
+    "chronology_topics",
+    "chronology_phases",
+    "chronology_event_nodes",
+    "chronology_event_edges",
 ]
 
 
@@ -1433,6 +1443,187 @@ class PostgresMemoryStore:
     def get_event_edge(self, from_event_id: str, to_event_id: str) -> dict[str, Any] | None:
         return self.events.get_event_edge(from_event_id, to_event_id)
 
+    def upsert_chronology_topic(self, topic: ChronologyTopic) -> None:
+        values = {
+            **_scope_columns(topic.scope),
+            "topic_id": topic.topic_id,
+            "canonical_label": topic.canonical_label,
+            "aliases": _json_dumps(topic.aliases),
+            "language": topic.language,
+            "taxonomy_tags": _json_dumps(topic.taxonomy_tags),
+            "source_span_ids": _json_dumps(topic.source_span_ids),
+            "confidence": topic.confidence,
+            "created_at": _dt_to_pg(topic.created_at),
+        }
+        columns = ", ".join(values.keys())
+        placeholders = ", ".join(["%s"] * len(values))
+        updates = ", ".join(f"{key}=excluded.{key}" for key in values if key != "topic_id")
+        cursor = self.connect().cursor()
+        try:
+            cursor.execute(
+                f"insert into chronology_topics ({columns}) values ({placeholders}) "
+                f"on conflict(topic_id) do update set {updates}",
+                list(values.values()),
+            )
+            self.connect().commit()
+        except Exception:
+            self.connect().rollback()
+            raise
+        finally:
+            cursor.close()
+
+    def upsert_chronology_phase(self, phase: ChronologyPhase) -> None:
+        values = {
+            "phase_id": phase.phase_id,
+            "topic_id": phase.topic_id,
+            "phase_type": phase.phase_type,
+            "order_hint": phase.order_hint,
+            "source_span_ids": _json_dumps(phase.source_span_ids),
+            "confidence": phase.confidence,
+            "created_at": _dt_to_pg(phase.created_at),
+        }
+        columns = ", ".join(values.keys())
+        placeholders = ", ".join(["%s"] * len(values))
+        updates = ", ".join(f"{key}=excluded.{key}" for key in values if key != "phase_id")
+        cursor = self.connect().cursor()
+        try:
+            cursor.execute(
+                f"insert into chronology_phases ({columns}) values ({placeholders}) "
+                f"on conflict(phase_id) do update set {updates}",
+                list(values.values()),
+            )
+            self.connect().commit()
+        except Exception:
+            self.connect().rollback()
+            raise
+        finally:
+            cursor.close()
+
+    def upsert_chronology_event_node(self, node: ChronologyEventNode) -> None:
+        values = {
+            **_scope_columns(node.scope),
+            "node_id": node.node_id,
+            "actor": node.actor,
+            "action": node.action,
+            "object": node.object,
+            "topic_id": node.topic_id,
+            "phase_id": node.phase_id,
+            "timestamp": _dt_to_pg(node.timestamp),
+            "source_span_id": node.source_span_id,
+            "source_turn_id": node.source_turn_id,
+            "text": node.text,
+            "language": node.language,
+            "confidence": node.confidence,
+            "explicit_order_marker": node.explicit_order_marker,
+            "created_at": _dt_to_pg(node.created_at),
+        }
+        columns = ", ".join(values.keys())
+        placeholders = ", ".join(["%s"] * len(values))
+        updates = ", ".join(f"{key}=excluded.{key}" for key in values if key != "node_id")
+        cursor = self.connect().cursor()
+        try:
+            cursor.execute(
+                f"insert into chronology_event_nodes ({columns}) values ({placeholders}) "
+                f"on conflict(node_id) do update set {updates}",
+                list(values.values()),
+            )
+            self.connect().commit()
+        except Exception:
+            self.connect().rollback()
+            raise
+        finally:
+            cursor.close()
+
+    def insert_chronology_event_edge(self, edge: ChronologyEventEdge) -> bool:
+        cursor = self.connect().cursor()
+        try:
+            cursor.execute(
+                """
+                insert into chronology_event_edges
+                (edge_id, from_node_id, to_node_id, edge_type, evidence_type, source_span_ids, confidence, created_at)
+                values (%s, %s, %s, %s, %s, %s::jsonb, %s, %s)
+                on conflict (from_node_id, to_node_id, edge_type, evidence_type) do nothing
+                """,
+                (
+                    edge.edge_id,
+                    edge.from_node_id,
+                    edge.to_node_id,
+                    edge.edge_type,
+                    edge.evidence_type,
+                    _json_dumps(edge.source_span_ids),
+                    edge.confidence,
+                    _dt_to_pg(edge.created_at),
+                ),
+            )
+            inserted = cursor.rowcount > 0
+            self.connect().commit()
+            return inserted
+        except Exception:
+            self.connect().rollback()
+            raise
+        finally:
+            cursor.close()
+
+    def list_chronology_topics(self, scope: Scope, include_session: bool = False) -> list[ChronologyTopic]:
+        where, params = _scope_where(scope, include_session=include_session)
+        rows = self._fetch_chronology_rows(
+            f"select * from chronology_topics where {where} order by confidence desc, created_at, canonical_label",
+            params,
+        )
+        return [_row_to_chronology_topic(row) for row in rows]
+
+    def list_chronology_phases(self, topic_ids: list[str]) -> list[ChronologyPhase]:
+        if not topic_ids:
+            return []
+        placeholders = ", ".join(["%s"] * len(topic_ids))
+        rows = self._fetch_chronology_rows(
+            f"select * from chronology_phases where topic_id in ({placeholders}) order by order_hint, created_at, phase_id",
+            topic_ids,
+        )
+        return [_row_to_chronology_phase(row) for row in rows]
+
+    def list_chronology_event_nodes(
+        self,
+        scope: Scope,
+        include_session: bool = False,
+        topic_ids: list[str] | None = None,
+    ) -> list[ChronologyEventNode]:
+        where, params = _scope_where(scope, include_session=include_session)
+        if topic_ids is not None:
+            if not topic_ids:
+                return []
+            placeholders = ", ".join(["%s"] * len(topic_ids))
+            where += f" and topic_id in ({placeholders})"
+            params.extend(topic_ids)
+        rows = self._fetch_chronology_rows(
+            f"select * from chronology_event_nodes where {where} order by timestamp, created_at, node_id",
+            params,
+        )
+        return [_row_to_chronology_event_node(row) for row in rows]
+
+    def list_chronology_event_edges(self, node_ids: list[str]) -> list[ChronologyEventEdge]:
+        if not node_ids:
+            return []
+        placeholders = ", ".join(["%s"] * len(node_ids))
+        rows = self._fetch_chronology_rows(
+            f"""
+            select * from chronology_event_edges
+            where from_node_id in ({placeholders}) or to_node_id in ({placeholders})
+            order by created_at, edge_id
+            """,
+            [*node_ids, *node_ids],
+        )
+        return [_row_to_chronology_event_edge(row) for row in rows]
+
+    def _fetch_chronology_rows(self, sql: str, params: list[Any]) -> list[dict[str, Any]]:
+        cursor = self.connect().cursor()
+        try:
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
+            return [_row_as_dict(row, cursor.description) for row in rows]
+        finally:
+            cursor.close()
+
     def upsert_current_view(self, view: CurrentView) -> bool:
         return self.views_profiles.upsert_current_view(view)
 
@@ -1766,6 +1957,65 @@ def _row_to_event(row: dict[str, Any]) -> MemoryEvent:
         time_granularity=row.get("time_granularity") or "unknown",
         time_source=row.get("time_source") or "unknown",
         confidence=float(row.get("confidence") or 0.0),
+    )
+
+
+def _row_to_chronology_topic(row: dict[str, Any]) -> ChronologyTopic:
+    return ChronologyTopic(
+        topic_id=row["topic_id"],
+        scope=_row_scope(row),
+        canonical_label=row["canonical_label"],
+        aliases=_json_loads(row.get("aliases"), []),
+        language=row.get("language") or "unknown",
+        taxonomy_tags=_json_loads(row.get("taxonomy_tags"), []),
+        source_span_ids=_json_loads(row.get("source_span_ids"), []),
+        confidence=float(row["confidence"]),
+        created_at=_dt_from_pg(row.get("created_at")) or datetime.now(timezone.utc),
+    )
+
+
+def _row_to_chronology_phase(row: dict[str, Any]) -> ChronologyPhase:
+    return ChronologyPhase(
+        phase_id=row["phase_id"],
+        topic_id=row["topic_id"],
+        phase_type=row["phase_type"],
+        order_hint=row.get("order_hint"),
+        source_span_ids=_json_loads(row.get("source_span_ids"), []),
+        confidence=float(row["confidence"]),
+        created_at=_dt_from_pg(row.get("created_at")) or datetime.now(timezone.utc),
+    )
+
+
+def _row_to_chronology_event_node(row: dict[str, Any]) -> ChronologyEventNode:
+    return ChronologyEventNode(
+        node_id=row["node_id"],
+        scope=_row_scope(row),
+        actor=row["actor"],
+        action=row["action"],
+        object=row["object"],
+        topic_id=row.get("topic_id"),
+        phase_id=row.get("phase_id"),
+        timestamp=_dt_from_pg(row.get("timestamp")),
+        source_span_id=row.get("source_span_id"),
+        source_turn_id=row.get("source_turn_id"),
+        text=row["text"],
+        language=row.get("language") or "unknown",
+        confidence=float(row["confidence"]),
+        explicit_order_marker=row.get("explicit_order_marker"),
+        created_at=_dt_from_pg(row.get("created_at")) or datetime.now(timezone.utc),
+    )
+
+
+def _row_to_chronology_event_edge(row: dict[str, Any]) -> ChronologyEventEdge:
+    return ChronologyEventEdge(
+        edge_id=row["edge_id"],
+        from_node_id=row["from_node_id"],
+        to_node_id=row["to_node_id"],
+        edge_type=row["edge_type"],
+        evidence_type=row["evidence_type"],
+        source_span_ids=_json_loads(row.get("source_span_ids"), []),
+        confidence=float(row["confidence"]),
+        created_at=_dt_from_pg(row.get("created_at")) or datetime.now(timezone.utc),
     )
 
 

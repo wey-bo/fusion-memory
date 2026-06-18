@@ -291,3 +291,73 @@ create table if not exists background_tasks (
 create unique index if not exists background_tasks_dedupe_idx on background_tasks(dedupe_key) where dedupe_key is not null;
 create index if not exists background_tasks_status_idx on background_tasks(status, run_after, created_at);
 create index if not exists background_tasks_scope_idx on background_tasks(workspace_id, user_id, agent_id, run_id, session_id);
+
+create table if not exists chronology_topics (
+  topic_id text primary key,
+  workspace_id text,
+  user_id text,
+  agent_id text,
+  run_id text,
+  session_id text,
+  app_id text,
+  canonical_label text not null,
+  aliases jsonb not null default '[]',
+  language text not null default 'unknown',
+  taxonomy_tags jsonb not null default '[]',
+  source_span_ids jsonb not null default '[]',
+  confidence double precision not null,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists chronology_topics_scope_idx on chronology_topics(workspace_id, user_id, agent_id, run_id, session_id);
+
+create table if not exists chronology_phases (
+  phase_id text primary key,
+  topic_id text not null references chronology_topics(topic_id) on delete cascade,
+  phase_type text not null,
+  order_hint int,
+  source_span_ids jsonb not null default '[]',
+  confidence double precision not null,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists chronology_phases_topic_idx on chronology_phases(topic_id, order_hint);
+
+create table if not exists chronology_event_nodes (
+  node_id text primary key,
+  workspace_id text,
+  user_id text,
+  agent_id text,
+  run_id text,
+  session_id text,
+  app_id text,
+  actor text not null,
+  action text not null,
+  object text not null,
+  topic_id text references chronology_topics(topic_id) on delete set null,
+  phase_id text references chronology_phases(phase_id) on delete set null,
+  timestamp timestamptz,
+  source_span_id text,
+  source_turn_id text,
+  text text not null,
+  language text not null default 'unknown',
+  confidence double precision not null,
+  explicit_order_marker text,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists chronology_nodes_scope_idx on chronology_event_nodes(workspace_id, user_id, agent_id, run_id, session_id);
+create index if not exists chronology_nodes_topic_idx on chronology_event_nodes(topic_id, timestamp);
+
+create table if not exists chronology_event_edges (
+  edge_id text primary key,
+  from_node_id text not null references chronology_event_nodes(node_id) on delete cascade,
+  to_node_id text not null references chronology_event_nodes(node_id) on delete cascade,
+  edge_type text not null,
+  evidence_type text not null,
+  source_span_ids jsonb not null default '[]',
+  confidence double precision not null,
+  created_at timestamptz not null default now()
+);
+
+create unique index if not exists chronology_edges_unique_idx on chronology_event_edges(from_node_id, to_node_id, edge_type, evidence_type);
