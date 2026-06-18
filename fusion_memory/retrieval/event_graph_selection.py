@@ -51,8 +51,6 @@ SOFTWARE_ASPECT_TERMS = {
     "worker",
 }
 
-TAXONOMY_SALIENT_LABELS = {"crud", "flask", "postgresql", "render"}
-
 EVENT_ACTION_TERMS = {
     "add",
     "added",
@@ -411,7 +409,7 @@ def _event_group_query_fit(query_lower: str, group: str | None, description: str
     overlap = len(query_tokens.intersection(event_tokens.union(group_tokens))) / max(1, len(query_tokens))
     taxonomy_hits = taxonomy_alias_hits(description)
     salient_hits = sum(1 for token in event_tokens.union(group_tokens) if token in SOFTWARE_ASPECT_TERMS)
-    salient_hits += sum(1 for label in taxonomy_hits if label in TAXONOMY_SALIENT_LABELS)
+    salient_hits += len(taxonomy_hits)
     action_hits = sum(1 for token in event_tokens if token in EVENT_ACTION_TERMS)
     compound_bonus = 0.10 if len(group_tokens) >= 2 else 0.0
     return min(1.0, (0.55 * overlap) + (0.06 * min(salient_hits, 5)) + (0.04 * min(action_hits, 3)) + compound_bonus)
