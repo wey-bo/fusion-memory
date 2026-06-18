@@ -41,6 +41,7 @@ def select_persisted_graph_event_ordering_candidates(
         edges = list(store.list_chronology_event_edges(node_ids))
     except Exception as exc:
         if _is_missing_chronology_table_error(exc):
+            _rollback_after_missing_chronology_table(store)
             return [], {
                 "selected_driver": "none",
                 "fallback_reason": "graph_unavailable",
@@ -246,3 +247,16 @@ def _is_missing_chronology_table_error(exc: Exception) -> bool:
             "missing table",
         )
     )
+
+
+def _rollback_after_missing_chronology_table(store: Any) -> None:
+    connect = getattr(store, "connect", None)
+    if not callable(connect):
+        return
+    try:
+        conn = connect()
+        rollback = getattr(conn, "rollback", None)
+        if callable(rollback):
+            rollback()
+    except Exception:
+        return

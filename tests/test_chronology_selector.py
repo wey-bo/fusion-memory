@@ -326,14 +326,22 @@ class ChronologySelectorTests(unittest.TestCase):
         class MissingChronologyStore:
             def __init__(self, wrapped) -> None:
                 self.wrapped = wrapped
+                self.rollback_count = 0
 
             def __getattr__(self, name: str):
                 return getattr(self.wrapped, name)
 
+            def connect(self):
+                return self
+
+            def rollback(self):
+                self.rollback_count += 1
+
             def list_chronology_topics(self, *args, **kwargs):
                 raise RuntimeError('relation "chronology_topics" does not exist')
 
-        memory.store = MissingChronologyStore(memory.store)
+        missing_store = MissingChronologyStore(memory.store)
+        memory.store = missing_store
 
         def fake_graph_selector(query, spans, events, limit):
             return [
@@ -359,6 +367,7 @@ class ChronologySelectorTests(unittest.TestCase):
         self.assertEqual(candidates[0].source, "event_ordering_graph_selector")
         self.assertEqual(candidates[0].metadata["persisted_graph_telemetry"]["fallback_reason"], "graph_unavailable")
         self.assertEqual(candidates[0].metadata["persisted_graph_telemetry"]["error"], "RuntimeError")
+        self.assertEqual(missing_store.rollback_count, 1)
 
     def test_selector_returns_no_candidates_for_single_sparse_node(self) -> None:
         memory = MemoryService()
