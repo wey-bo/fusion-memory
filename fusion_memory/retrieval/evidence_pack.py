@@ -58,6 +58,8 @@ class EvidencePackBuilder:
         token_budget: int | None = None,
     ) -> EvidencePack:
         token_budget = token_budget or self.config.answer_context_budget_tokens
+        intent = getattr(plan, "intent", {}) or {}
+        skip_stale_current_value_history = _query_needs_current_value_resolution(query, intent)
         current_views: list[dict] = []
         profiles: list[dict] = []
         facts: list[dict] = []
@@ -96,6 +98,8 @@ class EvidencePackBuilder:
                     continue
                 span = self.store.get_span(span_id)
                 if not span:
+                    continue
+                if skip_stale_current_value_history and _is_stale_historical_current_value_span(span.content):
                     continue
                 selected_scope = selected_scope or span.scope
                 seen_spans.add(seen_key)
@@ -188,7 +192,6 @@ class EvidencePackBuilder:
             events.sort(key=self._event_timeline_sort_key)
             for index, event in enumerate(events, start=1):
                 event["timeline_index"] = index
-        intent = getattr(plan, "intent", {}) or {}
         needs_value_history = _plan_needs_value_history(plan.query_type, query, intent)
         needs_recency_order = plan.query_type == "knowledge_update" or (
             needs_value_history and _query_needs_current_value_resolution(query, intent)
@@ -340,6 +343,11 @@ class EvidencePackBuilder:
             "aggregation_keys",
             "aggregation_signal",
             "aggregation_focus",
+            "graph_node_id",
+            "graph_edge_count",
+            "graph_phase",
+            "graph_topic",
+            "graph_fallback",
         ):
             value = candidate.metadata.get(key)
             if value is not None:
@@ -358,6 +366,8 @@ class EvidencePackBuilder:
         mode = _pack_expansion_mode(query, plan.query_type)
         if not mode:
             return [], estimated_tokens
+        intent = getattr(plan, "intent", {}) or {}
+        skip_stale_current_value_history = mode in {"preference", "exact", "broad"} and _query_needs_current_value_resolution(query, intent)
         groups = {str(span.get("topic_group") or "") for span in current_spans if span.get("topic_group")}
         if not groups:
             return [], estimated_tokens
@@ -432,7 +442,15 @@ class EvidencePackBuilder:
                 or span.span_id in event_ordering_user_ids
             )
         ]
-        candidates = [span for span in scope_spans if span.span_id not in seen_spans]
+        candidates = [
+            span
+            for span in scope_spans
+            if span.span_id not in seen_spans
+            and not (
+                skip_stale_current_value_history
+                and _is_stale_historical_current_value_span(span.content)
+            )
+        ]
         if not candidates:
             return [], estimated_tokens
         scored: list[tuple[float, object]] = []
@@ -816,8 +834,10 @@ def _exact_answer_candidates(query: str, plan: QueryPlan, scope_spans: list[Any]
                     score += 0.12
             if _location_event_query(lower, content):
                 score += 0.52 if speaker == "user" else -0.08
+                if re.search(r"\b(?:i(?:'m| am)\s+planning|upcoming|weekend getaway|anniversary dinner)\b", content_lower):
+                    score += 0.22
                 if re.search(r"\bam\s+i\s+planning\b", lower) and re.search(r"\b[A-Z][a-z]{2,}\s+planned\b", content):
-                    score -= 0.36
+                    score -= 0.62
             if _historical_said_query(lower) and re.search(r"\b(?:new|now|current|currently|latest|updated|revised)\b", content_lower):
                 score -= 0.22
             if re.search(r"\b(?:how far|distance|town|where)\b", lower):
@@ -1244,6 +1264,25 @@ def _query_needs_current_value_resolution(query: str, intent: dict[str, Any]) ->
     return bool(re.search(r"\b(?:recent|current|currently|latest|now|updated|newest|final|finally|revised|rescheduled)\b", query.lower()))
 
 
+def _is_stale_historical_current_value_span(text: str) -> bool:
+    lower = text.lower()
+    if not lower.strip():
+        return False
+    if re.search(
+        r"\b(?:switched\b.*\bfrom\b.*\bto\b|switch(?:ed)?\b.*\bto\b|migrat(?:e|ed|ing)\b|"
+        r"changed\b.*\bto\b|no\s+longer|not\s+anymore|historical context|current(?:ly)?|now|latest|updated)\b",
+        lower,
+    ):
+        return False
+    return bool(
+        re.search(
+            r"\b(?:initially|previously|formerly|originally|used to|before the switch|at first)\b",
+            lower,
+        )
+        or re.search(r"(?:最初|以前|之前|原来|曾经)", text)
+    )
+
+
 def _historical_said_query(lower: str) -> bool:
     return bool(
         re.search(r"\b(?:did\s+i\s+say|what\s+did\s+i\s+say|i\s+said|i\s+mentioned|i\s+told\s+you)\b", lower)
@@ -1400,9 +1439,14 @@ def _topic_scope_score(query: str, text: str) -> float:
 
 
 def _topic_scope_tokens(text: str) -> set[str]:
-    raw = re.findall(r"[a-zA-Z][a-zA-Z0-9_+-]*|\d+(?:\.\d+)?", text.lower())
+    raw = re.findall(r"[a-zA-Z][a-zA-Z0-9_+-]*|\d+(?:\.\d+)?|[\u4e00-\u9fff]+", text.lower())
     tokens: set[str] = set()
     for token in raw:
+        if re.search(r"[\u4e00-\u9fff]", token):
+            tokens.add(token)
+            for size in (2, 3, 4):
+                tokens.update(token[index : index + size] for index in range(0, max(0, len(token) - size + 1)))
+            continue
         token = token.strip("_+-")
         if len(token) < 3 or token in TOPIC_SCOPE_STOPWORDS:
             continue
