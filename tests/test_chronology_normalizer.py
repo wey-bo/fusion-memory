@@ -114,3 +114,76 @@ class ChronologyNormalizerTests(unittest.TestCase):
         self.assertEqual(batch.nodes[0].explicit_order_marker, "first")
         self.assertEqual(batch.nodes[1].explicit_order_marker, "then")
         self.assertTrue(batch.edges)
+
+    def test_timestamp_only_unknown_phase_adjacency_is_suppressed(self) -> None:
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s")
+        base = datetime(2026, 6, 18, 10, 0, tzinfo=timezone.utc)
+        spans = [
+            EvidenceSpan(
+                span_id="s1",
+                scope=scope,
+                turn_id="t1",
+                speaker="user",
+                span_type="turn",
+                content="Budget tracker notes about categories.",
+                content_hash=stable_hash("s1"),
+                timestamp=base,
+            ),
+            EvidenceSpan(
+                span_id="s2",
+                scope=scope,
+                turn_id="t2",
+                speaker="user",
+                span_type="turn",
+                content="Budget tracker notes about reports.",
+                content_hash=stable_hash("s2"),
+                timestamp=base + timedelta(minutes=5),
+            ),
+        ]
+        events = [
+            MemoryEvent(
+                event_id="e1",
+                scope=scope,
+                event_type="user_action",
+                description=spans[0].content,
+                participants=["user"],
+                source_span_ids=["s1"],
+                time_start=base,
+                confidence=0.8,
+            ),
+            MemoryEvent(
+                event_id="e2",
+                scope=scope,
+                event_type="user_action",
+                description=spans[1].content,
+                participants=["user"],
+                source_span_ids=["s2"],
+                time_start=base + timedelta(minutes=5),
+                confidence=0.8,
+            ),
+        ]
+
+        batch = build_chronology_write_batch(scope, spans, events)
+
+        self.assertEqual([phase.phase_type for phase in batch.phases], ["unknown"])
+        self.assertEqual(batch.edges, [])
+
+    def test_timestamp_less_inputs_use_deterministic_created_at(self) -> None:
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s")
+        spans: list[EvidenceSpan] = []
+        events = [
+            MemoryEvent(
+                event_id="e1",
+                scope=scope,
+                event_type="user_action",
+                description="Budget tracker notes about categories.",
+                participants=["user"],
+                source_span_ids=[],
+                confidence=0.8,
+            ),
+        ]
+
+        first_batch = build_chronology_write_batch(scope, spans, events)
+        second_batch = build_chronology_write_batch(scope, spans, events)
+
+        self.assertEqual(first_batch.nodes[0].created_at, second_batch.nodes[0].created_at)

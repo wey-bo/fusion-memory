@@ -59,6 +59,8 @@ PHASE_ORDER_HINTS = {
     "unknown": None,
 }
 
+DETERMINISTIC_CREATED_AT_FALLBACK = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
 
 def build_chronology_write_batch(
     scope: Scope, spans: list[EvidenceSpan], events: list[MemoryEvent]
@@ -101,7 +103,10 @@ def build_chronology_write_batch(
         )
         nodes.append(node)
 
-    edges = _build_edges(nodes, created_at)
+    recognized_phase_ids = {
+        phase.phase_id for phase in phases_by_key.values() if phase.phase_type != "unknown"
+    }
+    edges = _build_edges(nodes, created_at, recognized_phase_ids)
     telemetry = {
         "input_span_count": len(spans),
         "input_event_count": len(events),
@@ -122,7 +127,7 @@ def build_chronology_write_batch(
 def _created_at(events: list[MemoryEvent], spans: list[EvidenceSpan]) -> datetime:
     timestamps = [event.time_start for event in events if event.time_start is not None]
     timestamps.extend(span.timestamp for span in spans)
-    return min(timestamps) if timestamps else datetime.now(timezone.utc)
+    return min(timestamps) if timestamps else DETERMINISTIC_CREATED_AT_FALLBACK
 
 
 def _first_source_span(event: MemoryEvent, span_by_id: dict[str, EvidenceSpan]) -> EvidenceSpan | None:
@@ -258,12 +263,14 @@ def _infer_action(text: str) -> str:
     return tokens[0] if tokens else "unknown"
 
 
-def _build_edges(nodes: list[ChronologyEventNode], created_at: datetime) -> list[ChronologyEventEdge]:
+def _build_edges(
+    nodes: list[ChronologyEventNode], created_at: datetime, recognized_phase_ids: set[str]
+) -> list[ChronologyEventEdge]:
     edges: list[ChronologyEventEdge] = []
     for from_node, to_node in zip(nodes, nodes[1:]):
         if from_node.topic_id != to_node.topic_id:
             continue
-        evidence_type = _edge_evidence_type(from_node, to_node)
+        evidence_type = _edge_evidence_type(from_node, to_node, recognized_phase_ids)
         if evidence_type is None:
             continue
         source_span_ids = [
@@ -284,10 +291,17 @@ def _build_edges(nodes: list[ChronologyEventNode], created_at: datetime) -> list
     return edges
 
 
-def _edge_evidence_type(from_node: ChronologyEventNode, to_node: ChronologyEventNode) -> str | None:
+def _edge_evidence_type(
+    from_node: ChronologyEventNode, to_node: ChronologyEventNode, recognized_phase_ids: set[str]
+) -> str | None:
     if from_node.explicit_order_marker or to_node.explicit_order_marker:
         return "explicit_marker"
-    if from_node.timestamp is not None and to_node.timestamp is not None and from_node.timestamp <= to_node.timestamp:
+    if (
+        from_node.timestamp is not None
+        and to_node.timestamp is not None
+        and from_node.timestamp <= to_node.timestamp
+        and (from_node.phase_id in recognized_phase_ids or to_node.phase_id in recognized_phase_ids)
+    ):
         return "timestamp_phase"
     return None
 
