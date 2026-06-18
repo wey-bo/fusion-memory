@@ -249,6 +249,7 @@ class EvidencePackBuilder:
             "estimated_source_tokens": estimated_tokens,
             "timeline_span_count": len(spans) if plan.query_type == "event_ordering" else 0,
             "query_intent": intent,
+            "dropped_high_signal_candidates": coverage.get("dropped_high_signal_candidates", []),
         }
         coverage["pack_contract"] = pack_contract_metadata(
             active_sections=active_pack_sections_for(plan.query_type, coverage)
