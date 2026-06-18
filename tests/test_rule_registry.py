@@ -141,7 +141,7 @@ class RuleInstrumentationTests(unittest.TestCase):
         self.assertRegex(str(hits[0].metadata["phrases"]), r"^[0-9a-f]{12}$")
         self.assertNotIn("默认数据库", str(hits[0].metadata["phrases"]))
 
-    def test_multi_condition_rule_hit_sanitizes_condition_metadata(self) -> None:
+    def test_multi_condition_match_does_not_emit_rule_hit(self) -> None:
         from fusion_memory.api.service_helpers import _matched_query_conditions
 
         matches = _matched_query_conditions(
@@ -152,14 +152,9 @@ class RuleInstrumentationTests(unittest.TestCase):
         self.assertIn("openclaw", matches)
         self.assertIn("install", matches)
         hits = drain_rule_hits()
-        self.assertEqual(len(hits), 1)
-        self.assertEqual(hits[0].rule_id, "multi_condition.query_token_match")
-        self.assertEqual(hits[0].metadata["decision"], "attach_matched_conditions")
-        self.assertEqual(hits[0].metadata["match_count"], len(matches))
-        self.assertRegex(str(hits[0].metadata["conditions"]), r"^[0-9a-f]{12}$")
-        self.assertNotIn("install", str(hits[0].metadata["conditions"]))
+        self.assertEqual(hits, [])
 
-    def test_taxonomy_rule_hit_sanitizes_taxonomy_metadata(self) -> None:
+    def test_taxonomy_alias_match_does_not_emit_rule_hit(self) -> None:
         from fusion_memory.core.models import MemoryEvent, Scope
         from fusion_memory.retrieval.event_graph_selection import _event_ordering_event_relevance
 
@@ -177,12 +172,7 @@ class RuleInstrumentationTests(unittest.TestCase):
 
         self.assertGreater(score, 0.0)
         hits = drain_rule_hits()
-        self.assertEqual(len(hits), 1)
-        self.assertEqual(hits[0].rule_id, "event_ordering.taxonomy_alias_hit")
-        self.assertEqual(hits[0].metadata["decision"], "boost_salient_hits")
-        self.assertRegex(str(hits[0].metadata["taxonomy_hits"]), r"^[0-9a-f]{12}$")
-        self.assertNotIn("deployment", str(hits[0].metadata["taxonomy_hits"]))
-        self.assertNotIn("render", str(hits[0].metadata["taxonomy_hits"]))
+        self.assertEqual(hits, [])
 
     def test_search_trace_attaches_rule_hits(self) -> None:
         memory = MemoryService()
@@ -200,7 +190,7 @@ class RuleInstrumentationTests(unittest.TestCase):
         self.assertIsNotNone(trace)
         rule_hits = trace.get("rule_hits") if trace else None
         self.assertIsInstance(rule_hits, list)
-        self.assertTrue(any(hit.get("rule_id") == "multi_condition.query_token_match" for hit in rule_hits or []))
+        self.assertFalse(any(hit.get("rule_id") == "multi_condition.query_token_match" for hit in rule_hits or []))
 
     def test_answer_context_preserves_search_rule_hits_and_deduplicates_pack_hits(self) -> None:
         memory = MemoryService()

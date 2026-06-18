@@ -26,15 +26,6 @@ register_rule(
         pattern="cjk_exact_phrase",
     )
 )
-register_rule(
-    RuleDefinition(
-        rule_id="multi_condition.query_token_match",
-        module=__name__,
-        purpose="mark distributed multi-condition evidence matches",
-        category="high_risk",
-        pattern="matched_query_conditions",
-    )
-)
 
 def _source_coverage(items: list[Any]) -> float:
     if not items:
@@ -833,16 +824,7 @@ def _matched_query_conditions(query: str, text: str, *, min_len: int = 3) -> lis
         return []
     text_tokens = _expand_topic_tokens(_topic_scope_tokens(text))
     matched = [token for token in query_tokens if token in text_tokens]
-    unique_matches = list(dict.fromkeys(matched))
-    if unique_matches:
-        record_rule_hit(
-            "multi_condition.query_token_match",
-            query=query,
-            text=text,
-            stage="broad_raw_recall",
-            metadata={"decision": "attach_matched_conditions", "match_count": len(unique_matches), "conditions": unique_matches},
-        )
-    return unique_matches
+    return list(dict.fromkeys(matched))
 
 
 def _scent_trail_score(query: str, text: str) -> float:
