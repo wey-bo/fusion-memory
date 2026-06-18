@@ -54,6 +54,7 @@ from fusion_memory.retrieval.query_planner import QueryPlanner
 from fusion_memory.retrieval.raw_evidence_quota import RawEvidenceQuota
 from fusion_memory.retrieval.preservation import annotate_runtime_preservation_candidates, preserve_required_candidates
 from fusion_memory.retrieval.reranker import LexicalCrossEncoderReranker, Reranker, rerank_candidates
+from fusion_memory.retrieval.rule_registry import RuleDefinition, drain_rule_hits, record_rule_hit, register_rule
 from fusion_memory.retrieval.rrf import reciprocal_rank_fusion
 from fusion_memory.retrieval.scoring import score_candidate
 from fusion_memory.retrieval.structured_annotations import select_event_ordering_timeline
@@ -140,6 +141,16 @@ from fusion_memory.api.service_helpers import (
     _labeled_precision,
     ORDER_RE,
     _explicit_order_mentions,
+)
+
+register_rule(
+    RuleDefinition(
+        rule_id="event_ordering.legacy_rescue",
+        module=__name__,
+        purpose="track legacy event-ordering fallback candidates selected instead of graph-first path",
+        category="high_risk",
+        pattern="graph_fallback|legacy_fallback",
+    )
 )
 
 
@@ -288,6 +299,7 @@ class MemoryService:
         )
         model_calls = self._model_calls_since(model_call_marks)
         trace["model_calls"] = model_calls
+        trace["rule_hits"] = [hit.__dict__ for hit in drain_rule_hits()]
         self.store.save_trace(trace_id, trace, scope)
         self.store.insert_audit_event(
             scope,
@@ -476,6 +488,7 @@ class MemoryService:
                 )
         model_calls = self._model_calls_since(model_call_marks)
         trace["model_calls"] = model_calls
+        trace["rule_hits"] = [hit.__dict__ for hit in drain_rule_hits()]
         self.store.save_trace(trace_id, trace, scope)
         self.store.insert_audit_event(
             scope,
@@ -541,7 +554,8 @@ class MemoryService:
             },
         )
         trace = self.store.get_trace(result.trace_id, scope, include_session=bool(scope.session_id and not budget.get("allow_cross_session", False))) or {}
-        return self.pack_builder.build(
+        existing_rule_hits = list(trace.get("rule_hits") or [])
+        pack = self.pack_builder.build(
             query,
             plan,
             result.candidates,
@@ -549,6 +563,32 @@ class MemoryService:
             trace.get("selected", []),
             token_budget=token_budget,
         )
+        pack_rule_hits = [hit.__dict__ for hit in drain_rule_hits()]
+        if pack_rule_hits:
+            seen_hit_keys = {
+                (
+                    str(hit.get("rule_id")),
+                    str(hit.get("stage")),
+                    str(hit.get("text_hash")),
+                    str(hit.get("contributed_candidate_id")),
+                )
+                for hit in existing_rule_hits
+                if isinstance(hit, dict)
+            }
+            for hit in pack_rule_hits:
+                key = (
+                    str(hit.get("rule_id")),
+                    str(hit.get("stage")),
+                    str(hit.get("text_hash")),
+                    str(hit.get("contributed_candidate_id")),
+                )
+                if key in seen_hit_keys:
+                    continue
+                existing_rule_hits.append(hit)
+                seen_hit_keys.add(key)
+        if existing_rule_hits:
+            pack.coverage["rule_hits"] = existing_rule_hits
+        return pack
 
     def get(
         self,
@@ -2547,6 +2587,15 @@ class MemoryService:
         ]
         if not stale:
             return selected
+        for candidate in stale:
+            record_rule_hit(
+                "current_value.stale_history_marker",
+                query=query,
+                text=candidate.text,
+                stage="search_filter",
+                contributed_candidate_id=candidate.id,
+                metadata={"decision": "drop_stale_history", "source": candidate.source},
+            )
         kept = [candidate for candidate in selected if candidate not in stale]
         return kept if kept else selected
 

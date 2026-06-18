@@ -14,8 +14,8 @@ as fallback while graph coverage is incomplete.
 from typing import Any
 
 from fusion_memory.core.text import compact_summary
-
 from fusion_memory.retrieval.event_ordering_common import _event_ordering_record_sort_key
+from fusion_memory.retrieval.rule_registry import RuleDefinition, register_rule
 from fusion_memory.retrieval.event_ordering_sequence import (
     _event_ordering_assistant_plan_text,
     _event_ordering_choose_sequence_items,
@@ -29,6 +29,17 @@ from fusion_memory.retrieval.event_ordering_sequence import (
     _event_ordering_structured_sequence_items,
 )
 from fusion_memory.retrieval.event_ordering_episodes import event_ordering_referenceable_episodes
+
+
+register_rule(
+    RuleDefinition(
+        rule_id="event_ordering.legacy_rescue",
+        module=__name__,
+        purpose="track legacy event-ordering rescue path",
+        category="high_risk",
+        pattern="graph_fallback|legacy_fallback",
+    )
+)
 
 
 def build_event_ordering_model_pack(

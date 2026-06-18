@@ -107,3 +107,15 @@ class RuleRegistryTests(unittest.TestCase):
         self.assertRegex(str(hit.metadata["raw_text"]), r"^[0-9a-f]{12}$")
         self.assertRegex(str(hit.metadata["span_message"]), r"^[0-9a-f]{12}$")
         self.assertNotIn("I initially used SQLite.", hit.text_hash)
+
+
+class RuleInstrumentationTests(unittest.TestCase):
+    def test_current_value_stale_filter_records_rule_hit(self) -> None:
+        from fusion_memory.retrieval.evidence_pack import _is_stale_historical_current_value_span
+
+        drain_rule_hits()
+
+        self.assertTrue(_is_stale_historical_current_value_span("I initially used SQLite."))
+        hits = drain_rule_hits()
+
+        self.assertTrue(any(hit.rule_id == "current_value.stale_history_marker" for hit in hits))

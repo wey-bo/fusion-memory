@@ -4,6 +4,7 @@ import re
 from typing import Any
 
 from fusion_memory.core.models import Candidate, EvidenceSpan
+from fusion_memory.retrieval.rule_registry import RuleDefinition, record_rule_hit, register_rule
 from fusion_memory.retrieval.aggregation_keys import (
     combinatorics_aggregation_keys,
     generic_aggregation_keys,
@@ -13,6 +14,26 @@ from fusion_memory.retrieval.aggregation_keys import (
     is_stress_break_aggregation_query as _is_stress_break_aggregation_query,
     stress_break_aggregation_keys,
     vendor_tool_aggregation_keys,
+)
+
+
+register_rule(
+    RuleDefinition(
+        rule_id="exact_match.cjk_phrase",
+        module=__name__,
+        purpose="mark Chinese exact phrase preservation hits",
+        category="high_risk",
+        pattern="cjk_exact_phrase",
+    )
+)
+register_rule(
+    RuleDefinition(
+        rule_id="multi_condition.query_token_match",
+        module=__name__,
+        purpose="mark distributed multi-condition evidence matches",
+        category="high_risk",
+        pattern="matched_query_conditions",
+    )
 )
 
 def _source_coverage(items: list[Any]) -> float:
@@ -794,7 +815,16 @@ def _cjk_exact_match_phrases(query: str, text: str, *, min_len: int = 2) -> list
     if not query_tokens:
         return []
     matches = [token for token in query_tokens if token in text]
-    return list(dict.fromkeys(matches))
+    unique_matches = list(dict.fromkeys(matches))
+    if unique_matches:
+        record_rule_hit(
+            "exact_match.cjk_phrase",
+            query=query,
+            text=text,
+            stage="exact_filter",
+            metadata={"decision": "preserve_language_exact_match", "match_count": len(unique_matches), "phrases": unique_matches},
+        )
+    return unique_matches
 
 
 def _matched_query_conditions(query: str, text: str, *, min_len: int = 3) -> list[str]:
@@ -803,7 +833,16 @@ def _matched_query_conditions(query: str, text: str, *, min_len: int = 3) -> lis
         return []
     text_tokens = _expand_topic_tokens(_topic_scope_tokens(text))
     matched = [token for token in query_tokens if token in text_tokens]
-    return list(dict.fromkeys(matched))
+    unique_matches = list(dict.fromkeys(matched))
+    if unique_matches:
+        record_rule_hit(
+            "multi_condition.query_token_match",
+            query=query,
+            text=text,
+            stage="broad_raw_recall",
+            metadata={"decision": "attach_matched_conditions", "match_count": len(unique_matches), "conditions": unique_matches},
+        )
+    return unique_matches
 
 
 def _scent_trail_score(query: str, text: str) -> float:

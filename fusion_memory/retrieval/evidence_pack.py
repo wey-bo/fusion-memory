@@ -21,6 +21,7 @@ from fusion_memory.retrieval.aggregation_preferences import _preference_constrai
 from fusion_memory.retrieval.exact_answer_operators import exact_answer_operator_fields
 from fusion_memory.retrieval.pack_contract import active_pack_sections_for, pack_contract_metadata
 from fusion_memory.retrieval.slot_update_recall import build_slot_update_recall_rows as _slot_update_recall_rows
+from fusion_memory.retrieval.rule_registry import RuleDefinition, record_rule_hit, register_rule
 from fusion_memory.retrieval.temporal_pack import (
     date_signal as _date_signal,
     temporal_candidate_table as _temporal_candidate_table,
@@ -41,6 +42,17 @@ from fusion_memory.retrieval.value_history_pack import (
     value_update_marker_strength as _value_update_marker_strength,
 )
 from fusion_memory.storage.sqlite_store import SQLiteMemoryStore
+
+
+register_rule(
+    RuleDefinition(
+        rule_id="current_value.stale_history_marker",
+        module=__name__,
+        purpose="drop stale historical spans when resolving current value",
+        category="high_risk",
+        pattern="initially|previously|formerly|原来|曾经",
+    )
+)
 
 
 class EvidencePackBuilder:
@@ -1283,13 +1295,22 @@ def _is_stale_historical_current_value_span(text: str) -> bool:
         return False
     if re.search(r"(?:\b(?:updated?|revised?|changed?|switched|migrat(?:e|ed|ing))\b.*\b(?:from|to)\b)", lower):
         return False
-    return bool(
+    is_stale = bool(
         re.search(
             r"\b(?:initially|previously|formerly|originally|used to|before the switch|at first)\b",
             lower,
         )
         or re.search(r"(?:最初|以前|之前|原来|曾经)", text)
     )
+    if is_stale:
+        record_rule_hit(
+            "current_value.stale_history_marker",
+            query="",
+            text=text,
+            stage="evidence_pack_filter",
+            metadata={"decision": "drop_stale_history"},
+        )
+    return is_stale
 
 
 def _historical_said_query(lower: str) -> bool:
