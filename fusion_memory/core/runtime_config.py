@@ -42,7 +42,7 @@ def memory_service_from_env(
         query_intent_refiner=_build_query_intent_refiner(),
         query_intent_refiner_min_confidence=_float_env("FUSION_MEMORY_QUERY_INTENT_MIN_CONFIDENCE", 0.70),
         query_intent_refiner_mode=os.getenv("FUSION_MEMORY_QUERY_INTENT_MODE", "auto"),
-        retrieval_flags=_build_runtime_retrieval_flags_for_service(),
+        retrieval_flags=build_runtime_retrieval_flags(),
     )
 
 
@@ -175,13 +175,6 @@ def _build_query_intent_refiner() -> Any | None:
         retry_max_backoff_seconds=_float_env("FUSION_MEMORY_QUERY_INTENT_RETRY_MAX_BACKOFF_SECONDS", 30.0),
         min_interval_seconds=_float_env("FUSION_MEMORY_QUERY_INTENT_MIN_INTERVAL_SECONDS", 0.0),
     )
-
-
-def _build_runtime_retrieval_flags_for_service() -> RuntimeRetrievalFlags:
-    try:
-        return build_runtime_retrieval_flags()
-    except ValueError:
-        return RuntimeRetrievalFlags()
 
 
 def _model_kwargs() -> dict[str, Any]:

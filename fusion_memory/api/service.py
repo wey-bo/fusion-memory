@@ -167,10 +167,10 @@ class MemoryService:
         storage_backend: str = "sqlite",
         store: Any | None = None,
         store_connect: Any | None = None,
-        async_extractor: Any | None = None,
         query_intent_refiner: Any | None = None,
         query_intent_refiner_min_confidence: float = 0.70,
         query_intent_refiner_mode: str = "auto",
+        async_extractor: Any | None = None,
         retrieval_flags: Any | None = None,
     ) -> None:
         self.config = config or DEFAULT_CONFIG

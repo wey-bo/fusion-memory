@@ -48,18 +48,7 @@ class RuntimeRetrievalFlagTests(unittest.TestCase):
 
         self.assertEqual(captured_kwargs["query_intent_refiner_mode"], "auto")
 
-    def test_memory_service_from_env_falls_back_for_invalid_selector(self) -> None:
-        captured_kwargs: dict[str, object] = {}
-
-        class DummyMemoryService:
-            def __init__(self, *args, **kwargs) -> None:
-                captured_kwargs.update(kwargs)
-
-        with patch.dict(os.environ, {"FUSION_MEMORY_EVENT_ORDERING_SELECTOR": "graph"}, clear=True), patch(
-            "fusion_memory.core.runtime_config.MemoryService", DummyMemoryService
-        ):
-            memory_service_from_env()
-
-        retrieval_flags = captured_kwargs["retrieval_flags"]
-        self.assertFalse(getattr(retrieval_flags, "dual_event_ordering_shadow", True))
-        self.assertEqual(getattr(retrieval_flags, "production_selector", "graph"), "legacy")
+    def test_memory_service_from_env_raises_for_invalid_selector(self) -> None:
+        with patch.dict(os.environ, {"FUSION_MEMORY_EVENT_ORDERING_SELECTOR": "graph"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "unsupported event ordering selector"):
+                memory_service_from_env()
