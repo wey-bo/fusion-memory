@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
 from urllib import error, request
@@ -64,22 +65,25 @@ def init_home(
     port: int = DEFAULT_PORT,
     force: bool = False,
     settings: dict[str, Any] | None = None,
+    local_test: bool = False,
 ) -> dict[str, Any]:
     paths = product_paths(home)
     paths.home.mkdir(parents=True, exist_ok=True)
     paths.backup_dir.mkdir(parents=True, exist_ok=True)
     if not paths.config.exists() or force:
-        config = _default_config(paths, host=host, port=port)
+        config = _local_test_config(paths, host=host, port=port) if local_test else _default_config(paths, host=host, port=port)
         if settings:
             config.update(settings)
         _write_json(paths.config, config)
+    loaded = load_config(home)
     return {
         "ok": True,
         "home": str(paths.home),
         "config": str(paths.config),
-        "db": _redact_dsn(str(load_config(home)["db"])),
+        "db": _redact_dsn(str(loaded["db"])),
         "log": str(paths.log),
-        "message": "initialized",
+        "mode": loaded.get("mode", "production"),
+        "message": "initialized (local test mode; not production)" if loaded.get("mode") == "local_test" else "initialized",
     }
 
 
@@ -219,6 +223,9 @@ def doctor(home: str | Path | None = None) -> dict[str, Any]:
     if str(config.get("storage_backend")) == "postgres":
         db = str(config.get("db", ""))
         checks.append(_check("postgres_dsn", db.startswith("postgres"), _redact_dsn(db) if db.startswith("postgres") else "missing Postgres DSN"))
+        postgres = _postgres_readiness(db)
+        checks.append(postgres["connection"])
+        checks.append(postgres["pgvector"])
     else:
         db_path = Path(str(config["db"])).expanduser()
         try:
@@ -248,7 +255,7 @@ def doctor(home: str | Path | None = None) -> dict[str, Any]:
         "home": str(paths.home),
         "config": str(paths.config),
         "checks": checks,
-        "next_step": "fusion-memory start" if ok and not health["ok"] else "fusion-memory status",
+        "next_step": _doctor_next_step(ok=ok, service_running=bool(health["ok"])),
     }
 
 
@@ -306,13 +313,17 @@ def start_service(home: str | Path | None = None, *, wait_seconds: float = 10.0)
             return {"ok": True, "url": _base_url(config), "pid": process.pid, "log": str(paths.log)}
         if process.poll() is not None:
             _STARTED_PROCESSES.pop(process.pid, None)
-            return {
-                "ok": False,
-                "error": "service_exited",
-                "message": f"{APP_NAME} could not start. See {paths.log}.",
-                "pid": process.pid,
-                "log": str(paths.log),
-            }
+            return _startup_failure_result(
+                paths,
+                process.pid,
+                fallback={
+                    "ok": False,
+                    "error": "service_exited",
+                    "message": f"{APP_NAME} could not start. See {paths.log}.",
+                    "pid": process.pid,
+                    "log": str(paths.log),
+                },
+            )
         time.sleep(0.2)
 
     return {
@@ -458,7 +469,34 @@ def render_human(result: dict[str, Any]) -> str:
         if result.get("files") is not None:
             return f"{APP_NAME}: backup OK ({len(result['files'])} file(s))"
         return f"{APP_NAME}: OK"
-    return f"{APP_NAME}: {result.get('message') or result.get('error') or 'failed'}"
+        return f"{APP_NAME}: {result.get('message') or result.get('error') or 'failed'}"
+
+
+def safe_product_error(exc: BaseException) -> dict[str, str]:
+    message = str(exc).lower()
+    if isinstance(exc, ConnectionError) or "connection refused" in message or "could not connect" in message:
+        return {
+            "error": "database_not_ready",
+            "message": "Postgres is not ready or cannot be reached.",
+            "next_step": "Run fusion-memory doctor, then start Postgres or switch to local test mode.",
+        }
+    if "address already in use" in message or ("port" in message and "use" in message):
+        return {
+            "error": "port_in_use",
+            "message": "The configured service port is already in use.",
+            "next_step": "Run fusion-memory doctor and choose another port in the config file.",
+        }
+    if "transformers" in message or "sentence_transformers" in message or "model" in message:
+        return {
+            "error": "model_dependency_missing",
+            "message": "The configured model dependency is not ready.",
+            "next_step": "Run fusion-memory doctor to check Qwen embedding and reranker readiness.",
+        }
+    return {
+        "error": "unexpected_error",
+        "message": "Fusion Memory could not complete the request.",
+        "next_step": "Run fusion-memory doctor and check the local log file.",
+    }
 
 
 def _default_config(paths: ProductPaths, *, host: str, port: int) -> dict[str, Any]:
@@ -480,6 +518,29 @@ def default_product_settings(paths: ProductPaths) -> dict[str, Any]:
         "reranker": {"provider": "qwen", "model": DEFAULT_QWEN_RERANKER_MODEL},
         "extractor": {"provider": "rule"},
         "query_intent": {"provider": "off"},
+    }
+
+
+def local_test_settings(paths: ProductPaths) -> dict[str, Any]:
+    return {
+        "version": CONFIG_VERSION,
+        "mode": "local_test",
+        "host": DEFAULT_HOST,
+        "port": DEFAULT_PORT,
+        "db": str(paths.db),
+        "storage_backend": "sqlite",
+        "log": str(paths.log),
+        "embedding": {"provider": "deterministic"},
+        "reranker": {"provider": "lexical"},
+        "extractor": {"provider": "rule"},
+        "query_intent": {"provider": "off"},
+    }
+
+
+def _local_test_config(paths: ProductPaths, *, host: str, port: int) -> dict[str, Any]:
+    return local_test_settings(paths) | {
+        "host": host,
+        "port": port,
     }
 
 
@@ -605,9 +666,11 @@ def _apply_reranker_env(env: dict[str, str], config: dict[str, Any]) -> None:
 def _apply_extractor_env(env: dict[str, str], config: dict[str, Any]) -> None:
     provider = str(config.get("provider") or "rule")
     if provider != "api":
+        env.pop("FUSION_MEMORY_EXTRACTOR_MODE", None)
         env.pop("FUSION_MEMORY_EXTRACTOR_BASE_URL", None)
         env.pop("FUSION_MEMORY_EXTRACTOR_ENDPOINT", None)
         return
+    env["FUSION_MEMORY_EXTRACTOR_MODE"] = str(config.get("mode") or "async")
     _set_if_present(env, "FUSION_MEMORY_EXTRACTOR_BASE_URL", config.get("base_url"))
     _set_if_present(env, "FUSION_MEMORY_EXTRACTOR_MODEL", config.get("model"))
     _copy_secret_env(env, "FUSION_MEMORY_EXTRACTOR_API_KEY", config.get("api_key_env"))
@@ -616,9 +679,11 @@ def _apply_extractor_env(env: dict[str, str], config: dict[str, Any]) -> None:
 def _apply_query_intent_env(env: dict[str, str], config: dict[str, Any]) -> None:
     provider = str(config.get("provider") or "off")
     if provider != "api":
+        env["FUSION_MEMORY_QUERY_INTENT_MODE"] = "off"
         env.pop("FUSION_MEMORY_QUERY_INTENT_BASE_URL", None)
         env.pop("FUSION_MEMORY_QUERY_INTENT_ENDPOINT", None)
         return
+    env["FUSION_MEMORY_QUERY_INTENT_MODE"] = str(config.get("mode") or "off")
     _set_if_present(env, "FUSION_MEMORY_QUERY_INTENT_BASE_URL", config.get("base_url"))
     _set_if_present(env, "FUSION_MEMORY_QUERY_INTENT_MODEL", config.get("model"))
     _copy_secret_env(env, "FUSION_MEMORY_QUERY_INTENT_API_KEY", config.get("api_key_env"))
@@ -647,10 +712,10 @@ def _model_checks(config: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         if provider == "qwen":
             model = str(raw.get("model") or "")
-            ok = bool(model)
-            if model and (model.startswith("~") or model.startswith("/") or ":\\" in model or model.startswith(".")):
-                ok = Path(model).expanduser().exists()
-            checks.append(_check(label, ok, f"qwen model={model or 'missing'}"))
+            dependency = _qwen_dependency_check(label)
+            readiness = _qwen_model_readiness_check(label, model, dependency["ok"])
+            checks.append(dependency)
+            checks.append(readiness)
             continue
         if provider in {"http", "api"}:
             endpoint = str(raw.get("endpoint") or raw.get("base_url") or "")
@@ -666,6 +731,112 @@ def _model_checks(config: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         checks.append(_check(label, False, f"unsupported provider: {provider}"))
     return checks
+
+
+def _postgres_readiness(dsn: str) -> dict[str, dict[str, Any]]:
+    if not dsn.startswith("postgres"):
+        missing = _check("postgres_connection", False, "Postgres DSN is missing.")
+        return {"connection": missing, "pgvector": _check("pgvector", False, "Postgres is not ready yet.")}
+    try:
+        import psycopg2  # type: ignore[import-not-found]
+    except ImportError:
+        return {
+            "connection": _check("postgres_connection", False, "Postgres driver is missing. Install psycopg2-binary."),
+            "pgvector": _check("pgvector", False, "Postgres driver is missing."),
+        }
+    try:
+        conn = psycopg2.connect(dsn, connect_timeout=2)
+    except Exception:
+        return {
+            "connection": _check("postgres_connection", False, "Postgres is not reachable. Start Postgres or check the DSN."),
+            "pgvector": _check("pgvector", False, "Postgres is not reachable."),
+        }
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("select 1")
+        pgvector_ok = False
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute("select 1 from pg_extension where extname = 'vector'")
+                pgvector_ok = cursor.fetchone() is not None
+        except Exception:
+            pgvector_ok = False
+        return {
+            "connection": _check("postgres_connection", True, "Postgres is reachable."),
+            "pgvector": _check("pgvector", pgvector_ok, "pgvector is installed." if pgvector_ok else "pgvector extension is not installed."),
+        }
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _qwen_dependency_check(label: str) -> dict[str, Any]:
+    ok = find_spec("sentence_transformers") is not None
+    name = f"{label}_dependency"
+    detail = "Qwen ML dependencies are installed." if ok else "Qwen ML dependencies are missing. Install the qwen extra or use --local-test for a temporary local mode."
+    return _check(name, ok, detail)
+
+
+def _qwen_model_readiness_check(label: str, model: str, dependency_ok: bool) -> dict[str, Any]:
+    name = f"{label}_model_readiness"
+    if not model:
+        return _check(name, False, "Qwen model is not configured.")
+    if _looks_like_path(model):
+        exists = Path(model).expanduser().exists()
+        return _check(name, exists and dependency_ok, "Qwen model path is ready." if exists and dependency_ok else "Qwen model path or dependencies are not ready.")
+    return _check(
+        name,
+        dependency_ok,
+        "Qwen model can be loaded by the configured model id." if dependency_ok else "Qwen model cannot load until ML dependencies are installed.",
+    )
+
+
+def _looks_like_path(value: str) -> bool:
+    return value.startswith(("~", "/", ".")) or ":\\" in value or "\\" in value
+
+
+def _startup_failure_result(paths: ProductPaths, pid: int, *, fallback: dict[str, Any]) -> dict[str, Any]:
+    log_tail = _read_log_tail(paths.log)
+    classified = _classify_startup_failure(log_tail)
+    if not classified:
+        return fallback
+    return {
+        "ok": False,
+        "error": classified["error"],
+        "message": classified["message"],
+        "pid": pid,
+        "log": str(paths.log),
+    }
+
+
+def _read_log_tail(path: Path, *, max_chars: int = 12000) -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return text[-max_chars:]
+
+
+def _classify_startup_failure(log_tail: str) -> dict[str, str] | None:
+    lower = log_tail.lower()
+    if "sentence_transformers" in lower or "qwen3embeddingclient requires optional ml dependencies" in lower or "qwen3reranker requires optional ml dependencies" in lower:
+        return {
+            "error": "model_not_ready",
+            "message": "Qwen models are not ready. Run fusion-memory doctor, install the Qwen dependencies, or initialize with --local-test for a temporary local mode.",
+        }
+    if "connection refused" in lower or "could not connect" in lower or "postgres" in lower and "not reachable" in lower:
+        return {
+            "error": "database_not_ready",
+            "message": "Postgres is not ready. Start Postgres, check the DSN, then run fusion-memory doctor.",
+        }
+    if "address already in use" in lower or "port" in lower and "in use" in lower:
+        return {
+            "error": "port_in_use",
+            "message": "The Fusion Memory port is already in use. Change the configured port or stop the other service.",
+        }
+    return None
 
 
 def _default_home() -> Path:
@@ -686,6 +857,12 @@ def _base_url(config: dict[str, Any]) -> str:
 
 def _check(name: str, ok: bool, detail: str) -> dict[str, Any]:
     return {"name": name, "ok": ok, "detail": detail}
+
+
+def _doctor_next_step(*, ok: bool, service_running: bool) -> str:
+    if not ok:
+        return "Fix failed checks, then run fusion-memory doctor again. For a temporary local test mode, run fusion-memory init --local-test --force."
+    return "fusion-memory status" if service_running else "fusion-memory start"
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:

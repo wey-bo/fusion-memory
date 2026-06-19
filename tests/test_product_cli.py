@@ -18,6 +18,7 @@ from fusion_memory.product import (
     init_home,
     load_config,
     product_paths,
+    safe_product_error,
     render_human,
     service_status,
     start_service,
@@ -46,6 +47,48 @@ class ProductCliTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertTrue(payload["dry_run"])
 
+    def test_install_agent_invalid_target_cli_json_is_beginner_safe(self) -> None:
+        from fusion_memory.cli import main
+        import sys
+
+        old_argv = sys.argv
+        stdout = StringIO()
+        stderr = StringIO()
+        try:
+            sys.argv = ["fusion-memory", "install-agent", "--target", "bad-agent", "--json"]
+            with redirect_stdout(stdout), patch("sys.stderr", stderr):
+                main()
+            payload = json.loads(stdout.getvalue())
+        finally:
+            sys.argv = old_argv
+
+        self.assertFalse(payload["ok"])
+        self.assertIn("Choose one of", payload["message"])
+        combined = stdout.getvalue() + stderr.getvalue()
+        self.assertNotIn("usage:", combined)
+        self.assertNotIn("invalid choice", combined)
+        self.assertNotIn("Traceback", combined)
+
+    def test_cli_routes_command_errors_through_safe_product_error(self) -> None:
+        from fusion_memory.cli import main
+        import sys
+
+        old_argv = sys.argv
+        stdout = StringIO()
+        try:
+            sys.argv = ["fusion-memory", "doctor", "--json"]
+            with redirect_stdout(stdout), patch("fusion_memory.cli.doctor", side_effect=RuntimeError("Traceback (most recent call last): secret stack")):
+                exit_code = main()
+        finally:
+            sys.argv = old_argv
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 1)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"], "unexpected_error")
+        self.assertNotIn("Traceback", payload["message"])
+        self.assertNotIn("secret stack", payload["message"])
+
     def test_init_doctor_backup_and_upgrade_dry_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
@@ -66,8 +109,9 @@ class ProductCliTests(unittest.TestCase):
             self.assertEqual(defaults["storage_backend"], "postgres")
 
             report = doctor(home)
-            self.assertTrue(report["ok"])
             self.assertTrue(report["checks"])
+            self.assertIn("postgres_connection", {item["name"] for item in report["checks"]})
+            self.assertIn("embedding_dependency", {item["name"] for item in report["checks"]})
 
             (home / "fusion-memory.sqlite3").write_text("seed", encoding="utf-8")
             backup = backup_data(home)
@@ -78,6 +122,77 @@ class ProductCliTests(unittest.TestCase):
             self.assertTrue(plan["ok"])
             self.assertTrue(plan["dry_run"])
             self.assertIn("command", plan)
+
+    def test_local_test_init_is_explicit_fallback_not_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            result = init_home(home, port=0, local_test=True)
+            config = load_config(home)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mode"], "local_test")
+        self.assertEqual(config["storage_backend"], "sqlite")
+        self.assertEqual(config["embedding"]["provider"], "deterministic")
+        self.assertEqual(config["reranker"]["provider"], "lexical")
+        self.assertIn("not production", result["message"])
+
+    def test_doctor_checks_postgres_pgvector_and_qwen_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            init_home(home, port=0)
+
+            report = doctor(home)
+
+        names = {item["name"]: item for item in report["checks"]}
+        self.assertIn("postgres_connection", names)
+        self.assertIn("pgvector", names)
+        self.assertIn("embedding_dependency", names)
+        self.assertIn("embedding_model_readiness", names)
+        self.assertIn("reranker_dependency", names)
+        self.assertIn("reranker_model_readiness", names)
+        if not report["ok"]:
+            self.assertIn("Fix failed checks", report["next_step"])
+        serialized = json.dumps(report)
+        self.assertNotIn("Traceback", serialized)
+        self.assertNotIn("fusion:fusion", serialized)
+
+    def test_start_failure_maps_qwen_traceback_to_friendly_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            paths = product_paths(home)
+            init_home(home, port=0)
+            paths.log.write_text(
+                "Traceback (most recent call last):\n"
+                "ModuleNotFoundError: No module named 'sentence_transformers'\n"
+                "RuntimeError: Qwen3EmbeddingClient requires optional ML dependencies\n",
+                encoding="utf-8",
+            )
+
+            with patch("fusion_memory.product.subprocess.Popen") as popen:
+                process = popen.return_value
+                process.pid = 12345
+                process.poll.return_value = 1
+                result = start_service(home, wait_seconds=0.01)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "model_not_ready")
+        self.assertIn("Qwen", result["message"])
+        self.assertIn("fusion-memory doctor", result["message"])
+        self.assertNotIn("Traceback", result["message"])
+        self.assertNotIn("sentence_transformers", result["message"])
+
+    def test_safe_product_error_maps_connection_failure_to_database_guidance(self) -> None:
+        error = safe_product_error(ConnectionError("connection refused"))
+
+        self.assertEqual(error["error"], "database_not_ready")
+        self.assertIn("Postgres", error["message"])
+        self.assertIn("fusion-memory doctor", error["next_step"])
+
+    def test_safe_product_error_hides_traceback_details(self) -> None:
+        error = safe_product_error(RuntimeError("Traceback (most recent call last): secret stack"))
+
+        self.assertNotIn("Traceback", error["message"])
+        self.assertNotIn("secret stack", error["message"])
 
     def test_interactive_configures_models_without_storing_secret(self) -> None:
         answers = iter(
@@ -117,7 +232,9 @@ class ProductCliTests(unittest.TestCase):
             self.assertEqual(env["FUSION_MEMORY_EMBEDDING_PROVIDER"], "http")
             self.assertEqual(env["FUSION_MEMORY_EMBEDDING_API_KEY"], "secret-value")
             self.assertEqual(env["FUSION_MEMORY_RERANKER_PROVIDER"], "qwen")
+            self.assertEqual(env["FUSION_MEMORY_EXTRACTOR_MODE"], "async")
             self.assertEqual(env["FUSION_MEMORY_EXTRACTOR_API_KEY"], "secret-value")
+            self.assertEqual(env["FUSION_MEMORY_QUERY_INTENT_MODE"], "off")
 
     def test_interactive_and_human_output_redact_default_postgres_credentials(self) -> None:
         answers = iter(

@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from fusion_memory.product import (
     doctor,
     init_home,
     render_human,
+    safe_product_error,
     service_status,
     start_service,
     stop_service,
@@ -30,8 +32,26 @@ from fusion_memory.storage.postgres_store import PostgresMigrationRunner
 from fusion_memory.storage.postgres_verifier import verify_postgres_backend
 
 
+class FusionMemoryArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        if "--json" in sys.argv:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": "invalid_command",
+                        "message": _friendly_argparse_message(message),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            raise SystemExit(2)
+        super().error(message)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Fusion Memory local CLI")
+    parser = FusionMemoryArgumentParser(description="Fusion Memory local CLI")
     parser.add_argument("--db", default="fusion-memory.sqlite3", help="SQLite database path")
     parser.add_argument("--workspace-id")
     parser.add_argument("--user-id")
@@ -46,6 +66,7 @@ def main() -> None:
     init_cmd.add_argument("--port", type=int, default=8765)
     init_cmd.add_argument("--wizard", action="store_true", help="Ask for database and model configuration")
     init_cmd.add_argument("--force", action="store_true", help="Overwrite existing local configuration")
+    init_cmd.add_argument("--local-test", action="store_true", help="Use SQLite and built-in lightweight models for temporary local testing")
     init_cmd.add_argument("--json", action="store_true", help="Print machine-readable JSON")
 
     doctor_cmd = sub.add_parser("doctor", help="Check whether Fusion Memory is ready to run")
@@ -76,7 +97,7 @@ def main() -> None:
     upgrade_cmd.add_argument("--json", action="store_true", help="Print machine-readable JSON")
 
     install_agent_cmd = sub.add_parser("install-agent", help="Install or configure Agent adapters")
-    install_agent_cmd.add_argument("--target", default="all", choices=["all", "openclaw", "hermes", "fusion-agent"])
+    install_agent_cmd.add_argument("--target", default="all")
     install_agent_cmd.add_argument("--dry-run", action="store_true")
     install_agent_cmd.add_argument("--home", default=None)
     install_agent_cmd.add_argument("--json", action="store_true")
@@ -165,131 +186,141 @@ def main() -> None:
     pg_verify.add_argument("--skip-migrate", action="store_true", help="Skip migration and only run the service smoke")
 
     args = parser.parse_args()
-    if args.command == "init":
-        if args.wizard:
-            _print_product_result(
-                configure_interactive(args.home, host=args.host, port=args.port, force=args.force),
-                json_output=args.json,
-            )
-        else:
-            _print_product_result(
-                init_home(args.home, host=args.host, port=args.port, force=args.force),
-                json_output=args.json,
-            )
-        return
-    if args.command == "doctor":
-        _print_product_result(doctor(args.home), json_output=args.json)
-        return
-    if args.command == "start":
-        _print_product_result(start_service(args.home, wait_seconds=args.wait_seconds), json_output=args.json)
-        return
-    if args.command == "stop":
-        _print_product_result(stop_service(args.home), json_output=args.json)
-        return
-    if args.command == "status":
-        _print_product_result(service_status(args.home), json_output=args.json)
-        return
-    if args.command == "backup":
-        _print_product_result(backup_data(args.home), json_output=args.json)
-        return
-    if args.command == "upgrade":
-        _print_product_result(upgrade(args.home, package=args.package, dry_run=args.dry_run), json_output=args.json)
-        return
-    if args.command == "install-agent":
-        _print_product_result(
-            install_agent(args.target, dry_run=args.dry_run, home=args.home),
-            json_output=args.json,
-        )
-        return
-    if args.command == "alpha-test":
-        _print_product_result(run_alpha(report_path=args.report), json_output=args.json)
-        return
-    if args.command == "beta-test":
-        _print_product_result(run_beta(report_path=args.report), json_output=args.json)
-        return
-    if args.command == "migrate-postgres":
-        runner = PostgresMigrationRunner(args.dsn)
-        try:
-            report = runner.migrate()
-            print(json.dumps(_jsonable(report), ensure_ascii=False, indent=2))
-        finally:
-            runner.close()
-        return
-    if args.command == "verify-postgres":
-        report = verify_postgres_backend(args.dsn, migrate=not args.skip_migrate)
-        print(json.dumps(_jsonable(report), ensure_ascii=False, indent=2))
-        return
-
-    scope = Scope(
-        workspace_id=args.workspace_id,
-        user_id=args.user_id,
-        agent_id=args.agent_id,
-        run_id=args.run_id,
-        session_id=args.session_id,
-    )
-    service = memory_service_from_env(args.db)
     try:
-        if args.command == "add":
-            session_time = datetime.fromisoformat(args.time) if args.time else datetime.now(timezone.utc)
-            result = service.add({"role": args.role, "content": args.content}, scope, session_time)
-            print(json.dumps(_jsonable(result), ensure_ascii=False, indent=2))
-        elif args.command == "search":
-            result = service.search(args.query, scope, options={"limit": args.limit, "allow_cross_session": args.allow_cross_session})
-            print(json.dumps(_jsonable(result), ensure_ascii=False, indent=2))
-        elif args.command == "answer-context":
-            pack = service.answer_context(args.query, scope, budget={"limit": args.limit, "allow_cross_session": args.allow_cross_session})
-            print(json.dumps(_jsonable(pack), ensure_ascii=False, indent=2))
-        elif args.command == "get":
-            print(json.dumps(_jsonable(service.get(args.object_id, args.type)), ensure_ascii=False, indent=2))
-        elif args.command == "history":
-            print(json.dumps(_jsonable(service.history(scope, entity=args.entity, fact_id=args.fact_id, allow_cross_session=args.allow_cross_session)), ensure_ascii=False, indent=2))
-        elif args.command == "debug-trace":
-            print(json.dumps(_jsonable(service.debug_trace(args.trace_id)), ensure_ascii=False, indent=2))
-        elif args.command == "audit":
-            print(json.dumps(_jsonable(service.audit_events(scope, event_type=args.type, limit=args.limit)), ensure_ascii=False, indent=2))
-        elif args.command == "timeline":
-            events = service.timeline(args.entity, scope, start=args.start, end=args.end, allow_cross_session=args.allow_cross_session)
-            print(json.dumps(_jsonable(events), ensure_ascii=False, indent=2))
-        elif args.command == "views":
-            print(json.dumps(_jsonable(service.get_current_views(scope, view_type=args.type, allow_cross_session=args.allow_cross_session)), ensure_ascii=False, indent=2))
-        elif args.command == "profiles":
-            profiles = service.get_entity_profile(args.entity_id, scope, profile_type=args.type, allow_cross_session=args.allow_cross_session)
-            print(json.dumps(_jsonable(profiles), ensure_ascii=False, indent=2))
-        elif args.command == "summaries":
-            if args.refresh:
-                summary = service.refresh_session_summary(scope, max_source_spans=args.max_source_spans)
-                print(json.dumps(_jsonable(summary), ensure_ascii=False, indent=2))
-            else:
-                print(json.dumps(_jsonable(service.get_session_summaries(scope)), ensure_ascii=False, indent=2))
-        elif args.command == "tasks":
-            if args.process:
-                result = service.process_background_tasks(scope, limit=args.limit, allow_cross_session=args.allow_cross_session)
-                print(json.dumps(_jsonable(result), ensure_ascii=False, indent=2))
-            else:
-                tasks_out = service.list_background_tasks(
-                    scope,
-                    status=args.status,
-                    limit=args.limit,
-                    allow_cross_session=args.allow_cross_session,
+        if args.command == "init":
+            if args.wizard:
+                _print_product_result(
+                    configure_interactive(args.home, host=args.host, port=args.port, force=args.force),
+                    json_output=args.json,
                 )
-                print(json.dumps(_jsonable(tasks_out), ensure_ascii=False, indent=2))
-        elif args.command == "report":
-            if args.name == "encoding":
-                print(json.dumps(_jsonable(service.encoding_report(scope)), ensure_ascii=False, indent=2))
-            elif args.name == "profiles":
-                print(json.dumps(_jsonable(service.profile_report(scope)), ensure_ascii=False, indent=2))
-        elif args.command == "train-utility":
-            report = service.train_utility_scorer()
-            if args.save_model:
-                service.save_utility_scorer(args.save_model)
+            elif args.local_test:
+                _print_product_result(
+                    init_home(args.home, host=args.host, port=args.port, force=args.force, local_test=True),
+                    json_output=args.json,
+                )
+            else:
+                _print_product_result(
+                    init_home(args.home, host=args.host, port=args.port, force=args.force),
+                    json_output=args.json,
+                )
+            return
+        if args.command == "doctor":
+            _print_product_result(doctor(args.home), json_output=args.json)
+            return
+        if args.command == "start":
+            _print_product_result(start_service(args.home, wait_seconds=args.wait_seconds), json_output=args.json)
+            return
+        if args.command == "stop":
+            _print_product_result(stop_service(args.home), json_output=args.json)
+            return
+        if args.command == "status":
+            _print_product_result(service_status(args.home), json_output=args.json)
+            return
+        if args.command == "backup":
+            _print_product_result(backup_data(args.home), json_output=args.json)
+            return
+        if args.command == "upgrade":
+            _print_product_result(upgrade(args.home, package=args.package, dry_run=args.dry_run), json_output=args.json)
+            return
+        if args.command == "install-agent":
+            _print_product_result(
+                install_agent(args.target, dry_run=args.dry_run, home=args.home),
+                json_output=args.json,
+            )
+            return
+        if args.command == "alpha-test":
+            _print_product_result(run_alpha(report_path=args.report), json_output=args.json)
+            return
+        if args.command == "beta-test":
+            _print_product_result(run_beta(report_path=args.report), json_output=args.json)
+            return
+        if args.command == "migrate-postgres":
+            runner = PostgresMigrationRunner(args.dsn)
+            try:
+                report = runner.migrate()
+                print(json.dumps(_jsonable(report), ensure_ascii=False, indent=2))
+            finally:
+                runner.close()
+            return
+        if args.command == "verify-postgres":
+            report = verify_postgres_backend(args.dsn, migrate=not args.skip_migrate)
             print(json.dumps(_jsonable(report), ensure_ascii=False, indent=2))
-        elif args.command == "run-beam":
-            answer_model, judge_model = _build_eval_models(args)
-            adapter = BeamAdapter(service, scope, split=args.split, answer_model=answer_model, judge_model=judge_model)
-            output = adapter.run_dataset(args.dataset_path, split=args.split, ablate=args.ablate)
-            print(json.dumps(output, ensure_ascii=False, indent=2))
-    finally:
-        service.close()
+            return
+
+        scope = Scope(
+            workspace_id=args.workspace_id,
+            user_id=args.user_id,
+            agent_id=args.agent_id,
+            run_id=args.run_id,
+            session_id=args.session_id,
+        )
+        service = memory_service_from_env(args.db)
+        try:
+            if args.command == "add":
+                session_time = datetime.fromisoformat(args.time) if args.time else datetime.now(timezone.utc)
+                result = service.add({"role": args.role, "content": args.content}, scope, session_time)
+                print(json.dumps(_jsonable(result), ensure_ascii=False, indent=2))
+            elif args.command == "search":
+                result = service.search(args.query, scope, options={"limit": args.limit, "allow_cross_session": args.allow_cross_session})
+                print(json.dumps(_jsonable(result), ensure_ascii=False, indent=2))
+            elif args.command == "answer-context":
+                pack = service.answer_context(args.query, scope, budget={"limit": args.limit, "allow_cross_session": args.allow_cross_session})
+                print(json.dumps(_jsonable(pack), ensure_ascii=False, indent=2))
+            elif args.command == "get":
+                print(json.dumps(_jsonable(service.get(args.object_id, args.type)), ensure_ascii=False, indent=2))
+            elif args.command == "history":
+                print(json.dumps(_jsonable(service.history(scope, entity=args.entity, fact_id=args.fact_id, allow_cross_session=args.allow_cross_session)), ensure_ascii=False, indent=2))
+            elif args.command == "debug-trace":
+                print(json.dumps(_jsonable(service.debug_trace(args.trace_id)), ensure_ascii=False, indent=2))
+            elif args.command == "audit":
+                print(json.dumps(_jsonable(service.audit_events(scope, event_type=args.type, limit=args.limit)), ensure_ascii=False, indent=2))
+            elif args.command == "timeline":
+                events = service.timeline(args.entity, scope, start=args.start, end=args.end, allow_cross_session=args.allow_cross_session)
+                print(json.dumps(_jsonable(events), ensure_ascii=False, indent=2))
+            elif args.command == "views":
+                print(json.dumps(_jsonable(service.get_current_views(scope, view_type=args.type, allow_cross_session=args.allow_cross_session)), ensure_ascii=False, indent=2))
+            elif args.command == "profiles":
+                profiles = service.get_entity_profile(args.entity_id, scope, profile_type=args.type, allow_cross_session=args.allow_cross_session)
+                print(json.dumps(_jsonable(profiles), ensure_ascii=False, indent=2))
+            elif args.command == "summaries":
+                if args.refresh:
+                    summary = service.refresh_session_summary(scope, max_source_spans=args.max_source_spans)
+                    print(json.dumps(_jsonable(summary), ensure_ascii=False, indent=2))
+                else:
+                    print(json.dumps(_jsonable(service.get_session_summaries(scope)), ensure_ascii=False, indent=2))
+            elif args.command == "tasks":
+                if args.process:
+                    result = service.process_background_tasks(scope, limit=args.limit, allow_cross_session=args.allow_cross_session)
+                    print(json.dumps(_jsonable(result), ensure_ascii=False, indent=2))
+                else:
+                    tasks_out = service.list_background_tasks(
+                        scope,
+                        status=args.status,
+                        limit=args.limit,
+                        allow_cross_session=args.allow_cross_session,
+                    )
+                    print(json.dumps(_jsonable(tasks_out), ensure_ascii=False, indent=2))
+            elif args.command == "report":
+                if args.name == "encoding":
+                    print(json.dumps(_jsonable(service.encoding_report(scope)), ensure_ascii=False, indent=2))
+                elif args.name == "profiles":
+                    print(json.dumps(_jsonable(service.profile_report(scope)), ensure_ascii=False, indent=2))
+            elif args.command == "train-utility":
+                report = service.train_utility_scorer()
+                if args.save_model:
+                    service.save_utility_scorer(args.save_model)
+                print(json.dumps(_jsonable(report), ensure_ascii=False, indent=2))
+            elif args.command == "run-beam":
+                answer_model, judge_model = _build_eval_models(args)
+                adapter = BeamAdapter(service, scope, split=args.split, answer_model=answer_model, judge_model=judge_model)
+                output = adapter.run_dataset(args.dataset_path, split=args.split, ablate=args.ablate)
+                print(json.dumps(output, ensure_ascii=False, indent=2))
+        finally:
+            service.close()
+    except Exception as exc:
+        payload = {"ok": False, **safe_product_error(exc)}
+        _print_product_result(payload, json_output=getattr(args, "json", False))
+        return 1
 
 
 def _jsonable(value):
@@ -309,6 +340,14 @@ def _print_product_result(result: dict, *, json_output: bool = False) -> None:
         print(json.dumps(_jsonable(result), ensure_ascii=False, indent=2))
     else:
         print(render_human(result))
+
+
+def _friendly_argparse_message(message: str) -> str:
+    if "invalid choice" in message and "--target" in message:
+        return "Unknown Agent target. Choose one of: all, openclaw, hermes, fusion-agent."
+    if "the following arguments are required" in message:
+        return "A required command option is missing. Run fusion-memory doctor or check the help text."
+    return "Fusion Memory could not understand that command. Check the command and try again."
 
 
 def _add_eval_model_args(parser: argparse.ArgumentParser) -> None:
@@ -502,4 +541,4 @@ def _bool_arg_or_env(args: argparse.Namespace, arg_name: str, env_name: str, def
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
