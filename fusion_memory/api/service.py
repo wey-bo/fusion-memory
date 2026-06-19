@@ -52,7 +52,7 @@ from fusion_memory.retrieval.aggregation_keys import (
 from fusion_memory.retrieval.mmr import mmr
 from fusion_memory.retrieval.query_planner import QueryPlanner
 from fusion_memory.retrieval.raw_evidence_quota import RawEvidenceQuota
-from fusion_memory.retrieval.preservation import annotate_runtime_preservation_candidates, preserve_required_candidates
+from fusion_memory.retrieval.preservation import annotate_runtime_preservation_candidates, must_preserve_reasons, preserve_required_candidates
 from fusion_memory.retrieval.reranker import LexicalCrossEncoderReranker, Reranker, rerank_candidates
 from fusion_memory.retrieval.rule_registry import RuleDefinition, collect_rule_hits, record_rule_hit, register_rule
 from fusion_memory.retrieval.rrf import reciprocal_rank_fusion
@@ -461,6 +461,15 @@ class MemoryService:
         selected = self._filter_stale_current_value_candidates(query, plan, selected)
         annotated_candidates = annotate_runtime_preservation_candidates(scored_again)
         selected, dropped_high_signal = preserve_required_candidates(annotated_candidates, selected, limit)
+        if plan.query_type == "event_ordering":
+            selected, scope_dropped_high_signal = self._apply_event_ordering_post_preservation_topic_scope_filter(
+                query,
+                plan,
+                scored_again,
+                selected,
+                limit,
+            )
+            dropped_high_signal.extend(scope_dropped_high_signal)
         for candidate in selected:
             self.store.insert_utility_example(utility_example(trace_id, query, plan, candidate))
         shadow_ranking = self.utility_scorer.rank_shadow(selected, plan) if self.utility_scorer.trained else []
@@ -1583,6 +1592,7 @@ class MemoryService:
         elif selected_legacy:
             selected_driver = "legacy_fallback"
             selected_span_source = "legacy"
+            _record_event_ordering_legacy_rescue_hits(selected_legacy)
         graph_payload = {
             "graph_candidate_count": len(graph_candidates),
             "legacy_candidate_count": len(legacy_candidates),
@@ -1681,6 +1691,25 @@ class MemoryService:
         )
         ordered = _dedupe_event_ordering_candidates_for_shadow(candidates)
         return ordered[:limit], [candidate.source for candidate in ordered[:limit]]
+
+    def _event_ordering_coverage_candidates(
+        self,
+        query: str,
+        scope: Scope,
+        limit: int,
+        *,
+        include_session: bool = False,
+    ) -> list[Candidate]:
+        spans = [
+            span
+            for span in self.store.list_spans(scope, include_session=include_session)
+            if span.span_type in {"turn", "tool_result", "document_chunk"}
+            and span.speaker in {"user", "assistant", "agent", "document"}
+        ]
+        if not spans:
+            return []
+        events = self.store.list_events(scope, include_session=include_session)
+        return select_event_ordering_timeline(query, spans, events, limit=limit)
 
     def _event_ordering_timeline_candidates(
         self,
@@ -3331,7 +3360,9 @@ class MemoryService:
             episode_required = []
         remaining_after_episode = max(0, limit - episode_budget)
         anchor_cap = max(1, remaining_after_episode)
-        if episode_budget and remaining_after_episode >= 3:
+        if coverage_anchors and requested and not episode_budget:
+            anchor_cap = max(anchor_cap, min(len(coverage_anchors), requested, limit))
+        if episode_budget and remaining_after_episode >= 3 and not (coverage_anchors and requested):
             anchor_cap = max(1, min(anchor_cap, remaining_after_episode - 1))
         anchor_budget = max(1, min(len(coverage_anchors), anchor_cap)) if coverage_anchors and limit > 0 else 0
         support_budget = max(0, min(len(coverage_support), min(2, limit - episode_budget - anchor_budget)))
@@ -3416,6 +3447,12 @@ class MemoryService:
             if self._candidate_in_topic_groups(candidate, topic_groups)
             or (plan.query_type == "event_ordering" and _event_ordering_topic_scope_preserved_candidate(candidate))
         ]
+        if plan.query_type == "event_ordering":
+            in_scope = [
+                candidate
+                for candidate in in_scope
+                if self._event_ordering_candidate_allowed_in_topic_scope(query, candidate, topic_groups)
+            ]
         if len(in_scope) == len(selected):
             return selected
         replacements = [
@@ -3424,6 +3461,12 @@ class MemoryService:
             if self._candidate_in_topic_groups(candidate, topic_groups)
             or (plan.query_type == "event_ordering" and _event_ordering_topic_scope_preserved_candidate(candidate))
         ]
+        if plan.query_type == "event_ordering":
+            replacements = [
+                candidate
+                for candidate in replacements
+                if self._event_ordering_candidate_allowed_in_topic_scope(query, candidate, topic_groups)
+            ]
         out: list[Candidate] = []
         seen: set[tuple[str, str]] = set()
         for candidate in in_scope + replacements:
@@ -3437,6 +3480,46 @@ class MemoryService:
         if len(out) < max(1, min(limit, len(selected)) // 2):
             return selected
         return out
+
+    def _event_ordering_candidate_allowed_in_topic_scope(self, query: str, candidate: Candidate, topic_groups: set[str]) -> bool:
+        if _event_ordering_graph_candidate(candidate):
+            return self._candidate_in_topic_groups(candidate, topic_groups) or _event_ordering_graph_candidate_allowed_by_query(query, candidate)
+        if _event_ordering_topic_scope_preserved_candidate(candidate):
+            return self._candidate_in_topic_groups(candidate, topic_groups) or _event_ordering_episode_candidate_allowed_by_query(query, candidate)
+        return True
+
+    def _apply_event_ordering_post_preservation_topic_scope_filter(
+        self,
+        query: str,
+        plan: Any,
+        candidates: list[Candidate],
+        selected: list[Candidate],
+        limit: int,
+    ) -> tuple[list[Candidate], list[dict[str, object]]]:
+        filtered = self._apply_topic_scope_filter(query, plan, candidates, selected, limit)
+        if filtered is selected:
+            return selected, []
+        filtered_keys = {(candidate.type, candidate.id) for candidate in filtered}
+        dropped: list[dict[str, object]] = []
+        for candidate in selected:
+            if (candidate.type, candidate.id) in filtered_keys:
+                continue
+            reasons = must_preserve_reasons(candidate)
+            if not reasons:
+                continue
+            dropped.append(
+                {
+                    "candidate_id": candidate.id,
+                    "reason": "topic_scope_filter",
+                    "must_preserve_reasons": reasons,
+                    "evidence_role": candidate.metadata.get("evidence_role", "answer"),
+                    "source": candidate.source,
+                    "occupying_candidate_ids": [selected_candidate.id for selected_candidate in filtered],
+                    "occupying_candidate_sources": [selected_candidate.source for selected_candidate in filtered],
+                    "replaced_by": [selected_candidate.id for selected_candidate in filtered],
+                }
+            )
+        return filtered, dropped
 
     def _apply_quality_fallback(
         self,
@@ -3955,16 +4038,24 @@ def _event_ordering_legacy_candidate(candidate: Candidate) -> bool:
     is_legacy = bool(candidate.metadata.get("graph_fallback")) or (
         any(marker in source for marker in legacy_markers) and not source.startswith("event_ordering_graph")
     )
-    if is_legacy:
+    return is_legacy
+
+
+def _record_event_ordering_legacy_rescue_hits(candidates: list[Candidate]) -> None:
+    seen: set[tuple[str, str]] = set()
+    for candidate in candidates:
+        key = (str(candidate.id), str(candidate.source or ""))
+        if key in seen:
+            continue
+        seen.add(key)
         record_rule_hit(
             "event_ordering.legacy_rescue",
             query="",
             text=candidate.text,
             stage="event_ordering_selection",
             contributed_candidate_id=candidate.id,
-            metadata={"decision": "legacy_candidate_path", "source": source},
+            metadata={"decision": "legacy_fallback", "source": candidate.source},
         )
-    return is_legacy
 
 
 def _event_ordering_graph_candidate(candidate: Candidate) -> bool:
@@ -3972,6 +4063,40 @@ def _event_ordering_graph_candidate(candidate: Candidate) -> bool:
     return source in {"event_ordering_persisted_graph"} or (
         source.startswith("event_ordering_graph") and not bool(candidate.metadata.get("graph_fallback"))
     )
+
+
+def _event_ordering_graph_candidate_allowed_by_query(query: str, candidate: Candidate) -> bool:
+    if not _event_ordering_graph_candidate(candidate):
+        return True
+    candidate_tokens = _topic_scope_tokens(candidate.text)
+    if not candidate_tokens:
+        return True
+    query_tokens = _topic_scope_tokens(query)
+    if not query_tokens:
+        return True
+    expanded_candidate_tokens = set(candidate_tokens)
+    for token in list(candidate_tokens):
+        expanded_candidate_tokens.update(_event_ordering_term_variants_for_service(token))
+    expanded_query_tokens = set(query_tokens)
+    for token in list(query_tokens):
+        expanded_query_tokens.update(_event_ordering_term_variants_for_service(token))
+    return bool(expanded_candidate_tokens & expanded_query_tokens)
+
+
+def _event_ordering_episode_candidate_allowed_by_query(query: str, candidate: Candidate) -> bool:
+    if candidate.metadata.get("event_ordering_facet_hits") or candidate.metadata.get("event_ordering_anchor_hits"):
+        return True
+    candidate_tokens = _topic_scope_tokens(candidate.text)
+    query_tokens = _topic_scope_tokens(query)
+    if not candidate_tokens or not query_tokens:
+        return True
+    expanded_candidate_tokens = set(candidate_tokens)
+    for token in list(candidate_tokens):
+        expanded_candidate_tokens.update(_event_ordering_term_variants_for_service(token))
+    expanded_query_tokens = set(query_tokens)
+    for token in list(query_tokens):
+        expanded_query_tokens.update(_event_ordering_term_variants_for_service(token))
+    return bool(expanded_candidate_tokens & expanded_query_tokens)
 
 
 def _event_ordering_candidate_path_key(candidate: Candidate) -> tuple[str, str, bool]:

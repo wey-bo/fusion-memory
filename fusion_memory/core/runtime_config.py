@@ -41,7 +41,7 @@ def memory_service_from_env(
         async_extractor=_build_async_extractor(),
         query_intent_refiner=_build_query_intent_refiner(),
         query_intent_refiner_min_confidence=_float_env("FUSION_MEMORY_QUERY_INTENT_MIN_CONFIDENCE", 0.70),
-        query_intent_refiner_mode=os.getenv("FUSION_MEMORY_QUERY_INTENT_MODE", "auto"),
+        query_intent_refiner_mode=os.getenv("FUSION_MEMORY_QUERY_INTENT_MODE", "off"),
         retrieval_flags=build_runtime_retrieval_flags(),
     )
 
@@ -103,30 +103,9 @@ def _build_reranker() -> Any | None:
 
 def _build_extractor() -> Any | None:
     mode = os.getenv("FUSION_MEMORY_EXTRACTOR_MODE", "off").strip().lower()
-    if mode not in {"off", "sync"}:
+    if mode == "sync":
         return None
-    if mode != "sync":
-        return None
-    endpoint = _optional_env("FUSION_MEMORY_EXTRACTOR_ENDPOINT") or _endpoint_from_base_url(
-        "FUSION_MEMORY_EXTRACTOR_BASE_URL",
-        "chat/completions",
-    )
-    if not endpoint:
-        return None
-    client = OpenAICompatibleLLMClient(
-        endpoint,
-        api_key=_optional_env("FUSION_MEMORY_EXTRACTOR_API_KEY"),
-        model=os.getenv("FUSION_MEMORY_EXTRACTOR_MODEL", "local-structured-extractor"),
-        timeout_seconds=_float_env("FUSION_MEMORY_EXTRACTOR_TIMEOUT_SECONDS", 30.0),
-        retry_attempts=_int_env("FUSION_MEMORY_EXTRACTOR_RETRY_ATTEMPTS", 3),
-        retry_backoff_seconds=_float_env("FUSION_MEMORY_EXTRACTOR_RETRY_BACKOFF_SECONDS", 2.0),
-        retry_max_backoff_seconds=_float_env("FUSION_MEMORY_EXTRACTOR_RETRY_MAX_BACKOFF_SECONDS", 60.0),
-        min_interval_seconds=_float_env("FUSION_MEMORY_EXTRACTOR_MIN_INTERVAL_SECONDS", 0.0),
-    )
-    return StructuredLLMExtractor(
-        client,
-        prompt_version=os.getenv("FUSION_MEMORY_EXTRACTOR_PROMPT_VERSION", "llm-extractor-v0"),
-    )
+    return None
 
 
 def _build_async_extractor() -> Any | None:
@@ -156,7 +135,7 @@ def _build_async_extractor() -> Any | None:
 
 
 def _build_query_intent_refiner() -> Any | None:
-    mode = os.getenv("FUSION_MEMORY_QUERY_INTENT_MODE", "auto").strip().lower()
+    mode = os.getenv("FUSION_MEMORY_QUERY_INTENT_MODE", "off").strip().lower()
     if mode not in {"auto", "always"}:
         return None
     endpoint = _optional_env("FUSION_MEMORY_QUERY_INTENT_ENDPOINT") or _endpoint_from_base_url(

@@ -401,6 +401,60 @@ class BeamEventOrderingGateTests(unittest.TestCase):
         self.assertEqual(summary["dropped_high_signal_candidate_count"], 3)
         self.assertEqual(summary["over_abstract_label_count"], 2)
 
+    def test_aggregate_reports_graph_vs_legacy_passed_independently_from_dual(self) -> None:
+        records = [
+            {
+                "paths": {
+                    "graph": {
+                        "active": True,
+                        "items": ["schema setup", "crud implementation"],
+                        "metrics": {
+                            "precision": 0.8,
+                            "recall": 0.8,
+                            "f1": 0.8,
+                            "kendall_tau": 0.4,
+                            "kendall_tau_norm": 0.7,
+                            "system_count": 2,
+                            "matched": 2,
+                        },
+                    },
+                    "legacy": {
+                        "active": True,
+                        "items": ["schema setup"],
+                        "metrics": {
+                            "precision": 0.5,
+                            "recall": 0.5,
+                            "f1": 0.5,
+                            "kendall_tau": 0.0,
+                            "kendall_tau_norm": 0.5,
+                            "system_count": 1,
+                            "matched": 1,
+                        },
+                    },
+                    "dual": {
+                        "active": True,
+                        "items": [],
+                        "metrics": {
+                            "precision": 0.0,
+                            "recall": 0.0,
+                            "f1": 0.0,
+                            "kendall_tau": 0.0,
+                            "kendall_tau_norm": 0.0,
+                            "system_count": 0,
+                            "matched": 0,
+                        },
+                    },
+                    "hybrid": {"active": False, "items": [], "sources": [], "inactive": True},
+                }
+            }
+        ]
+
+        summary = _aggregate(records)
+
+        self.assertTrue(summary["graph_vs_legacy_passed"])
+        self.assertFalse(summary["dual_vs_legacy_passed"])
+        self.assertIn("dual_f1_below_legacy", summary["gate_failures"])
+
     def test_record_diagnostics_reports_topic_drift_duplicate_labels_empty_graph_and_new_counters(self) -> None:
         record = {
             "reference": ["Alpha build", "Beta launch"],

@@ -101,6 +101,22 @@ def build_candidate_lists(
             if aggregation_candidates:
                 candidate_lists.append(aggregation_candidates)
         if plan.query_type == "event_ordering":
+            graph_candidates = service._event_ordering_graph_selector_candidates(
+                query,
+                scope,
+                limit=max(per_source_limit * 3, per_source_limit + 12),
+                include_session=include_session,
+            )
+            if graph_candidates:
+                candidate_lists.append(graph_candidates)
+            coverage_candidates = service._event_ordering_coverage_candidates(
+                query,
+                scope,
+                limit=max(per_source_limit * 3, per_source_limit + 12),
+                include_session=include_session,
+            )
+            if coverage_candidates:
+                candidate_lists.append(coverage_candidates)
             episode_recall = service._event_ordering_episode_recall_candidates(
                 query,
                 scope,
@@ -110,14 +126,6 @@ def build_candidate_lists(
             )
             if episode_recall:
                 candidate_lists.append(episode_recall)
-            candidate_lists.append(
-                service._event_ordering_graph_selector_candidates(
-                    query,
-                    scope,
-                    limit=max(per_source_limit * 3, per_source_limit + 12),
-                    include_session=include_session,
-                )
-            )
             candidate_lists.append(
                 service._event_ordering_timeline_candidates(
                     query,

@@ -536,6 +536,44 @@ class FusionMemoryTests(unittest.TestCase):
 
         self.assertEqual([candidate.id for candidate in filtered], ["anchor", "episode"])
 
+    def test_event_ordering_post_preservation_topic_filter_reports_dropped_graph_anchor(self) -> None:
+        service = MemoryService()
+        query = "Can you list the order in which I brought up different sneaker shopping experiences?"
+        plan = QueryPlan(query=query, query_type="event_ordering", entities=[], time_constraints=[])
+        selected = [
+            Candidate(
+                id="anchor",
+                type="span",
+                text="I compared sneaker styles for the festival.",
+                source="event_ordering_coverage",
+                scores={},
+                source_span_ids=["anchor"],
+                metadata={"topic_group": "sneakers", "timeline_role": "user_aspect_anchor", "speaker": "user"},
+            ),
+            Candidate(
+                id="graph-off-topic",
+                type="event",
+                text="track with my savings goals",
+                source="event_ordering_persisted_graph",
+                scores={},
+                source_span_ids=["savings"],
+                metadata={"must_preserve_reason": ["graph_chronology_anchor"], "evidence_role": "answer"},
+            ),
+        ]
+
+        filtered, dropped = service._apply_event_ordering_post_preservation_topic_scope_filter(
+            query,
+            plan,
+            selected,
+            selected,
+            limit=2,
+        )
+
+        self.assertEqual([candidate.id for candidate in filtered], ["anchor"])
+        self.assertEqual(dropped[0]["candidate_id"], "graph-off-topic")
+        self.assertEqual(dropped[0]["reason"], "topic_scope_filter")
+        self.assertEqual(dropped[0]["must_preserve_reasons"], ["graph_chronology_anchor"])
+
     def test_event_ordering_preserve_episode_recall_uses_time_bucket_coverage(self) -> None:
         service = MemoryService()
         query = "Can you list the order in which I brought up different strategies and support options for managing my workload throughout our conversations in order? Mention ONLY and ONLY five items."

@@ -6,7 +6,8 @@ from datetime import datetime, timezone
 from types import MethodType
 
 from fusion_memory import MemoryService, Scope
-from fusion_memory.core.models import EvidencePack, QueryPlan, SearchResult
+from fusion_memory.api.service import _event_ordering_legacy_candidate
+from fusion_memory.core.models import Candidate, EvidencePack, QueryPlan, SearchResult
 from fusion_memory.retrieval.rule_audit import build_rule_audit
 from fusion_memory.retrieval.rule_registry import (
     RuleDefinition,
@@ -419,3 +420,40 @@ class RuleInstrumentationTests(unittest.TestCase):
             [hit.get("rule_id") for hit in rule_hits or []],
             ["current_value.stale_history_marker", "event_ordering.legacy_rescue"],
         )
+
+    def test_event_ordering_legacy_candidate_predicate_does_not_record_rule_hit(self) -> None:
+        candidate = Candidate(
+            id="legacy",
+            type="span",
+            text="I configured deployment.",
+            source="event_ordering_timeline",
+            scores={},
+            source_span_ids=["span-1"],
+            metadata={},
+        )
+
+        with collect_rule_hits() as collector:
+            self.assertTrue(_event_ordering_legacy_candidate(candidate))
+            self.assertEqual(collector.drain(), [])
+
+    def test_event_ordering_shadow_coverage_records_legacy_rescue_once_for_fallback(self) -> None:
+        memory = MemoryService()
+        candidate = Candidate(
+            id="legacy",
+            type="span",
+            text="I configured deployment.",
+            source="event_ordering_timeline",
+            scores={},
+            source_span_ids=["span-1"],
+            metadata={},
+        )
+        try:
+            with collect_rule_hits() as collector:
+                coverage = memory._event_ordering_shadow_coverage([[candidate]], [candidate])
+                hits = [hit for hit in collector.drain() if hit.rule_id == "event_ordering.legacy_rescue"]
+
+            self.assertEqual(coverage["event_ordering_shadow"]["selected_driver"], "legacy_fallback")
+            self.assertEqual(len(hits), 1)
+            self.assertEqual(hits[0].contributed_candidate_id, "legacy")
+        finally:
+            memory.close()

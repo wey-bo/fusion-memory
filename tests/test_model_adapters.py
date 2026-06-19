@@ -298,6 +298,7 @@ class ModelAdapterTests(unittest.TestCase):
                 "FUSION_MEMORY_RERANKER_PROVIDER": "http",
                 "FUSION_MEMORY_RERANKER_ENDPOINT": server.url("/rerank"),
                 "FUSION_MEMORY_RERANKER_MODEL": "env-rerank",
+                "FUSION_MEMORY_EXTRACTOR_MODE": "async",
                 "FUSION_MEMORY_EXTRACTOR_ENDPOINT": server.url("/llm"),
                 "FUSION_MEMORY_EXTRACTOR_MODEL": "env-extractor",
             }
@@ -305,6 +306,8 @@ class ModelAdapterTests(unittest.TestCase):
                 memory = memory_service_from_env(":memory:")
                 scope = Scope(workspace_id="w", user_id="u", agent_id="a")
                 memory.add("Please remember reports should use PostgreSQL.", scope, datetime(2026, 6, 1, tzinfo=timezone.utc))
+                self.assertFalse(any(request["path"] == "/llm" for request in server.requests))
+                memory.process_background_tasks(scope, limit=5)
                 result = memory.search("PostgreSQL reports", scope, options={"mode": "balanced"})
                 memory.close()
 
@@ -317,9 +320,10 @@ class ModelAdapterTests(unittest.TestCase):
             self.assertTrue(any(request["json"].get("model") == "env-rerank" for request in server.requests))
             self.assertTrue(any(request["json"].get("model") == "env-extractor" for request in server.requests))
 
-    def test_runtime_config_accepts_extractor_base_url(self) -> None:
+    def test_runtime_config_ignores_sync_extractor_mode(self) -> None:
         with FakeModelServer() as server:
             env = {
+                "FUSION_MEMORY_EXTRACTOR_MODE": "sync",
                 "FUSION_MEMORY_EXTRACTOR_BASE_URL": server.url(""),
                 "FUSION_MEMORY_EXTRACTOR_MODEL": "env-extractor",
             }
@@ -329,7 +333,7 @@ class ModelAdapterTests(unittest.TestCase):
                 memory.add("Please remember reports should use PostgreSQL.", scope, datetime(2026, 6, 1, tzinfo=timezone.utc))
                 memory.close()
 
-            self.assertTrue(any(request["path"] == "/chat/completions" for request in server.requests))
+            self.assertFalse(any(request["path"] == "/chat/completions" for request in server.requests))
 
     def test_eval_model_builder_wires_optional_llm_aggregation(self) -> None:
         args = SimpleNamespace(
