@@ -25,9 +25,9 @@ class RuleHit:
     text_hash: str
     contributed_candidate_id: str | None
     stage: str
+    metadata: dict[str, object] = field(default_factory=dict)
     contributed: bool | None = None
     impact: str = "observed"
-    metadata: dict[str, object] = field(default_factory=dict)
 
 
 _RULE_REGISTRY: dict[str, RuleDefinition] = {}
@@ -59,9 +59,10 @@ def record_rule_hit(
     text: str,
     stage: str,
     contributed_candidate_id: str | None = None,
+    metadata: dict[str, object] | None = None,
+    *,
     contributed: bool | None = None,
     impact: str = "observed",
-    metadata: dict[str, object] | None = None,
 ) -> RuleHit:
     hit = RuleHit(
         rule_id=rule_id,
@@ -69,9 +70,9 @@ def record_rule_hit(
         text_hash=sha1(text.encode("utf-8")).hexdigest()[:12],
         contributed_candidate_id=contributed_candidate_id,
         stage=stage,
+        metadata=_sanitize_metadata(metadata),
         contributed=contributed,
         impact=impact,
-        metadata=_sanitize_metadata(metadata),
     )
     _current_hits().append(hit)
     return hit

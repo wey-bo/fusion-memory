@@ -10,6 +10,7 @@ from fusion_memory.core.models import EvidencePack, QueryPlan, SearchResult
 from fusion_memory.retrieval.rule_audit import build_rule_audit
 from fusion_memory.retrieval.rule_registry import (
     RuleDefinition,
+    RuleHit,
     collect_rule_hits,
     drain_rule_hits,
     record_rule_hit,
@@ -113,6 +114,56 @@ class RuleRegistryTests(unittest.TestCase):
         self.assertRegex(str(hit.metadata["raw_text"]), r"^[0-9a-f]{12}$")
         self.assertRegex(str(hit.metadata["span_message"]), r"^[0-9a-f]{12}$")
         self.assertNotIn("I initially used SQLite.", hit.text_hash)
+
+    def test_record_rule_hit_preserves_positional_metadata(self) -> None:
+        metadata = {"decision": "drop_stale_history", "source": "candidate_1"}
+
+        hit = record_rule_hit(
+            "current_value.stale_history_marker",
+            "What is current?",
+            "I initially used SQLite.",
+            "evidence_pack_filter",
+            "span_1",
+            metadata,
+        )
+
+        self.assertEqual(hit.contributed_candidate_id, "span_1")
+        self.assertEqual(hit.metadata, metadata)
+        self.assertIsNone(hit.contributed)
+        self.assertEqual(hit.impact, "observed")
+
+    def test_rule_hit_positional_constructor_preserves_metadata_and_defaults(self) -> None:
+        metadata = {"decision": "selected", "source": "candidate_1"}
+
+        hit = RuleHit(
+            "current_value.stale_history_marker",
+            "What is current?",
+            "deadbeefcafe",
+            "span_1",
+            "evidence_pack_filter",
+            metadata,
+        )
+
+        self.assertEqual(hit.metadata, metadata)
+        self.assertIsNone(hit.contributed)
+        self.assertEqual(hit.impact, "observed")
+
+    def test_record_rule_hit_accepts_keyword_contributed_and_impact(self) -> None:
+        hit = record_rule_hit(
+            "current_value.stale_history_marker",
+            "What is current?",
+            "I initially used SQLite.",
+            "evidence_pack_filter",
+            contributed_candidate_id="span_1",
+            metadata={"decision": "selected"},
+            contributed=True,
+            impact="selected",
+        )
+
+        self.assertEqual(hit.contributed_candidate_id, "span_1")
+        self.assertTrue(hit.contributed)
+        self.assertEqual(hit.impact, "selected")
+        self.assertEqual(hit.metadata, {"decision": "selected"})
 
     def test_collect_rule_hits_isolates_and_clears_on_exception(self) -> None:
         record_rule_hit(
