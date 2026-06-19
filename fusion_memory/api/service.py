@@ -457,6 +457,14 @@ class MemoryService:
         }
         if plan.query_type == "event_ordering":
             coverage.update(self._event_ordering_shadow_coverage(candidate_lists, selected))
+            if getattr(self.retrieval_flags, "dual_event_ordering_shadow", False):
+                coverage["event_ordering_dual_shadow"] = self._event_ordering_dual_shadow_coverage(
+                    query,
+                    scope,
+                    plan,
+                    limit,
+                    include_session,
+                )
         if intent_telemetry:
             coverage["query_intent_telemetry"] = intent_telemetry
         trace = {
@@ -1571,6 +1579,59 @@ class MemoryService:
         if graph_candidates:
             out["event_ordering_graph"] = graph_payload
         return out
+
+    def _event_ordering_dual_shadow_coverage(
+        self,
+        query: str,
+        scope: Scope,
+        plan: Any,
+        limit: int,
+        include_session: bool,
+    ) -> dict[str, Any]:
+        graph_candidates = [
+            candidate
+            for candidate in self._event_ordering_graph_selector_candidates(query, scope, limit=limit, include_session=include_session)
+            if candidate.source == "event_ordering_persisted_graph"
+        ]
+        legacy_items, legacy_sources = self._event_ordering_legacy_recall_for_shadow(query, scope, plan, limit, include_session)
+        return {
+            "selected_driver": "dual_shadow",
+            "graph_candidate_count": len(graph_candidates),
+            "legacy_candidate_count": len(legacy_items),
+            "candidate_count": min(limit, len(legacy_items) + len(graph_candidates)),
+            "sources": list(dict.fromkeys([candidate.source for candidate in graph_candidates] + legacy_sources)),
+            "production_selector": getattr(self.retrieval_flags, "production_selector", "legacy"),
+        }
+
+    def _event_ordering_legacy_recall_for_shadow(
+        self,
+        query: str,
+        scope: Scope,
+        plan: Any,
+        limit: int,
+        include_session: bool,
+    ) -> tuple[list[str], list[str]]:
+        candidates: list[Candidate] = []
+        candidates.extend(
+            self._event_ordering_episode_recall_candidates(
+                query,
+                scope,
+                plan,
+                limit=max(limit * 4, limit + 24),
+                include_session=include_session,
+            )
+        )
+        candidates.extend(
+            self._event_ordering_timeline_candidates(
+                query,
+                plan,
+                scope,
+                limit=max(limit * 3, limit + 12),
+                include_session=include_session,
+            )
+        )
+        ordered = _dedupe_event_ordering_candidates_for_shadow(candidates)
+        return [candidate.text for candidate in ordered[:limit] if candidate.text], [candidate.source for candidate in ordered[:limit]]
 
     def _event_ordering_timeline_candidates(
         self,
@@ -3870,6 +3931,18 @@ def _event_ordering_candidate_path_key(candidate: Candidate) -> tuple[str, str, 
         str(candidate.source or ""),
         bool(candidate.metadata.get("graph_fallback")),
     )
+
+
+def _dedupe_event_ordering_candidates_for_shadow(candidates: list[Candidate]) -> list[Candidate]:
+    out: list[Candidate] = []
+    seen: set[tuple[str, str]] = set()
+    for candidate in candidates:
+        key = (str(candidate.id), " ".join(re.findall(r"[a-zA-Z0-9]+", candidate.text.lower())))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(candidate)
+    return out
 
 
 def _stale_current_value_candidate_text(text: str) -> bool:
