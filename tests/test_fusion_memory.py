@@ -675,6 +675,22 @@ class FusionMemoryTests(unittest.TestCase):
         result = memory.search("Qdrant Atlas", scope_b)
         self.assertEqual(result.candidates, [])
 
+    def test_search_trace_contains_retrieval_pipeline_sections(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="ws-trace", user_id="u", agent_id="a")
+        try:
+            memory.add({"role": "user", "content": "I now prefer PostgreSQL for the memory database."}, scope)
+            result = memory.search("What database do I currently prefer?", scope)
+            trace = memory.store.get_trace(result.trace_id, scope)
+
+            retrieval_trace = trace["retrieval_trace"]
+            self.assertIn("query_understanding", retrieval_trace)
+            self.assertIn("candidate_recall", retrieval_trace)
+            self.assertIn("candidate_fusion", retrieval_trace)
+            self.assertIn("evidence_output", retrieval_trace)
+        finally:
+            memory.close()
+
     def test_preference_update_writes_source_fact_relation_and_current_view(self) -> None:
         memory = MemoryService()
         scope = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s")
