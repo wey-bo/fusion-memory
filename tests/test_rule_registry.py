@@ -7,6 +7,7 @@ from types import MethodType
 
 from fusion_memory import MemoryService, Scope
 from fusion_memory.core.models import EvidencePack, QueryPlan, SearchResult
+from fusion_memory.retrieval.rule_audit import build_rule_audit
 from fusion_memory.retrieval.rule_registry import (
     RuleDefinition,
     collect_rule_hits,
@@ -151,6 +152,37 @@ class RuleRegistryTests(unittest.TestCase):
             self.assertEqual([hit.rule_id for hit in outer.drain()], ["outer.one", "outer.two"])
 
         self.assertEqual(drain_rule_hits(), [])
+
+    def test_rule_audit_reports_hits_contributions_and_zero_hit_rules(self) -> None:
+        rules = [
+            RuleDefinition(
+                rule_id="event.order",
+                module="m",
+                purpose="event order",
+                category="event_ordering",
+                ability="event_ordering",
+            ),
+            RuleDefinition(
+                rule_id="zh.recall",
+                module="m",
+                purpose="Chinese recall",
+                category="retrieval",
+                ability="chinese_recall",
+            ),
+        ]
+        hits = [
+            {"rule_id": "event.order", "contributed": True, "impact": "selected"},
+            {"rule_id": "event.order", "contributed": False, "impact": "filtered"},
+        ]
+
+        audit = build_rule_audit(rules, hits)
+
+        self.assertEqual(audit[0]["rule_id"], "event.order")
+        self.assertEqual(audit[0]["hit_count"], 2)
+        self.assertEqual(audit[0]["contribution_count"], 1)
+        self.assertEqual(audit[0]["negative_impact_count"], 1)
+        self.assertEqual(audit[1]["rule_id"], "zh.recall")
+        self.assertEqual(audit[1]["hit_count"], 0)
 
 
 class RuleInstrumentationTests(unittest.TestCase):

@@ -15,6 +15,7 @@ class RuleDefinition:
     category: str
     pattern: str | None = None
     owner: str = "retrieval"
+    ability: str = "general"
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,8 @@ class RuleHit:
     text_hash: str
     contributed_candidate_id: str | None
     stage: str
+    contributed: bool | None = None
+    impact: str = "observed"
     metadata: dict[str, object] = field(default_factory=dict)
 
 
@@ -56,6 +59,8 @@ def record_rule_hit(
     text: str,
     stage: str,
     contributed_candidate_id: str | None = None,
+    contributed: bool | None = None,
+    impact: str = "observed",
     metadata: dict[str, object] | None = None,
 ) -> RuleHit:
     hit = RuleHit(
@@ -64,6 +69,8 @@ def record_rule_hit(
         text_hash=sha1(text.encode("utf-8")).hexdigest()[:12],
         contributed_candidate_id=contributed_candidate_id,
         stage=stage,
+        contributed=contributed,
+        impact=impact,
         metadata=_sanitize_metadata(metadata),
     )
     _current_hits().append(hit)
