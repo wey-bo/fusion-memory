@@ -4,7 +4,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from fusion_memory.core.runtime_config import build_runtime_retrieval_flags
+from fusion_memory.core.runtime_config import build_runtime_retrieval_flags, memory_service_from_env
 
 
 class RuntimeRetrievalFlagTests(unittest.TestCase):
@@ -33,3 +33,33 @@ class RuntimeRetrievalFlagTests(unittest.TestCase):
         with patch.dict(os.environ, {"FUSION_MEMORY_EVENT_ORDERING_SELECTOR": "graph"}, clear=True):
             with self.assertRaisesRegex(ValueError, "unsupported event ordering selector"):
                 build_runtime_retrieval_flags()
+
+    def test_omitted_query_intent_mode_keeps_auto_mode_on_memory_service(self) -> None:
+        captured_kwargs: dict[str, object] = {}
+
+        class DummyMemoryService:
+            def __init__(self, *args, **kwargs) -> None:
+                captured_kwargs.update(kwargs)
+
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "fusion_memory.core.runtime_config.MemoryService", DummyMemoryService
+        ):
+            memory_service_from_env()
+
+        self.assertEqual(captured_kwargs["query_intent_refiner_mode"], "auto")
+
+    def test_memory_service_from_env_falls_back_for_invalid_selector(self) -> None:
+        captured_kwargs: dict[str, object] = {}
+
+        class DummyMemoryService:
+            def __init__(self, *args, **kwargs) -> None:
+                captured_kwargs.update(kwargs)
+
+        with patch.dict(os.environ, {"FUSION_MEMORY_EVENT_ORDERING_SELECTOR": "graph"}, clear=True), patch(
+            "fusion_memory.core.runtime_config.MemoryService", DummyMemoryService
+        ):
+            memory_service_from_env()
+
+        retrieval_flags = captured_kwargs["retrieval_flags"]
+        self.assertFalse(getattr(retrieval_flags, "dual_event_ordering_shadow", True))
+        self.assertEqual(getattr(retrieval_flags, "production_selector", "graph"), "legacy")

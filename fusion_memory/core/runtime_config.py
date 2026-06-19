@@ -41,8 +41,8 @@ def memory_service_from_env(
         async_extractor=_build_async_extractor(),
         query_intent_refiner=_build_query_intent_refiner(),
         query_intent_refiner_min_confidence=_float_env("FUSION_MEMORY_QUERY_INTENT_MIN_CONFIDENCE", 0.70),
-        query_intent_refiner_mode=os.getenv("FUSION_MEMORY_QUERY_INTENT_MODE", "off"),
-        retrieval_flags=build_runtime_retrieval_flags(),
+        query_intent_refiner_mode=os.getenv("FUSION_MEMORY_QUERY_INTENT_MODE", "auto"),
+        retrieval_flags=_build_runtime_retrieval_flags_for_service(),
     )
 
 
@@ -156,7 +156,7 @@ def _build_async_extractor() -> Any | None:
 
 
 def _build_query_intent_refiner() -> Any | None:
-    mode = os.getenv("FUSION_MEMORY_QUERY_INTENT_MODE", "off").strip().lower()
+    mode = os.getenv("FUSION_MEMORY_QUERY_INTENT_MODE", "auto").strip().lower()
     if mode not in {"auto", "always"}:
         return None
     endpoint = _optional_env("FUSION_MEMORY_QUERY_INTENT_ENDPOINT") or _endpoint_from_base_url(
@@ -175,6 +175,13 @@ def _build_query_intent_refiner() -> Any | None:
         retry_max_backoff_seconds=_float_env("FUSION_MEMORY_QUERY_INTENT_RETRY_MAX_BACKOFF_SECONDS", 30.0),
         min_interval_seconds=_float_env("FUSION_MEMORY_QUERY_INTENT_MIN_INTERVAL_SECONDS", 0.0),
     )
+
+
+def _build_runtime_retrieval_flags_for_service() -> RuntimeRetrievalFlags:
+    try:
+        return build_runtime_retrieval_flags()
+    except ValueError:
+        return RuntimeRetrievalFlags()
 
 
 def _model_kwargs() -> dict[str, Any]:
