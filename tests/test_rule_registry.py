@@ -263,6 +263,24 @@ class RuleRegistryTests(unittest.TestCase):
         self.assertEqual(zero_hit["cleanup_action"], "delete_no_hits")
         self.assertTrue(zero_hit["safe_to_delete"])
 
+    def test_registered_rule_audit_keeps_zero_hit_legacy_shadow_rules(self) -> None:
+        rules = [
+            RuleDefinition(
+                rule_id="event_ordering.legacy.tie_breaker",
+                module="m",
+                purpose="legacy event ordering shadow",
+                category="event_ordering",
+                ability="event_ordering",
+            )
+        ]
+
+        audit = build_rule_audit(rules, [])
+        legacy = audit[0]
+
+        self.assertFalse(legacy["candidate_for_deletion"])
+        self.assertEqual(legacy["cleanup_action"], "keep_shadow")
+        self.assertFalse(legacy["safe_to_delete"])
+
 
 class RuleInstrumentationTests(unittest.TestCase):
     def setUp(self) -> None:

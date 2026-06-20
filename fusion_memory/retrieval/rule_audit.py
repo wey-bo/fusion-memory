@@ -75,7 +75,7 @@ def build_rule_audit(
                 "hit_count": len(rule_hits),
                 "contribution_count": contribution_count,
                 "negative_impact_count": negative_impact_count,
-                "candidate_for_deletion": len(rule_hits) == 0,
+                "candidate_for_deletion": safe_to_delete,
                 "duplicate_of": duplicate_of,
                 "cleanup_phase": cleanup_phase,
                 "cleanup_action": cleanup_action,
