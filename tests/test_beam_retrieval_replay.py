@@ -124,6 +124,52 @@ class BeamRetrievalReplayTests(unittest.TestCase):
         )
         self.assertEqual(report["records"][0]["pipeline_trace"], trace)
 
+    def test_run_replay_keeps_structural_selected_trace_without_text(self) -> None:
+        fake_query = SimpleNamespace(id="q1", query="中文原始查询不应落盘", category="knowledge_update")
+        fake_pack = SimpleNamespace(
+            source_spans=[{"span_id": "s1"}],
+            coverage={"coverage_insufficient": False},
+            debug_trace=[
+                {
+                    "id": "cand_1",
+                    "type": "span",
+                    "source": "l0_raw",
+                    "scores": {"utility_score": 0.75},
+                    "source_span_ids": ["span_1"],
+                    "text": "中文原始候选内容不应落盘",
+                }
+            ],
+        )
+        service = MagicMock()
+        service.answer_context.return_value = fake_pack
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(replay, "_load_queries", return_value=[fake_query]):
+            out = Path(tmp) / "replay.json"
+            replay.run_replay(
+                service,
+                base_scope=replay.Scope(workspace_id="w", user_id="u", agent_id="a"),
+                categories={"current_value"},
+                output_path=out,
+                query_limit=None,
+            )
+            payload = json.loads(out.read_text(encoding="utf-8"))
+
+        trace = payload["records"][0]["pipeline_trace"]
+        self.assertEqual(
+            trace,
+            [
+                {
+                    "id": "cand_1",
+                    "type": "span",
+                    "source": "l0_raw",
+                    "scores": {"utility_score": 0.75},
+                    "source_span_ids": ["span_1"],
+                }
+            ],
+        )
+        self.assertNotIn("中文原始查询不应落盘", json.dumps(payload, ensure_ascii=False))
+        self.assertNotIn("中文原始候选内容不应落盘", json.dumps(payload, ensure_ascii=False))
+
     def test_run_replay_does_not_persist_raw_query_text(self) -> None:
         fake_query = SimpleNamespace(id="q1", query="What is my current IDE?", category="knowledge_update")
         fake_pack = SimpleNamespace(
@@ -167,6 +213,7 @@ class BeamRetrievalReplayTests(unittest.TestCase):
                     "message_content": "assistant prompt text",
                     "source_span": {"text": "span content"},
                     "safe": {"category": "current_value", "count": 1},
+                    "neutral": {"note": "I use VS Code"},
                     "text_hash": "def456",
                 },
             }
@@ -200,7 +247,12 @@ class BeamRetrievalReplayTests(unittest.TestCase):
         self.assertNotIn("query", hit)
         self.assertEqual(
             hit["metadata"],
-            {"decision": "kept", "safe": {"category": "current_value", "count": 1}, "text_hash": "def456"},
+            {
+                "decision": "kept",
+                "safe": {"category": "current_value", "count": 1},
+                "neutral": {"note": {"hash": "0a39a96ea3d1"}},
+                "text_hash": "def456",
+            },
         )
         self.assertNotIn("What is my current IDE?", json.dumps(payload, ensure_ascii=False))
         self.assertNotIn("I use VS Code.", json.dumps(payload, ensure_ascii=False))

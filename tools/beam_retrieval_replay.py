@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+from hashlib import sha1
 from pathlib import Path
 from time import perf_counter
 from types import SimpleNamespace
@@ -254,11 +255,19 @@ def _sanitize_pipeline_trace(value: Any) -> list[dict[str, Any]]:
 
 def _sanitize_pipeline_trace_entry(entry: dict[str, Any]) -> dict[str, Any]:
     sanitized: dict[str, Any] = {}
-    for key in ("layer", "query_type", "mode"):
+    for key in ("layer", "query_type", "mode", "id", "type", "source"):
         if key in entry:
-            value = _sanitize_stable_string(entry[key])
+            value = _sanitize_identifier_string(entry[key])
             if value is not None:
                 sanitized[key] = value
+    if "scores" in entry:
+        scores = _sanitize_count_mapping(entry["scores"])
+        if scores:
+            sanitized["scores"] = scores
+    if "source_span_ids" in entry:
+        source_span_ids = _sanitize_identifier_list(entry["source_span_ids"])
+        if source_span_ids:
+            sanitized["source_span_ids"] = source_span_ids
     if "source_counts" in entry:
         source_counts = _sanitize_count_mapping(entry["source_counts"])
         if source_counts:
@@ -288,9 +297,12 @@ def _sanitize_count_mapping(value: Any) -> dict[str, int | float | bool]:
         key_text = str(key)
         if _metadata_key_contains_raw_text(key_text):
             continue
+        safe_key = _sanitize_identifier_string(key_text)
+        if safe_key is None:
+            continue
         count = _sanitize_count_value(item)
         if count is not None:
-            sanitized[key_text] = count
+            sanitized[safe_key] = count
     return sanitized
 
 
@@ -334,7 +346,7 @@ def _sanitize_trace_scalar(value: Any) -> Any:
         return value
     if isinstance(value, int | float):
         return value
-    return _sanitize_stable_string(value)
+    return _sanitize_identifier_string(value)
 
 
 def _sanitize_count_value(value: Any) -> int | float | bool | None:
@@ -345,12 +357,27 @@ def _sanitize_count_value(value: Any) -> int | float | bool | None:
     return None
 
 
-def _sanitize_stable_string(value: Any) -> str | None:
+def _sanitize_identifier_string(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
     if any(character.isspace() for character in value):
         return None
+    if any("\u4e00" <= character <= "\u9fff" for character in value):
+        return None
+    if not all(character.isalnum() or character in "._:+/@=-" for character in value):
+        return None
     return value
+
+
+def _sanitize_identifier_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    sanitized: list[str] = []
+    for item in value:
+        identifier = _sanitize_identifier_string(item)
+        if identifier is not None:
+            sanitized.append(identifier)
+    return sanitized
 
 
 def _object_dict(value: Any) -> dict[str, Any]:
@@ -368,7 +395,9 @@ def _sanitize_metadata(value: Any) -> dict[str, Any]:
         key_text = str(key)
         if _metadata_key_contains_raw_text(key_text):
             continue
-        sanitized[key_text] = _sanitize_metadata_value(item)
+        sanitized_value = _sanitize_metadata_value(item)
+        if sanitized_value is not None:
+            sanitized[key_text] = sanitized_value
     return sanitized
 
 
@@ -376,10 +405,17 @@ def _sanitize_metadata_value(value: Any) -> Any:
     if isinstance(value, dict):
         return _sanitize_metadata(value)
     if isinstance(value, list):
-        return [_sanitize_metadata_value(item) for item in value]
+        return [_sanitize_metadata_value(item) for item in value if _sanitize_metadata_value(item) is not None]
     if isinstance(value, tuple):
-        return [_sanitize_metadata_value(item) for item in value]
-    return value
+        return [_sanitize_metadata_value(item) for item in value if _sanitize_metadata_value(item) is not None]
+    if isinstance(value, bool | int | float):
+        return value
+    if isinstance(value, str):
+        identifier = _sanitize_identifier_string(value)
+        if identifier is not None and len(value) <= 64:
+            return identifier
+        return {"hash": sha1(value.encode("utf-8")).hexdigest()[:12]}
+    return None
 
 
 def _metadata_key_contains_raw_text(key: str) -> bool:
