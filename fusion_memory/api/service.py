@@ -50,6 +50,7 @@ from fusion_memory.retrieval.aggregation_keys import (
     vendor_tool_aggregation_keys,
 )
 from fusion_memory.retrieval.mmr import mmr
+from fusion_memory.retrieval.pipeline import build_pipeline_record
 from fusion_memory.retrieval.query_planner import QueryPlanner
 from fusion_memory.retrieval.raw_evidence_quota import RawEvidenceQuota
 from fusion_memory.retrieval.preservation import annotate_runtime_preservation_candidates, must_preserve_reasons, preserve_required_candidates
@@ -57,7 +58,6 @@ from fusion_memory.retrieval.reranker import LexicalCrossEncoderReranker, Rerank
 from fusion_memory.retrieval.rule_registry import RuleDefinition, collect_rule_hits, record_rule_hit, register_rule
 from fusion_memory.retrieval.rrf import reciprocal_rank_fusion
 from fusion_memory.retrieval.scoring import score_candidate
-from fusion_memory.retrieval.retrieval_trace import RetrievalTraceBuilder
 from fusion_memory.retrieval.structured_annotations import select_event_ordering_timeline
 from fusion_memory.retrieval.utility_model import LogisticUtilityScorer, UtilityTrainingReport
 from fusion_memory.retrieval.utility_scorer import utility_example
@@ -364,6 +364,16 @@ class MemoryService:
         precomputed_plan = options.get("_plan")
         plan = precomputed_plan or self.planner.plan(query, query_type_hint=options.get("query_type_hint"))
         intent_telemetry = options.get("_intent_telemetry") if precomputed_plan else self.planner.last_intent_telemetry
+        query_language = "zh" if re.search(r"[\u4e00-\u9fff]", query) else "en"
+        query_features = [
+            feature
+            for feature, enabled in {
+                "current_value": bool(getattr(plan, "current_value", False)),
+                "multi_condition": bool(getattr(plan, "constraints", None)),
+                "temporal": plan.query_type in {"temporal_lookup", "event_ordering"},
+            }.items()
+            if enabled
+        ]
         candidate_lists = self._candidate_lists(
             query,
             scope,
@@ -380,26 +390,6 @@ class MemoryService:
         scored_again.sort(key=lambda candidate: candidate.scores.get("utility_score", 0.0), reverse=True)
         mode = options.get("mode", "fast")
         limit = options.get("limit", self.config.retrieval_output_n)
-        retrieval_trace = RetrievalTraceBuilder(query_type=plan.query_type, mode=str(mode))
-        retrieval_trace.query_understanding(
-            language="zh" if re.search(r"[\u4e00-\u9fff]", query) else "en",
-            intent=plan.query_type,
-            features=[
-                feature
-                for feature, enabled in {
-                    "current_value": bool(getattr(plan, "current_value", False)),
-                    "multi_condition": bool(getattr(plan, "constraints", None)),
-                    "temporal": plan.query_type in {"temporal_lookup", "event_ordering"},
-                }.items()
-                if enabled
-            ],
-        )
-        retrieval_trace.candidate_recall(
-            source_counts={
-                items[0].source if items else f"source_{index}": len(items)
-                for index, items in enumerate(candidate_lists)
-            }
-        )
         rerank_top_n = options.get("rerank_top_n") or (
             self.config.balanced_mode_rerank_top_n
             if mode == "balanced"
@@ -497,14 +487,20 @@ class MemoryService:
                 )
         if intent_telemetry:
             coverage["query_intent_telemetry"] = intent_telemetry
-        retrieval_trace.candidate_fusion(
-            selected_sources=list(dict.fromkeys(candidate.source for candidate in selected)),
+        pipeline_record = build_pipeline_record(
+            plan.query_type,
+            str(mode),
+            language=query_language,
+            intent=plan.query_type,
+            features=query_features,
+            recalled=[candidate for items in candidate_lists for candidate in items],
+            selected=selected,
             dropped_count=len(dropped_high_signal),
-        )
-        retrieval_trace.evidence_output(
             source_span_count=len(quota_result.selected_span_ids),
             coverage_insufficient=quota_result.coverage_insufficient,
         )
+        pipeline_trace = pipeline_record.to_dict()
+        coverage["pipeline_trace"] = pipeline_trace
         trace = {
             "operation": "search",
             "query": query,
@@ -512,7 +508,8 @@ class MemoryService:
             "config": self.config.snapshot(),
             "candidate_counts": [len(items) for items in candidate_lists],
             "coverage": coverage,
-            "retrieval_trace": retrieval_trace.to_dict(),
+            "pipeline_trace": pipeline_trace,
+            "retrieval_trace": pipeline_trace,
             "mode": mode,
             "enabled_sources": options.get("enabled_sources"),
             "allow_cross_session": allow_cross_session,
