@@ -6,6 +6,23 @@ from fusion_memory.core.text import tokenize
 from fusion_memory.retrieval.taxonomy import taxonomy_entry_for_text
 
 
+STOPWORDS = {
+    "a",
+    "after",
+    "an",
+    "and",
+    "first",
+    "i",
+    "implemented",
+    "next",
+    "later",
+    "set",
+    "the",
+    "then",
+    "up",
+}
+
+
 @dataclass(frozen=True)
 class TopicClusterDecision:
     label: str
@@ -29,10 +46,11 @@ def cluster_topic_label(
             aliases=tuple(entry.aliases),
         )
 
-    tokens = {token for token in tokenize(text) if len(token) > 2}
+    tokens = _meaningful_tokens(text)
+    token_set = set(tokens)
     hint_tokens = {token for token in tokenize(session_hint or "") if len(token) > 2}
     previous_tokens = {token for token in tokenize(previous_label or "") if len(token) > 2}
-    if session_hint and (tokens & hint_tokens or tokens & previous_tokens or _is_continuation(text)):
+    if session_hint and (token_set & hint_tokens or token_set & previous_tokens or _is_continuation(text)):
         return TopicClusterDecision(
             label=session_hint,
             confidence=0.74,
@@ -41,7 +59,7 @@ def cluster_topic_label(
         )
     if previous_label and _is_continuation(text):
         return TopicClusterDecision(label=previous_label, confidence=0.62, reasons=("previous_topic",))
-    label = " ".join(list(tokens)[:4]) or "unknown"
+    label = " ".join(tokens[:4]) or "unknown"
     return TopicClusterDecision(label=label, confidence=0.45, reasons=("lexical_fallback",))
 
 
@@ -58,3 +76,16 @@ def cluster_topic_telemetry(decisions: list[TopicClusterDecision]) -> dict[str, 
 def _is_continuation(text: str) -> bool:
     lowered = text.lower()
     return any(marker in lowered for marker in ("then", "next", "later", "after that", "随后", "然后", "接着"))
+
+
+def _meaningful_tokens(text: str) -> list[str]:
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for token in tokenize(text):
+        if token in STOPWORDS or len(token) <= 1:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        tokens.append(token)
+    return tokens

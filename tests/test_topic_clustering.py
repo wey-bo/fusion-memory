@@ -32,6 +32,14 @@ class TopicClusteringTests(unittest.TestCase):
 
         self.assertNotIn("taxonomy", decision.reasons)
 
+    def test_cluster_fallback_label_preserves_token_order(self) -> None:
+        labels = {
+            cluster_topic_label("Then I planned alpha beta gamma delta epsilon.").label
+            for _ in range(20)
+        }
+
+        self.assertEqual(labels, {"planned alpha beta gamma"})
+
     def test_cluster_telemetry_counts_merged_and_taxonomy_decisions(self) -> None:
         decisions = [
             cluster_topic_label("Then I compared median formulas.", session_hint="triangle geometry"),

@@ -241,6 +241,37 @@ class ChronologyNormalizerTests(unittest.TestCase):
         self.assertEqual({topic.canonical_label for topic in batch.topics}, {"triangle geometry"})
         self.assertGreaterEqual(batch.telemetry["topic_cluster"]["merged_by_session_hint"], 1)
 
+    def test_write_batch_topic_cluster_labels_reflect_persisted_topics_after_override(self) -> None:
+        scope = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s")
+        base = datetime(2026, 6, 18, 10, 0, tzinfo=timezone.utc)
+        spans = [
+            EvidenceSpan(
+                "s1",
+                scope,
+                "t1",
+                "user",
+                "turn",
+                "First I studied PostgreSQL indexes and query planning.",
+                stable_hash("final-label-1"),
+                base,
+            ),
+            EvidenceSpan(
+                "s2",
+                scope,
+                "t2",
+                "user",
+                "turn",
+                "After I compared alpha beta gamma delta notes.",
+                stable_hash("final-label-2"),
+                base + timedelta(minutes=5),
+            ),
+        ]
+
+        batch = build_chronology_write_batch(scope, spans, [])
+
+        self.assertEqual({topic.canonical_label for topic in batch.topics}, {"postgresql"})
+        self.assertEqual(batch.telemetry["topic_cluster"]["labels"], ["postgresql"])
+
     def test_build_chronology_batch_extracts_action_object_phase_topic_and_order_edges(self) -> None:
         scope = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s")
         base = datetime(2026, 6, 18, 10, 0, tzinfo=timezone.utc)
