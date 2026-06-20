@@ -69,7 +69,6 @@ def cluster_topic_telemetry(decisions: list[TopicClusterDecision]) -> dict[str, 
         "merged_by_session_hint": sum(1 for decision in decisions if "session_hint" in decision.reasons),
         "taxonomy_count": sum(1 for decision in decisions if "taxonomy" in decision.reasons),
         "fallback_count": sum(1 for decision in decisions if "lexical_fallback" in decision.reasons),
-        "labels": sorted({decision.label for decision in decisions}),
     }
 
 

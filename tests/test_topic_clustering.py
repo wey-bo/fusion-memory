@@ -51,3 +51,4 @@ class TopicClusteringTests(unittest.TestCase):
         self.assertEqual(telemetry["decision_count"], 2)
         self.assertGreaterEqual(telemetry["merged_by_session_hint"], 1)
         self.assertGreaterEqual(telemetry["taxonomy_count"], 1)
+        self.assertNotIn("labels", telemetry)

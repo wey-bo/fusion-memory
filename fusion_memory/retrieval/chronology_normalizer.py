@@ -154,8 +154,6 @@ def build_chronology_write_batch(
         phase.phase_id for phase in phases_by_key.values() if phase.phase_type != "unknown"
     }
     edges = _build_edges(nodes, created_at, recognized_phase_ids)
-    topic_cluster_telemetry = cluster_topic_telemetry(cluster_decisions)
-    topic_cluster_telemetry["labels"] = sorted(topics_by_label)
     telemetry = {
         "input_span_count": len(spans),
         "input_event_count": len(events),
@@ -163,7 +161,7 @@ def build_chronology_write_batch(
         "phase_count": len(phases_by_key),
         "node_count": len(nodes),
         "edge_count": len(edges),
-        "topic_cluster": topic_cluster_telemetry,
+        "topic_cluster": cluster_topic_telemetry(cluster_decisions),
     }
     return ChronologyWriteBatch(
         topics=list(topics_by_label.values()),
