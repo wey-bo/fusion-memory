@@ -19,18 +19,23 @@ class TopicClusteringTests(unittest.TestCase):
 
     def test_cluster_keeps_strong_taxonomy_label(self) -> None:
         decision = cluster_topic_label(
-            "I need the OpenClaw memory adapter to use beginner friendly errors.",
+            "I need PostgreSQL query storage for the memory graph.",
             session_hint="triangle geometry",
             previous_label="triangle geometry",
         )
 
-        self.assertNotEqual(decision.label, "triangle geometry")
+        self.assertEqual(decision.label, "postgresql")
         self.assertIn("taxonomy", decision.reasons)
+
+    def test_cluster_does_not_invent_taxonomy_for_unconfigured_adapter(self) -> None:
+        decision = cluster_topic_label("I need the OpenClaw adapter.")
+
+        self.assertNotIn("taxonomy", decision.reasons)
 
     def test_cluster_telemetry_counts_merged_and_taxonomy_decisions(self) -> None:
         decisions = [
             cluster_topic_label("Then I compared median formulas.", session_hint="triangle geometry"),
-            cluster_topic_label("I need the OpenClaw adapter.", session_hint="triangle geometry"),
+            cluster_topic_label("I need PostgreSQL storage.", session_hint="triangle geometry"),
         ]
 
         telemetry = cluster_topic_telemetry(decisions)

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 
 from fusion_memory.core.text import tokenize
@@ -29,10 +28,6 @@ def cluster_topic_label(
             reasons=("taxonomy",),
             aliases=tuple(entry.aliases),
         )
-
-    named_adapter = _named_adapter_label(text)
-    if named_adapter is not None:
-        return TopicClusterDecision(label=named_adapter, confidence=0.78, reasons=("taxonomy",))
 
     tokens = {token for token in tokenize(text) if len(token) > 2}
     hint_tokens = {token for token in tokenize(session_hint or "") if len(token) > 2}
@@ -63,10 +58,3 @@ def cluster_topic_telemetry(decisions: list[TopicClusterDecision]) -> dict[str, 
 def _is_continuation(text: str) -> bool:
     lowered = text.lower()
     return any(marker in lowered for marker in ("then", "next", "later", "after that", "随后", "然后", "接着"))
-
-
-def _named_adapter_label(text: str) -> str | None:
-    match = re.search(r"\b([A-Z][A-Za-z0-9_-]{2,})\s+(?:memory\s+)?adapter\b", text)
-    if match is None:
-        return None
-    return f"{match.group(1)} adapter".lower()
