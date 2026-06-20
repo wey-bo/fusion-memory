@@ -34,6 +34,13 @@ class AgentInstallerTests(unittest.TestCase):
         self.assertNotIn("Traceback", result["results"][0]["message"])
         self.assertNotIn("openclaw missing", result["results"][0]["message"])
 
+    def test_actions_include_runtime_smoke_command(self) -> None:
+        action = _action_for("openclaw")
+
+        self.assertEqual(action["smoke_command"][:2], ["python3", "tools/agent_runtime_smoke.py"])
+        self.assertIn("--target", action["smoke_command"])
+        self.assertIn("openclaw", action["smoke_command"])
+
     def test_hermes_copy_failure_preserves_existing_install(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"

@@ -35,10 +35,12 @@ def install_agent(target: str, *, dry_run: bool = False, home: str | Path | None
 
 
 def _action_for(target: str, *, home: str | Path | None = None) -> dict[str, Any]:
+    smoke_command = _smoke_command(target)
     if target == "openclaw":
         return {
             "target": "openclaw",
             "command": ["openclaw", "plugins", "install", "--link", str(OPENCLAW_PLUGIN)],
+            "smoke_command": smoke_command,
             "message": "Install the external OpenClaw Fusion Memory plugin.",
         }
     if target == "hermes":
@@ -47,11 +49,13 @@ def _action_for(target: str, *, home: str | Path | None = None) -> dict[str, Any
             "target": "hermes",
             "source": str(HERMES_PROVIDER),
             "destination": str(hermes_home / "plugins" / "fusion_memory"),
+            "smoke_command": smoke_command,
             "message": "Install the external Hermes Fusion Memory provider.",
         }
     return {
         "target": "fusion-agent",
         "path": str(_fusion_agent_root(home)),
+        "smoke_command": smoke_command,
         "message": "Fusion-Agent memory integration is in-repo; verify env PSI_MEMORY_BASE_URL and --memory-enabled.",
     }
 
@@ -96,6 +100,19 @@ def _fusion_agent_root(home: str | Path | None = None) -> Path:
     if env_root:
         return Path(env_root).expanduser()
     return FUSION_AGENT_ROOT
+
+
+def _smoke_command(target: str) -> list[str]:
+    return [
+        "python3",
+        "tools/agent_runtime_smoke.py",
+        "--target",
+        target,
+        "--memory-url",
+        "http://127.0.0.1:8765",
+        "--output",
+        f".runtime/agent-smoke-{target}.json",
+    ]
 
 
 def _install_hermes(action: dict[str, Any]) -> dict[str, Any]:

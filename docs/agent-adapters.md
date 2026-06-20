@@ -16,6 +16,19 @@ fusion-memory install-agent --target hermes
 fusion-memory install-agent --target fusion-agent
 ```
 
+Run a runtime smoke after installing an adapter and starting the local Fusion
+Memory service:
+
+```bash
+python3 tools/agent_runtime_smoke.py --target openclaw --memory-url http://127.0.0.1:8765 --output .runtime/agent-smoke-openclaw.json
+python3 tools/agent_runtime_smoke.py --target hermes --memory-url http://127.0.0.1:8765 --output .runtime/agent-smoke-hermes.json
+python3 tools/agent_runtime_smoke.py --target fusion-agent --memory-url http://127.0.0.1:8765 --output .runtime/agent-smoke-fusion-agent.json
+```
+
+The smoke report contains `target`, `host_available`, `plugin_available`,
+`write_smoke`, `retrieve_smoke`, `ok`, and `message`. Missing host binaries or
+checkouts return `ok=false` with recovery guidance instead of raw runtime logs.
+
 OpenClaw and Hermes are installed as external plugins. Their source checkouts
 are not modified in stage one.
 
