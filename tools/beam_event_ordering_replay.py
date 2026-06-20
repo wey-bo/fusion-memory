@@ -648,8 +648,12 @@ def _aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
             "mean_system_count": _mean(metrics, "system_count"),
             "mean_matched": _mean(metrics, "matched"),
         }
-    out["dual_lift_over_legacy_f1"] = float(out.get("dual", {}).get("f1") or 0.0) - float(out.get("legacy", {}).get("f1") or 0.0)
-    out["dual_lift_over_legacy_tau"] = float(out.get("dual", {}).get("kendall_tau_norm") or 0.0) - float(out.get("legacy", {}).get("kendall_tau_norm") or 0.0)
+    if _summary_path_active(out.get("dual", {})) and _summary_path_active(out.get("legacy", {})):
+        out["dual_lift_over_legacy_f1"] = float(out.get("dual", {}).get("f1") or 0.0) - float(out.get("legacy", {}).get("f1") or 0.0)
+        out["dual_lift_over_legacy_tau"] = float(out.get("dual", {}).get("kendall_tau_norm") or 0.0) - float(out.get("legacy", {}).get("kendall_tau_norm") or 0.0)
+    else:
+        out["dual_lift_over_legacy_f1"] = None
+        out["dual_lift_over_legacy_tau"] = None
     out["cluster_diagnostics"] = _cluster_diagnostics(records)
     gate = evaluate_gate(out)
     out["graph_vs_legacy_passed"] = _graph_vs_legacy_passed(out)

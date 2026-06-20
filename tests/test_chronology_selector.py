@@ -353,14 +353,18 @@ class ChronologySelectorTests(unittest.TestCase):
         memory = MemoryService()
         scope = Scope(workspace_id="graph-select-cluster", user_id="u", agent_id="a", session_id="s")
         created_at = ts("2026-06-18T10:00:00+00:00")
-        topic_a = ChronologyTopic("topic-tri-a", scope, "triangle classification", ["triangle geometry"], "en", [], [], 0.9, created_at)
-        topic_b = ChronologyTopic("topic-tri-b", scope, "triangle area methods", ["triangle geometry"], "en", [], [], 0.9, created_at)
-        for topic in (topic_a, topic_b):
+        topic_a = ChronologyTopic("topic-tri-a", scope, "study triangle geometry", ["triangle geometry"], "en", [], [], 0.9, created_at)
+        topic_b = ChronologyTopic("topic-tri-b", scope, "area methods", ["triangle geometry"], "en", [], [], 0.9, created_at)
+        distractor_a = ChronologyTopic("topic-distractor-a", scope, "what order triangle unique", ["unrelated-a"], "en", [], [], 0.9, created_at)
+        distractor_b = ChronologyTopic("topic-distractor-b", scope, "order study triangle unique", ["unrelated-b"], "en", [], [], 0.9, created_at)
+        for topic in (topic_a, topic_b, distractor_a, distractor_b):
             memory.store.upsert_chronology_topic(topic)
             memory.store.upsert_chronology_phase(ChronologyPhase(f"phase-{topic.topic_id}", topic.topic_id, "implementation", 20, [], 0.9, created_at))
         for node_id, topic_id, text, minute, marker in (
             ("node-a", "topic-tri-a", "First I studied triangle classification.", 0, "first"),
             ("node-b", "topic-tri-b", "Then I compared triangle area methods.", 5, "then"),
+            ("node-distractor-a", "topic-distractor-a", "I mentioned a triangle ordering aside.", 6, None),
+            ("node-distractor-b", "topic-distractor-b", "I studied an unrelated triangle note.", 7, None),
         ):
             memory.store.upsert_chronology_event_node(
                 ChronologyEventNode(
@@ -380,7 +384,9 @@ class ChronologySelectorTests(unittest.TestCase):
         )
 
         self.assertEqual(telemetry["selected_driver"], "persisted_graph")
-        self.assertEqual(telemetry["selected_topic_count"], 2)
+        self.assertEqual(telemetry["cluster_expanded_topic_ids"], ["topic-tri-b"])
+        self.assertEqual(telemetry["selected_topic_count"], 4)
+        self.assertNotIn("graph_ordered_legacy_recall_count", telemetry)
         self.assertEqual({candidate.metadata["graph_topic_id"] for candidate in candidates}, {"topic-tri-a", "topic-tri-b"})
 
     def test_persisted_graph_candidate_text_uses_short_object_label(self) -> None:

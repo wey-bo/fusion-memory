@@ -1605,6 +1605,7 @@ class MemoryService:
         }
         if graph_candidates:
             graph_payload["available_sources"] = list(dict.fromkeys(candidate.source for candidate in graph_candidates))
+            graph_payload.update(_event_ordering_graph_selector_coverage_telemetry(graph_candidates))
         shadow_payload = {
             "graph_candidate_count": len(graph_candidates),
             "legacy_candidate_count": len(legacy_candidates),
@@ -4063,6 +4064,23 @@ def _event_ordering_graph_candidate(candidate: Candidate) -> bool:
     return source in {"event_ordering_persisted_graph"} or (
         source.startswith("event_ordering_graph") and not bool(candidate.metadata.get("graph_fallback"))
     )
+
+
+def _event_ordering_graph_selector_coverage_telemetry(candidates: list[Candidate]) -> dict[str, Any]:
+    for candidate in candidates:
+        metadata = candidate.metadata if isinstance(candidate.metadata, dict) else {}
+        telemetry = metadata.get("graph_selector_telemetry") or metadata.get("persisted_graph_telemetry")
+        if not isinstance(telemetry, dict):
+            continue
+        out: dict[str, Any] = {}
+        expanded_topic_ids = telemetry.get("cluster_expanded_topic_ids")
+        if isinstance(expanded_topic_ids, list):
+            out["cluster_expanded_topic_ids"] = [str(topic_id) for topic_id in expanded_topic_ids if str(topic_id).strip()]
+        selected_topic_count = telemetry.get("selected_topic_count")
+        if isinstance(selected_topic_count, int):
+            out["selected_topic_count"] = selected_topic_count
+        return out
+    return {}
 
 
 def _event_ordering_graph_candidate_allowed_by_query(query: str, candidate: Candidate) -> bool:

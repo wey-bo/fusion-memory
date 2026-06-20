@@ -1004,6 +1004,35 @@ class FusionMemoryTests(unittest.TestCase):
         self.assertTrue(graph_coverage["graph_candidates_dropped_by_filters"])
         self.assertEqual(graph_coverage["dropped_count"], 1)
 
+    def test_event_ordering_graph_coverage_propagates_safe_selector_telemetry(self) -> None:
+        memory = MemoryService()
+        graph_candidate = Candidate(
+            id="graph-event",
+            type="event",
+            text="Graph event",
+            source="event_ordering_persisted_graph",
+            scores={"score": 1.0},
+            source_span_ids=["s1"],
+            metadata={
+                "graph_selector_telemetry": {
+                    "cluster_expanded_topic_ids": ["topic-b"],
+                    "selected_topic_count": 4,
+                    "topic_ids": ["topic-a", "topic-b"],
+                    "cluster_labels": ["triangle geometry"],
+                    "raw_text": "do not expose",
+                }
+            },
+        )
+
+        coverage = memory._event_ordering_shadow_coverage([[graph_candidate]], [graph_candidate])
+
+        graph_coverage = coverage["event_ordering_graph"]
+        self.assertEqual(graph_coverage["cluster_expanded_topic_ids"], ["topic-b"])
+        self.assertEqual(graph_coverage["selected_topic_count"], 4)
+        self.assertNotIn("topic_ids", graph_coverage)
+        self.assertNotIn("cluster_labels", graph_coverage)
+        self.assertNotIn("raw_text", graph_coverage)
+
     def test_event_ordering_dual_shadow_reports_without_replacing_selected_candidates(self) -> None:
         class Flags:
             dual_event_ordering_shadow = True
