@@ -167,6 +167,7 @@ Expected: PASS.
 - Produces CLI:
   - `python3 tools/beam_retrieval_replay.py --dataset /public/home/wwb/datasets/BEAM --split 100k --workspace <workspace> --categories current_value,multi_condition,zh_recall --output <path>`
 - Produces JSON fields:
+  - `records[].query_id`, `records[].category`, and `records[].beam_category` identify replay cases without storing raw query text.
   - `summary.categories[category].query_count`
   - `summary.categories[category].coverage_insufficient_rate`
   - `summary.categories[category].mean_source_span_count`

@@ -55,6 +55,88 @@ class BeamRetrievalReplayTests(unittest.TestCase):
         self.assertEqual(report["summary"]["categories"]["current_value"]["query_count"], 1)
         self.assertIn("pipeline_trace", payload["records"][0])
 
+    def test_run_replay_does_not_persist_raw_query_text(self) -> None:
+        fake_query = SimpleNamespace(id="q1", query="What is my current IDE?", category="knowledge_update")
+        fake_pack = SimpleNamespace(
+            source_spans=[],
+            coverage={"coverage_insufficient": False},
+            debug_trace=[],
+        )
+        service = MagicMock()
+        service.answer_context.return_value = fake_pack
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(replay, "_load_queries", return_value=[fake_query]):
+            out = Path(tmp) / "replay.json"
+            report = replay.run_replay(
+                service,
+                base_scope=replay.Scope(workspace_id="w", user_id="u", agent_id="a"),
+                categories={"current_value"},
+                output_path=out,
+                query_limit=None,
+            )
+            payload = json.loads(out.read_text(encoding="utf-8"))
+
+        self.assertNotIn("query", report["records"][0])
+        self.assertNotIn("query", payload["records"][0])
+        self.assertEqual(service.answer_context.call_args.args[0], "What is my current IDE?")
+
+    def test_run_replay_sanitizes_rule_hits_before_writing(self) -> None:
+        fake_query = SimpleNamespace(id="q1", query="What is my current IDE?", category="knowledge_update")
+        raw_rule_hits = [
+            {
+                "rule_id": "current_value.keep_latest",
+                "query": "What is my current IDE?",
+                "text_hash": "abc123",
+                "contributed_candidate_id": "candidate-1",
+                "stage": "filter",
+                "contributed": True,
+                "impact": "selected",
+                "metadata": {
+                    "decision": "kept",
+                    "query": "What is my current IDE?",
+                    "raw_text": "I use VS Code.",
+                    "message_content": "assistant prompt text",
+                    "source_span": {"text": "span content"},
+                    "safe": {"category": "current_value", "count": 1},
+                    "text_hash": "def456",
+                },
+            }
+        ]
+        fake_pack = SimpleNamespace(
+            source_spans=[],
+            coverage={"coverage_insufficient": False, "rule_hits": raw_rule_hits},
+            debug_trace=[],
+        )
+        service = MagicMock()
+        service.answer_context.return_value = fake_pack
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(replay, "_load_queries", return_value=[fake_query]):
+            out = Path(tmp) / "replay.json"
+            report = replay.run_replay(
+                service,
+                base_scope=replay.Scope(workspace_id="w", user_id="u", agent_id="a"),
+                categories={"current_value"},
+                output_path=out,
+                query_limit=None,
+            )
+            payload = json.loads(out.read_text(encoding="utf-8"))
+
+        hit = payload["records"][0]["rule_hits"][0]
+        self.assertEqual(hit["rule_id"], "current_value.keep_latest")
+        self.assertEqual(hit["text_hash"], "abc123")
+        self.assertEqual(hit["contributed_candidate_id"], "candidate-1")
+        self.assertEqual(hit["stage"], "filter")
+        self.assertTrue(hit["contributed"])
+        self.assertEqual(hit["impact"], "selected")
+        self.assertNotIn("query", hit)
+        self.assertEqual(
+            hit["metadata"],
+            {"decision": "kept", "safe": {"category": "current_value", "count": 1}, "text_hash": "def456"},
+        )
+        self.assertNotIn("What is my current IDE?", json.dumps(payload, ensure_ascii=False))
+        self.assertNotIn("I use VS Code.", json.dumps(payload, ensure_ascii=False))
+        self.assertEqual(report["records"][0]["rule_hits"], payload["records"][0]["rule_hits"])
+
 
 if __name__ == "__main__":
     unittest.main()

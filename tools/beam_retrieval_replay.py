@@ -24,6 +24,35 @@ CATEGORY_ALIASES = {
     "zh_recall": {"zh_recall"},
 }
 
+_RULE_HIT_SAFE_KEYS = {
+    "rule_id",
+    "text_hash",
+    "contributed_candidate_id",
+    "stage",
+    "contributed",
+    "impact",
+}
+
+_SENSITIVE_METADATA_KEY_PARTS = (
+    "raw_text",
+    "text",
+    "content",
+    "span",
+    "message",
+    "query",
+    "prompt",
+)
+
+_SENSITIVE_METADATA_KEYS = {
+    "phrases",
+    "conditions",
+    "taxonomy_hits",
+}
+
+_METADATA_KEY_EXCEPTIONS = {
+    "text_hash",
+}
+
 ZH_PROBES = [
     SimpleNamespace(id="zh:1", category="zh_recall", query="我现在使用的数据库是什么？"),
     SimpleNamespace(id="zh:2", category="zh_recall", query="我之前说过偏好的模型是什么？"),
@@ -98,13 +127,12 @@ def run_replay(
             "query_id": query.id,
             "category": canonical_category,
             "beam_category": query.category,
-            "query": query.query,
             "source_span_count": len(getattr(pack, "source_spans", []) or []),
             "coverage_insufficient": bool(coverage.get("coverage_insufficient", False)),
             "pipeline_trace": list(getattr(pack, "debug_trace", []) or []),
         }
         if "rule_hits" in coverage:
-            record["rule_hits"] = coverage["rule_hits"]
+            record["rule_hits"] = _sanitize_rule_hits(coverage["rule_hits"])
         records.append(record)
 
     report: dict[str, Any] = {
@@ -192,6 +220,60 @@ def _beam_session_id_from_id(item_id: str | None) -> str | None:
 
 def _coverage_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _sanitize_rule_hits(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    sanitized_hits: list[dict[str, Any]] = []
+    for hit in value:
+        hit_dict = _object_dict(hit)
+        if not hit_dict:
+            continue
+        sanitized = {key: hit_dict[key] for key in _RULE_HIT_SAFE_KEYS if key in hit_dict}
+        metadata = _sanitize_metadata(hit_dict.get("metadata"))
+        if metadata:
+            sanitized["metadata"] = metadata
+        sanitized_hits.append(sanitized)
+    return sanitized_hits
+
+
+def _object_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    attrs = getattr(value, "__dict__", None)
+    return attrs if isinstance(attrs, dict) else {}
+
+
+def _sanitize_metadata(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    sanitized: dict[str, Any] = {}
+    for key, item in value.items():
+        key_text = str(key)
+        if _metadata_key_contains_raw_text(key_text):
+            continue
+        sanitized[key_text] = _sanitize_metadata_value(item)
+    return sanitized
+
+
+def _sanitize_metadata_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return _sanitize_metadata(value)
+    if isinstance(value, list):
+        return [_sanitize_metadata_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_metadata_value(item) for item in value]
+    return value
+
+
+def _metadata_key_contains_raw_text(key: str) -> bool:
+    normalized = key.lower()
+    if normalized in _METADATA_KEY_EXCEPTIONS:
+        return False
+    if normalized in _SENSITIVE_METADATA_KEYS:
+        return True
+    return any(part in normalized for part in _SENSITIVE_METADATA_KEY_PARTS)
 
 
 def _summary_for_stdout(report: dict[str, Any]) -> dict[str, Any]:
