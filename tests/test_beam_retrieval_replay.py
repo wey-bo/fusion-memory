@@ -55,6 +55,75 @@ class BeamRetrievalReplayTests(unittest.TestCase):
         self.assertEqual(report["summary"]["categories"]["current_value"]["query_count"], 1)
         self.assertIn("pipeline_trace", payload["records"][0])
 
+    def test_run_replay_sanitizes_pipeline_trace_before_writing(self) -> None:
+        fake_query = SimpleNamespace(id="q1", query="What is my current IDE?", category="knowledge_update")
+        fake_pack = SimpleNamespace(
+            source_spans=[{"span_id": "s1"}],
+            coverage={"coverage_insufficient": True},
+            debug_trace=[
+                {
+                    "layer": "retrieval",
+                    "query_type": "current_value",
+                    "mode": "benchmark",
+                    "query": "What is my current IDE?",
+                    "content": "I use VS Code.",
+                    "source_counts": {"candidate": 3, "selected": 1},
+                    "selected_sources": [
+                        {
+                            "source_id": "s1",
+                            "selected_text": "selected raw source text",
+                            "content": "selected raw content",
+                        }
+                    ],
+                    "source_span_count": 1,
+                    "coverage_insufficient": True,
+                    "rule_hits": [
+                        {"rule_id": "current_value.keep_latest", "content": "candidate raw text"},
+                        {"rule_id": "current_value.prefer_recent"},
+                    ],
+                    "prompt": {"message": "raw prompt text"},
+                }
+            ],
+        )
+        service = MagicMock()
+        service.answer_context.return_value = fake_pack
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(replay, "_load_queries", return_value=[fake_query]):
+            out = Path(tmp) / "replay.json"
+            report = replay.run_replay(
+                service,
+                base_scope=replay.Scope(workspace_id="w", user_id="u", agent_id="a"),
+                categories={"current_value"},
+                output_path=out,
+                query_limit=None,
+            )
+            payload = json.loads(out.read_text(encoding="utf-8"))
+
+        trace = payload["records"][0]["pipeline_trace"]
+        self.assertTrue(trace)
+        self.assertNotIn("What is my current IDE?", json.dumps(payload, ensure_ascii=False))
+        self.assertNotIn("I use VS Code.", json.dumps(payload, ensure_ascii=False))
+        self.assertNotIn("selected raw source text", json.dumps(payload, ensure_ascii=False))
+        self.assertNotIn("selected raw content", json.dumps(payload, ensure_ascii=False))
+        self.assertNotIn("candidate raw text", json.dumps(payload, ensure_ascii=False))
+        self.assertNotIn("raw prompt text", json.dumps(payload, ensure_ascii=False))
+        self.assertEqual(
+            trace,
+            [
+                {
+                    "layer": "retrieval",
+                    "query_type": "current_value",
+                    "mode": "benchmark",
+                    "source_counts": {"candidate": 3, "selected": 1},
+                    "selected_sources": [{"source_id": "s1"}],
+                    "source_span_count": 1,
+                    "coverage_insufficient": True,
+                    "rule_hit_count": 2,
+                }
+            ],
+        )
+        self.assertEqual(report["records"][0]["pipeline_trace"], trace)
+
     def test_run_replay_does_not_persist_raw_query_text(self) -> None:
         fake_query = SimpleNamespace(id="q1", query="What is my current IDE?", category="knowledge_update")
         fake_pack = SimpleNamespace(

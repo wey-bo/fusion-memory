@@ -129,7 +129,7 @@ def run_replay(
             "beam_category": query.category,
             "source_span_count": len(getattr(pack, "source_spans", []) or []),
             "coverage_insufficient": bool(coverage.get("coverage_insufficient", False)),
-            "pipeline_trace": list(getattr(pack, "debug_trace", []) or []),
+            "pipeline_trace": _sanitize_pipeline_trace(getattr(pack, "debug_trace", []) or []),
         }
         if "rule_hits" in coverage:
             record["rule_hits"] = _sanitize_rule_hits(coverage["rule_hits"])
@@ -236,6 +236,121 @@ def _sanitize_rule_hits(value: Any) -> list[dict[str, Any]]:
             sanitized["metadata"] = metadata
         sanitized_hits.append(sanitized)
     return sanitized_hits
+
+
+def _sanitize_pipeline_trace(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    sanitized_trace: list[dict[str, Any]] = []
+    for entry in value:
+        entry_dict = _object_dict(entry)
+        if not entry_dict:
+            continue
+        sanitized = _sanitize_pipeline_trace_entry(entry_dict)
+        if sanitized:
+            sanitized_trace.append(sanitized)
+    return sanitized_trace
+
+
+def _sanitize_pipeline_trace_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    sanitized: dict[str, Any] = {}
+    for key in ("layer", "query_type", "mode"):
+        if key in entry:
+            value = _sanitize_stable_string(entry[key])
+            if value is not None:
+                sanitized[key] = value
+    if "source_counts" in entry:
+        source_counts = _sanitize_count_mapping(entry["source_counts"])
+        if source_counts:
+            sanitized["source_counts"] = source_counts
+    if "selected_sources" in entry:
+        selected_sources = _sanitize_selected_sources(entry["selected_sources"])
+        if selected_sources:
+            sanitized["selected_sources"] = selected_sources
+    if "source_span_count" in entry:
+        value = _sanitize_count_value(entry["source_span_count"])
+        if value is not None:
+            sanitized["source_span_count"] = value
+    if "coverage_insufficient" in entry:
+        sanitized["coverage_insufficient"] = bool(entry["coverage_insufficient"])
+    rule_hit_count = _rule_hit_count(entry)
+    if rule_hit_count is not None:
+        sanitized["rule_hit_count"] = rule_hit_count
+    return sanitized
+
+
+def _sanitize_count_mapping(value: Any) -> dict[str, int | float | bool]:
+    mapping = _object_dict(value)
+    if not mapping:
+        return {}
+    sanitized: dict[str, int | float | bool] = {}
+    for key, item in mapping.items():
+        key_text = str(key)
+        if _metadata_key_contains_raw_text(key_text):
+            continue
+        count = _sanitize_count_value(item)
+        if count is not None:
+            sanitized[key_text] = count
+    return sanitized
+
+
+def _sanitize_selected_sources(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    sanitized_sources: list[dict[str, Any]] = []
+    for source in value:
+        source_dict = _object_dict(source)
+        if not source_dict:
+            continue
+        sanitized: dict[str, Any] = {}
+        for key, item in source_dict.items():
+            key_text = str(key)
+            if _metadata_key_contains_raw_text(key_text):
+                continue
+            sanitized_value = _sanitize_trace_scalar(item)
+            if sanitized_value is not None:
+                sanitized[key_text] = sanitized_value
+        if sanitized:
+            sanitized_sources.append(sanitized)
+    return sanitized_sources
+
+
+def _rule_hit_count(entry: dict[str, Any]) -> int | None:
+    for key in ("rule_hit_count", "rule_hits_count"):
+        if key in entry:
+            value = _sanitize_count_value(entry[key])
+            if isinstance(value, bool):
+                return int(value)
+            if isinstance(value, int):
+                return value
+    rule_hits = entry.get("rule_hits")
+    if isinstance(rule_hits, list):
+        return len(rule_hits)
+    return None
+
+
+def _sanitize_trace_scalar(value: Any) -> Any:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int | float):
+        return value
+    return _sanitize_stable_string(value)
+
+
+def _sanitize_count_value(value: Any) -> int | float | bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int | float):
+        return value
+    return None
+
+
+def _sanitize_stable_string(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    if any(character.isspace() for character in value):
+        return None
+    return value
 
 
 def _object_dict(value: Any) -> dict[str, Any]:
