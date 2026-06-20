@@ -50,7 +50,7 @@ from fusion_memory.retrieval.aggregation_keys import (
     vendor_tool_aggregation_keys,
 )
 from fusion_memory.retrieval.mmr import mmr
-from fusion_memory.retrieval.pipeline import build_pipeline_record
+from fusion_memory.retrieval.pipeline import build_pipeline_record, update_pipeline_evidence_output
 from fusion_memory.retrieval.query_planner import QueryPlanner
 from fusion_memory.retrieval.raw_evidence_quota import RawEvidenceQuota
 from fusion_memory.retrieval.preservation import annotate_runtime_preservation_candidates, must_preserve_reasons, preserve_required_candidates
@@ -629,6 +629,12 @@ class MemoryService:
             trace.get("selected", []),
             token_budget=token_budget,
         )
+        if "pipeline_trace" in pack.coverage:
+            pack.coverage["pipeline_trace"] = update_pipeline_evidence_output(
+                pack.coverage["pipeline_trace"],
+                source_span_count=len(pack.source_spans),
+                coverage_insufficient=bool(pack.coverage.get("coverage_insufficient", False)),
+            )
         pack_rule_hits = [hit.__dict__ for hit in rule_hits.drain()]
         if pack_rule_hits:
             seen_hit_keys = {

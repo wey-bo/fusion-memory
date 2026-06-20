@@ -116,3 +116,24 @@ def build_pipeline_record(
             coverage_insufficient=coverage_insufficient,
         ),
     )
+
+
+def update_pipeline_evidence_output(
+    value: Any,
+    *,
+    source_span_count: int,
+    coverage_insufficient: bool,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    updated = dict(value)
+    evidence = {
+        "source_span_count": int(source_span_count),
+        "coverage_insufficient": bool(coverage_insufficient),
+    }
+    layers = dict(updated.get("pipeline_layers") or {})
+    layers["EvidencePackBuilder"] = evidence
+    updated["pipeline_layers"] = layers
+    if "evidence_output" in updated:
+        updated["evidence_output"] = evidence
+    return updated

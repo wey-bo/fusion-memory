@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import unittest
+from types import MethodType
 
 from fusion_memory.api.service import MemoryService
 from fusion_memory.core.models import Candidate
+from fusion_memory.core.models import EvidencePack
 from fusion_memory.core.models import Scope
+from fusion_memory.core.models import SearchResult
 from fusion_memory.retrieval.pipeline import build_pipeline_record
 
 
@@ -69,3 +72,53 @@ class RetrievalPipelineTests(unittest.TestCase):
             self.assertNotIn(raw_memory_text, repr(pack.coverage["pipeline_trace"]))
         finally:
             memory.close()
+
+    def test_answer_context_pipeline_trace_uses_actual_pack_source_span_count(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="ws-pipeline-pack-count", user_id="u", agent_id="a")
+        stale_pipeline_trace = {
+            "query_type": "fact_lookup",
+            "mode": "fast",
+            "pipeline_layers": {
+                "QueryUnderstanding": {"language": "en", "intent": "fact_lookup", "features": []},
+                "CandidateRecall": {"source_counts": {"l0_raw": 5}},
+                "CandidateFusion": {"selected_sources": ["l0_raw"], "dropped_count": 0},
+                "EvidencePackBuilder": {"source_span_count": 5, "coverage_insufficient": False},
+            },
+            "query_understanding": {"language": "en", "intent": "fact_lookup", "features": []},
+            "candidate_recall": {"source_counts": {"l0_raw": 5}},
+            "candidate_fusion": {"selected_sources": ["l0_raw"], "dropped_count": 0},
+            "evidence_output": {"source_span_count": 5, "coverage_insufficient": False},
+        }
+
+        def fake_search(self: MemoryService, query: str, scope: Scope, options: dict | None = None) -> SearchResult:
+            return SearchResult(candidates=[], trace_id="trace-pipeline", coverage={"pipeline_trace": stale_pipeline_trace})
+
+        def fake_get_trace(self, trace_id: str, scope: Scope, include_session: bool = False) -> dict:
+            return {"selected": [], "rule_hits": []}
+
+        def fake_build(self, query, plan, candidates, coverage, trace, token_budget=None) -> EvidencePack:
+            return EvidencePack(
+                query=query,
+                answer_policy="test",
+                current_views=[],
+                entity_profiles=[],
+                facts=[],
+                events=[],
+                source_spans=[{"id": "span_1"}],
+                conflicts=[],
+                coverage=dict(coverage),
+                debug_trace=[],
+            )
+
+        memory.search = MethodType(fake_search, memory)
+        memory.store.get_trace = MethodType(fake_get_trace, memory.store)
+        memory.pack_builder.build = MethodType(fake_build, memory.pack_builder)
+
+        try:
+            pack = memory.answer_context("What did I ask you to remember?", scope)
+        finally:
+            memory.close()
+
+        evidence_layer = pack.coverage["pipeline_trace"]["pipeline_layers"]["EvidencePackBuilder"]
+        self.assertEqual(evidence_layer["source_span_count"], len(pack.source_spans))
