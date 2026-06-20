@@ -386,7 +386,7 @@ class ChronologySelectorTests(unittest.TestCase):
         self.assertEqual(telemetry["selected_driver"], "persisted_graph")
         self.assertEqual(telemetry["cluster_expanded_topic_ids"], ["topic-tri-b"])
         self.assertEqual(telemetry["selected_topic_count"], 4)
-        self.assertNotIn("graph_ordered_legacy_recall_count", telemetry)
+        self.assertIsNone(telemetry["graph_ordered_legacy_recall_count"])
         self.assertEqual({candidate.metadata["graph_topic_id"] for candidate in candidates}, {"topic-tri-a", "topic-tri-b"})
 
     def test_persisted_graph_candidate_text_uses_short_object_label(self) -> None:

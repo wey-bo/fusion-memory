@@ -66,7 +66,7 @@ def record_rule_hit(
 ) -> RuleHit:
     hit = RuleHit(
         rule_id=rule_id,
-        query=query,
+        query=sha1(query.encode("utf-8")).hexdigest()[:12],
         text_hash=sha1(text.encode("utf-8")).hexdigest()[:12],
         contributed_candidate_id=contributed_candidate_id,
         stage=stage,

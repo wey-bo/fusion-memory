@@ -210,13 +210,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Build a retrieval rule audit report from replay records.")
     parser.add_argument("--input", required=True, help="Path to replay JSON input.")
     parser.add_argument("--output", required=True, help="Path to audit JSON output.")
-    parser.add_argument("--csv", required=True, help="Path to audit CSV output.")
+    parser.add_argument("--csv", default=None, help="Optional path to audit CSV output.")
     args = parser.parse_args()
 
     records = _load_records(Path(args.input))
     audit_rows = build_rule_audit(records)
     _write_json(Path(args.output), audit_rows)
-    _write_csv(Path(args.csv), audit_rows)
+    if args.csv:
+        _write_csv(Path(args.csv), audit_rows)
     return 0
 
 

@@ -38,6 +38,7 @@ def select_persisted_graph_event_ordering_candidates(
                 "fallback_reason": "no_topic",
                 "cluster_expanded_topic_ids": [],
                 "selected_topic_count": 0,
+                "graph_ordered_legacy_recall_count": None,
             }
         phases = {phase.phase_id: phase for phase in store.list_chronology_phases(topic_ids)}
         nodes = store.list_chronology_event_nodes(scope, include_session=include_session, topic_ids=topic_ids)
@@ -49,6 +50,7 @@ def select_persisted_graph_event_ordering_candidates(
                 "topic_ids": topic_ids,
                 "cluster_expanded_topic_ids": cluster_expanded_topic_ids,
                 "selected_topic_count": len(topic_ids),
+                "graph_ordered_legacy_recall_count": None,
             }
         node_ids = [node.node_id for node in nodes]
         if any(node.phase_id and node.phase_id not in phases for node in nodes):
@@ -68,6 +70,7 @@ def select_persisted_graph_event_ordering_candidates(
                 "error": type(exc).__name__,
                 "cluster_expanded_topic_ids": [],
                 "selected_topic_count": 0,
+                "graph_ordered_legacy_recall_count": None,
             }
         raise
 
@@ -79,6 +82,7 @@ def select_persisted_graph_event_ordering_candidates(
             "topic_ids": topic_ids,
             "cluster_expanded_topic_ids": cluster_expanded_topic_ids,
             "selected_topic_count": len(topic_ids),
+            "graph_ordered_legacy_recall_count": None,
             "node_count": len(deduped_nodes),
         }
 
@@ -97,6 +101,7 @@ def select_persisted_graph_event_ordering_candidates(
             "topic_ids": topic_ids,
             "cluster_expanded_topic_ids": cluster_expanded_topic_ids,
             "selected_topic_count": len(topic_ids),
+            "graph_ordered_legacy_recall_count": None,
             "node_count": len(deduped_nodes),
         }
     edge_connected_ids = {node_id for node_id, count in edge_count_by_node.items() if count > 0}
@@ -114,6 +119,7 @@ def select_persisted_graph_event_ordering_candidates(
             "topic_ids": topic_ids,
             "cluster_expanded_topic_ids": cluster_expanded_topic_ids,
             "selected_topic_count": len(topic_ids),
+            "graph_ordered_legacy_recall_count": None,
             "node_count": len(deduped_nodes),
             "edge_count": len(usable_edges),
             "source_span_count": len(source_span_ids),
@@ -158,6 +164,7 @@ def select_persisted_graph_event_ordering_candidates(
         "topic_ids": topic_ids,
         "cluster_expanded_topic_ids": cluster_expanded_topic_ids,
         "selected_topic_count": len(topic_ids),
+        "graph_ordered_legacy_recall_count": None,
         "node_count": len(deduped_nodes),
         "edge_count": len(usable_edges),
         "source_span_count": len(source_span_ids),

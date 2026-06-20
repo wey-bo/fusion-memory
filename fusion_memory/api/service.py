@@ -4079,6 +4079,12 @@ def _event_ordering_graph_selector_coverage_telemetry(candidates: list[Candidate
         selected_topic_count = telemetry.get("selected_topic_count")
         if isinstance(selected_topic_count, int):
             out["selected_topic_count"] = selected_topic_count
+        graph_ordered_legacy_recall_count = telemetry.get("graph_ordered_legacy_recall_count")
+        out["graph_ordered_legacy_recall_count"] = (
+            graph_ordered_legacy_recall_count
+            if isinstance(graph_ordered_legacy_recall_count, int)
+            else None
+        )
         return out
     return {}
 

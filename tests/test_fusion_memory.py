@@ -1032,6 +1032,7 @@ class FusionMemoryTests(unittest.TestCase):
         graph_coverage = coverage["event_ordering_graph"]
         self.assertEqual(graph_coverage["cluster_expanded_topic_ids"], ["topic-b"])
         self.assertEqual(graph_coverage["selected_topic_count"], 4)
+        self.assertIsNone(graph_coverage["graph_ordered_legacy_recall_count"])
         self.assertNotIn("topic_ids", graph_coverage)
         self.assertNotIn("cluster_labels", graph_coverage)
         self.assertNotIn("raw_text", graph_coverage)

@@ -234,6 +234,43 @@ class RuleAuditTests(unittest.TestCase):
             self.assertEqual([row["rule_id"] for row in rows], ["rule.alpha", "rule.beta"])
             self.assertEqual(rows[0]["candidate_sources"], "source_a;source_b")
 
+    def test_cli_can_write_json_without_csv(self) -> None:
+        payload = {
+            "records": [
+                {
+                    "query_id": "q-json",
+                    "rule_hits": [{"rule_id": "rule.alpha", "contributed_candidate_id": "c1"}],
+                    "coverage": {},
+                    "paths": {"hybrid": {"sources": ["source_a"]}},
+                }
+            ]
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            input_path = tmp_path / "replay.json"
+            output_path = tmp_path / "audit.json"
+            input_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "tools/rule_audit.py",
+                    "--input",
+                    str(input_path),
+                    "--output",
+                    str(output_path),
+                ],
+                cwd=REPO_ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            audit = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual([row["rule_id"] for row in audit], ["rule.alpha"])
+
     def test_cli_writes_deterministic_json_and_csv_for_top_level_list_input(self) -> None:
         payload = [
             {

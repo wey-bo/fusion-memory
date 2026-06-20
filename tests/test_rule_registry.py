@@ -49,6 +49,8 @@ class RuleRegistryTests(unittest.TestCase):
             hashlib.sha1("I initially used SQLite.".encode("utf-8")).hexdigest()[:12],
         )
         self.assertNotIn("SQLite", hit.text_hash)
+        self.assertNotEqual(hit.query, "What is current?")
+        self.assertRegex(hit.query, r"^[0-9a-f]{12}$")
         self.assertEqual(hit.contributed_candidate_id, "span_1")
 
     def test_drain_rule_hits_returns_and_clears_queue(self) -> None:
@@ -359,6 +361,7 @@ class RuleInstrumentationTests(unittest.TestCase):
         self.assertIsNotNone(trace)
         rule_hits = trace.get("rule_hits") if trace else None
         self.assertIsInstance(rule_hits, list)
+        self.assertFalse(any("默认数据库" in str(hit.get("query")) for hit in rule_hits or []))
         self.assertFalse(any(hit.get("rule_id") == "multi_condition.query_token_match" for hit in rule_hits or []))
 
     def test_search_exception_discards_unpersisted_rule_hits(self) -> None:
