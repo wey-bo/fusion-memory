@@ -103,11 +103,13 @@ class RuleAuditTests(unittest.TestCase):
         self.assertEqual(taxonomy_row["recommendation"], "migrate_to_taxonomy")
         self.assertEqual(taxonomy_row["cleanup_phase"], "first_pass")
         self.assertEqual(taxonomy_row["cleanup_action"], "migrate_to_taxonomy")
+        self.assertEqual(taxonomy_row["cleanup_blockers"], ["domain_label_taxonomy_migration_required"])
         self.assertFalse(taxonomy_row["safe_to_delete"])
 
         legacy_row = next(item for item in audit if item["rule_id"] == "event_ordering.legacy.tie_breaker")
         self.assertEqual(legacy_row["recommendation"], "legacy_shadow")
-        self.assertEqual(legacy_row["cleanup_action"], "keep_shadow")
+        self.assertEqual(legacy_row["cleanup_action"], "keep_protected")
+        self.assertEqual(legacy_row["cleanup_blockers"], ["protected:legacy_event_ordering_fallback"])
         self.assertFalse(legacy_row["safe_to_delete"])
 
     def test_build_rule_audit_includes_provider_and_lifecycle_dimensions(self) -> None:
@@ -324,12 +326,88 @@ class RuleAuditTests(unittest.TestCase):
         self.assertFalse(by_rule["exact_match.cjk_phrase"]["safe_to_delete"])
         self.assertTrue(by_rule["event_ordering.legacy.unused"]["protected"])
         self.assertEqual(by_rule["event_ordering.legacy.unused"]["protected_reason"], "legacy_event_ordering_fallback")
+        self.assertEqual(by_rule["event_ordering.legacy.unused"]["cleanup_action"], "keep_protected")
+        self.assertEqual(
+            by_rule["event_ordering.legacy.unused"]["cleanup_blockers"],
+            ["protected:legacy_event_ordering_fallback"],
+        )
         self.assertFalse(by_rule["event_ordering.legacy.unused"]["safe_to_delete"])
         self.assertTrue(by_rule["event_ordering.legacy_rescue"]["protected"])
         self.assertFalse(by_rule["event_ordering.legacy_rescue"]["safe_to_delete"])
         self.assertEqual(by_rule["event_ordering.taxonomy.domain_label_match"]["recommendation"], "migrate_to_taxonomy")
         self.assertEqual(by_rule["event_ordering.taxonomy.domain_label_match"]["cleanup_action"], "migrate_to_taxonomy")
+        self.assertEqual(
+            by_rule["event_ordering.taxonomy.domain_label_match"]["cleanup_blockers"],
+            ["domain_label_taxonomy_migration_required"],
+        )
         self.assertFalse(by_rule["event_ordering.taxonomy.domain_label_match"]["safe_to_delete"])
+
+    def test_cleanup_gate_blocks_protected_zero_contribution_rules(self) -> None:
+        records = [
+            {
+                "query_id": "q1",
+                "rule_hits": [
+                    {
+                        "rule_id": "current_value.stale_history_marker",
+                        "contributed_candidate_id": None,
+                        "protected": True,
+                        "protected_reason": "high_precision_current_value",
+                    }
+                ],
+            }
+        ]
+
+        audit = build_rule_audit(records)
+        row = next(item for item in audit if item["rule_id"] == "current_value.stale_history_marker")
+
+        self.assertFalse(row["safe_to_delete"])
+        self.assertEqual(row["cleanup_action"], "keep_protected")
+        self.assertEqual(row["cleanup_blockers"], ["protected:high_precision_current_value"])
+
+    def test_cleanup_gate_marks_exact_duplicate_unprotected_rule_safe_to_delete(self) -> None:
+        records = [
+            {
+                "query_id": "q1",
+                "rule_hits": [
+                    {
+                        "rule_id": "rule.alpha_duplicate",
+                        "contributed_candidate_id": None,
+                        "metadata": {"duplicate_of": "rule.alpha"},
+                    }
+                ],
+            }
+        ]
+
+        audit = build_rule_audit(records)
+        row = next(item for item in audit if item["rule_id"] == "rule.alpha_duplicate")
+
+        self.assertEqual(row["cleanup_action"], "delete_duplicate")
+        self.assertEqual(row["cleanup_phase"], "first_pass")
+        self.assertTrue(row["safe_to_delete"])
+
+    def test_cleanup_gate_migrates_domain_label_rules_even_when_duplicate(self) -> None:
+        records = [
+            {
+                "query_id": "q1",
+                "rule_hits": [
+                    {
+                        "rule_id": "event_ordering.taxonomy.domain_label_match",
+                        "contributed_candidate_id": None,
+                        "metadata": {
+                            "category": "taxonomy_candidate",
+                            "duplicate_of": "event_ordering.taxonomy.domain_label",
+                        },
+                    }
+                ],
+            }
+        ]
+
+        audit = build_rule_audit(records)
+        row = next(item for item in audit if item["rule_id"] == "event_ordering.taxonomy.domain_label_match")
+
+        self.assertEqual(row["cleanup_action"], "migrate_to_taxonomy")
+        self.assertEqual(row["cleanup_blockers"], ["domain_label_taxonomy_migration_required"])
+        self.assertFalse(row["safe_to_delete"])
 
     def test_build_rule_audit_marks_event_ordering_legacy_rules_as_legacy_shadow(self) -> None:
         records = [
@@ -348,10 +426,12 @@ class RuleAuditTests(unittest.TestCase):
 
         legacy_row = next(item for item in audit if item["rule_id"] == "event_ordering.legacy.tie_breaker")
         self.assertEqual(legacy_row["recommendation"], "legacy_shadow")
-        self.assertEqual(legacy_row["cleanup_action"], "keep_shadow")
+        self.assertEqual(legacy_row["cleanup_action"], "keep_protected")
+        self.assertEqual(legacy_row["cleanup_blockers"], ["protected:legacy_event_ordering_fallback"])
         unused_row = next(item for item in audit if item["rule_id"] == "event_ordering.legacy.unused")
         self.assertEqual(unused_row["recommendation"], "legacy_shadow")
-        self.assertEqual(unused_row["cleanup_action"], "keep_shadow")
+        self.assertEqual(unused_row["cleanup_action"], "keep_protected")
+        self.assertEqual(unused_row["cleanup_blockers"], ["protected:legacy_event_ordering_fallback"])
         self.assertFalse(unused_row["safe_to_delete"])
 
     def test_rule_audit_marks_duplicate_no_contribution_rules_for_first_pass_cleanup(self) -> None:
@@ -456,6 +536,7 @@ class RuleAuditTests(unittest.TestCase):
                         "cleanup_phase",
                         "cleanup_action",
                         "safe_to_delete",
+                        "cleanup_blockers",
                     ],
                 )
                 rows = list(reader)

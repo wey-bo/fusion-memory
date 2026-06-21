@@ -184,13 +184,19 @@ def _cleanup_classification(
     recommendation: str,
     duplicate_of: str | None,
     protected: bool,
-) -> tuple[str, str, bool]:
-    if rule_id.startswith("event_ordering.legacy"):
-        cleanup_action = "keep_shadow"
-    elif protected:
+    protected_reason: str,
+) -> tuple[str, str, bool, list[str]]:
+    cleanup_blockers: list[str] = []
+    domain_label_or_taxonomy = recommendation == "migrate_to_taxonomy"
+
+    if protected:
         cleanup_action = "keep_protected"
-    elif recommendation == "migrate_to_taxonomy":
+        cleanup_blockers.append(f"protected:{protected_reason or 'unspecified'}")
+    elif rule_id.startswith("event_ordering.legacy"):
+        cleanup_action = "keep_shadow"
+    elif domain_label_or_taxonomy:
         cleanup_action = "migrate_to_taxonomy"
+        cleanup_blockers.append("domain_label_taxonomy_migration_required")
     elif duplicate_of is not None:
         cleanup_action = "delete_duplicate"
     elif hit_count == 0:
@@ -202,7 +208,7 @@ def _cleanup_classification(
 
     cleanup_phase = "first_pass" if cleanup_action.startswith("delete_") or cleanup_action == "migrate_to_taxonomy" else ""
     safe_to_delete = cleanup_action.startswith("delete_")
-    return cleanup_phase, cleanup_action, safe_to_delete
+    return cleanup_phase, cleanup_action, safe_to_delete, cleanup_blockers
 
 
 def build_rule_audit(records: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -304,13 +310,14 @@ def build_rule_audit(records: list[dict[str, object]]) -> list[dict[str, object]
         recommendation = _recommendation_for_rule(rule_id, hit_count, contribution_count, categories)
         duplicate_of = row["duplicate_of"] if isinstance(row["duplicate_of"], str) else None
         protected, protected_reason = _protected_governance_for_rule(rule_id)
-        cleanup_phase, cleanup_action, safe_to_delete = _cleanup_classification(
+        cleanup_phase, cleanup_action, safe_to_delete, cleanup_blockers = _cleanup_classification(
             rule_id,
             hit_count,
             contribution_count,
             recommendation,
             duplicate_of,
             protected,
+            protected_reason,
         )
         audit_rows.append(
             {
@@ -333,6 +340,7 @@ def build_rule_audit(records: list[dict[str, object]]) -> list[dict[str, object]
                 "cleanup_phase": cleanup_phase,
                 "cleanup_action": cleanup_action,
                 "safe_to_delete": safe_to_delete,
+                "cleanup_blockers": cleanup_blockers,
             }
         )
     return audit_rows
@@ -374,6 +382,7 @@ def _write_csv(csv_path: Path, audit_rows: list[dict[str, object]]) -> None:
         "cleanup_phase",
         "cleanup_action",
         "safe_to_delete",
+        "cleanup_blockers",
     ]
     with csv_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -385,6 +394,7 @@ def _write_csv(csv_path: Path, audit_rows: list[dict[str, object]]) -> None:
             csv_row["provider_ids"] = ";".join(row["provider_ids"])
             csv_row["lifecycle_stages"] = ";".join(row["lifecycle_stages"])
             csv_row["lifecycle_reasons"] = ";".join(row["lifecycle_reasons"])
+            csv_row["cleanup_blockers"] = ";".join(row["cleanup_blockers"])
             writer.writerow(csv_row)
 
 

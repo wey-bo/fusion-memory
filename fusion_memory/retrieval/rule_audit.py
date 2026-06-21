@@ -102,15 +102,24 @@ def _is_safe_identifier(value: str) -> bool:
 
 def _cleanup_classification(
     rule_id: str,
+    category: str,
     hit_count: int,
     contribution_count: int,
     duplicate_of: str | None,
     protected: bool,
-) -> tuple[str, str, bool]:
-    if rule_id.startswith("event_ordering.legacy"):
-        cleanup_action = "keep_shadow"
-    elif protected:
+    protected_reason: str,
+) -> tuple[str, str, bool, list[str]]:
+    cleanup_blockers: list[str] = []
+    domain_label_or_taxonomy = ".domain_label" in rule_id or category == "taxonomy_candidate"
+
+    if protected:
         cleanup_action = "keep_protected"
+        cleanup_blockers.append(f"protected:{protected_reason or 'unspecified'}")
+    elif rule_id.startswith("event_ordering.legacy"):
+        cleanup_action = "keep_shadow"
+    elif domain_label_or_taxonomy:
+        cleanup_action = "migrate_to_taxonomy"
+        cleanup_blockers.append("domain_label_taxonomy_migration_required")
     elif duplicate_of is not None:
         cleanup_action = "delete_duplicate"
     elif hit_count == 0:
@@ -120,9 +129,9 @@ def _cleanup_classification(
     else:
         cleanup_action = "keep"
 
-    cleanup_phase = "first_pass" if cleanup_action.startswith("delete_") else ""
+    cleanup_phase = "first_pass" if cleanup_action.startswith("delete_") or cleanup_action == "migrate_to_taxonomy" else ""
     safe_to_delete = cleanup_action.startswith("delete_")
-    return cleanup_phase, cleanup_action, safe_to_delete
+    return cleanup_phase, cleanup_action, safe_to_delete, cleanup_blockers
 
 
 def build_rule_audit(
@@ -155,12 +164,14 @@ def build_rule_audit(
         lifecycle_stages = _string_values(rule_hits, "lifecycle_stage")
         lifecycle_reasons = _string_values(rule_hits, "lifecycle_reason")
         duplicate_of = _duplicate_of(rule_hits) or rule.duplicate_of
-        cleanup_phase, cleanup_action, safe_to_delete = _cleanup_classification(
+        cleanup_phase, cleanup_action, safe_to_delete, cleanup_blockers = _cleanup_classification(
             rule.rule_id,
+            rule.category,
             len(rule_hits),
             contribution_count,
             duplicate_of,
             rule.protected,
+            rule.protected_reason,
         )
         rows.append(
             {
@@ -182,6 +193,7 @@ def build_rule_audit(
                 "cleanup_phase": cleanup_phase,
                 "cleanup_action": cleanup_action,
                 "safe_to_delete": safe_to_delete,
+                "cleanup_blockers": cleanup_blockers,
             }
         )
     return rows
