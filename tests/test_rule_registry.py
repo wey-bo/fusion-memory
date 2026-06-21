@@ -467,10 +467,18 @@ class RuleRegistryTests(unittest.TestCase):
                 category="zh_recall",
                 ability="zh_recall",
             ),
+            RuleDefinition(
+                rule_id="taxonomy.alias_match",
+                module="fusion_memory.api.service_helpers",
+                purpose="observe taxonomy alias matching",
+                category="taxonomy_candidate",
+                ability="zh_recall",
+            ),
         ]
         hits = [
             {"rule_id": "multi_condition.query_token_match", "impact": "observed"},
             {"rule_id": "zh_recall.cjk_exact_match", "impact": "observed"},
+            {"rule_id": "taxonomy.alias_match", "impact": "observed"},
         ]
 
         audit = build_rule_audit(rules, hits)

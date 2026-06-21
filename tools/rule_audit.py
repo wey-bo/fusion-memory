@@ -223,10 +223,10 @@ def _recommendation_for_rule(
 ) -> str:
     if rule_id.startswith("event_ordering.legacy"):
         return "legacy_shadow"
+    if hit_count > 0 and observation_count == hit_count and contribution_count == 0 and negative_impact_count == 0:
+        return "keep_observation"
     if ".domain_label" in rule_id or "taxonomy_candidate" in categories:
         return "migrate_to_taxonomy"
-    if observation_count == hit_count and contribution_count == 0 and negative_impact_count == 0:
-        return "keep_observation"
     if hit_count == 0 or contribution_count == 0:
         return "delete_candidate"
     return "keep"
@@ -249,6 +249,9 @@ def _cleanup_classification(
         cleanup_blockers.append(f"protected:{protected_reason or 'unspecified'}")
     elif rule_id.startswith("event_ordering.legacy"):
         cleanup_action = "keep_shadow"
+    elif recommendation == "keep_observation":
+        cleanup_action = "keep_observation"
+        cleanup_blockers.append("observation_only_rule")
     elif domain_label_or_taxonomy:
         cleanup_action = "migrate_to_taxonomy"
         cleanup_blockers.append("domain_label_taxonomy_migration_required")
@@ -256,9 +259,6 @@ def _cleanup_classification(
         cleanup_action = "delete_duplicate"
     elif hit_count == 0:
         cleanup_action = "delete_no_hits"
-    elif recommendation == "keep_observation":
-        cleanup_action = "keep_observation"
-        cleanup_blockers.append("observation_only_rule")
     elif contribution_count == 0:
         cleanup_action = "delete_no_contribution"
     else:

@@ -122,6 +122,9 @@ def _cleanup_classification(
         cleanup_blockers.append(f"protected:{protected_reason or 'unspecified'}")
     elif rule_id.startswith("event_ordering.legacy"):
         cleanup_action = "keep_shadow"
+    elif hit_count > 0 and observation_count == hit_count and contribution_count == 0 and negative_impact_count == 0:
+        cleanup_action = "keep_observation"
+        cleanup_blockers.append("observation_only_rule")
     elif domain_label_or_taxonomy:
         cleanup_action = "migrate_to_taxonomy"
         cleanup_blockers.append("domain_label_taxonomy_migration_required")
@@ -129,9 +132,6 @@ def _cleanup_classification(
         cleanup_action = "delete_duplicate"
     elif hit_count == 0:
         cleanup_action = "delete_no_hits"
-    elif observation_count == hit_count and contribution_count == 0 and negative_impact_count == 0:
-        cleanup_action = "keep_observation"
-        cleanup_blockers.append("observation_only_rule")
     elif contribution_count == 0:
         cleanup_action = "delete_no_contribution"
     else:

@@ -765,7 +765,11 @@ class RuleAuditTests(unittest.TestCase):
                 "rule_hits": [
                     {"rule_id": "multi_condition.query_token_match", "impact": "observed"},
                     {"rule_id": "zh_recall.cjk_exact_match", "impact": "observed"},
-                    {"rule_id": "taxonomy.alias_match", "impact": "observed"},
+                    {
+                        "rule_id": "taxonomy.alias_match",
+                        "impact": "observed",
+                        "metadata": {"category": "taxonomy_candidate"},
+                    },
                 ],
             }
         ]
