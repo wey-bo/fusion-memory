@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Callable
 
 from fusion_memory.core.models import Candidate
 from fusion_memory.core.models import Scope
+from fusion_memory.retrieval.providers import RecallContext
+from fusion_memory.retrieval.providers import default_provider_registry
 from fusion_memory.retrieval.temporal_relations import temporal_relation_summary_from_safe_records
 
 
@@ -52,27 +54,130 @@ class QueryUnderstandingEngine:
         options = options or {}
         precomputed_plan = options.get("_plan")
         precomputed = precomputed_plan is not None
-        plan = precomputed_plan or planner.plan(query, query_type_hint=options.get("query_type_hint"))
+        plan = precomputed_plan if precomputed else planner.plan(query, query_type_hint=options.get("query_type_hint"))
         intent_telemetry = options.get("_intent_telemetry") if precomputed else getattr(planner, "last_intent_telemetry", None)
-        language = "zh" if re.search(r"[\u4e00-\u9fff]", query) else "en"
-        features = tuple(
-            feature
-            for feature, enabled in {
-                "current_value": bool(getattr(plan, "current_value", False)),
-                "multi_condition": bool(getattr(plan, "constraints", None)),
-                "temporal": getattr(plan, "query_type", None) in {"temporal_lookup", "event_ordering"},
-            }.items()
-            if enabled
-        )
-        intent = str(getattr(plan, "query_type", ""))
-        return QueryUnderstandingResult(
+        return query_understanding_result_from_plan(
             plan=plan,
-            language=language,
-            intent=intent,
-            features=features,
+            query=query,
             intent_telemetry=intent_telemetry,
             precomputed=precomputed,
         )
+
+
+def query_understanding_result_from_plan(
+    *,
+    plan: Any,
+    query: str,
+    intent_telemetry: dict[str, Any] | None = None,
+    precomputed: bool = True,
+) -> QueryUnderstandingResult:
+    language = "zh" if re.search(r"[\u4e00-\u9fff]", query) else "en"
+    features = tuple(
+        feature
+        for feature, enabled in {
+            "current_value": bool(getattr(plan, "current_value", False)),
+            "multi_condition": bool(getattr(plan, "constraints", None)),
+            "temporal": getattr(plan, "query_type", None) in {"temporal_lookup", "event_ordering"},
+        }.items()
+        if enabled
+    )
+    return QueryUnderstandingResult(
+        plan=plan,
+        language=language,
+        intent=str(getattr(plan, "query_type", "")),
+        features=features,
+        intent_telemetry=intent_telemetry,
+        precomputed=precomputed,
+    )
+
+
+@dataclass(frozen=True)
+class RetrievalExecutionContext:
+    service: Any
+    query: str
+    scope: Scope
+    options: dict[str, Any]
+    query_understanding: QueryUnderstandingResult
+    include_session: bool
+    per_source_limit: int
+    enabled_sources: list[str] | set[str] | None
+    mode: str
+    limit: int
+    rerank_top_n: int
+    event_milestone_group: Callable[[Any], str | None]
+
+
+@dataclass(frozen=True)
+class RecallResult:
+    candidate_lists: list[list[Candidate]]
+    recalled_candidates: list[Candidate]
+    provider_summary: list[dict[str, Any]] = field(default_factory=list)
+
+    def safe_record(self) -> dict[str, Any]:
+        record: dict[str, Any] = {"source_counts": _candidate_source_counts(self.recalled_candidates)}
+        if self.provider_summary:
+            record["provider_summary"] = [_safe_provider_summary(item) for item in self.provider_summary]
+        return record
+
+
+class RecallOrchestrator:
+    def __init__(self, registry: Any | None = None) -> None:
+        self._registry = registry
+
+    def run(self, context: RetrievalExecutionContext) -> RecallResult:
+        enabled = set(context.enabled_sources) if context.enabled_sources is not None else None
+        recall_context = RecallContext(
+            service=context.service,
+            query=context.query,
+            scope=context.scope,
+            plan=context.query_understanding.plan,
+            per_source_limit=context.per_source_limit,
+            enabled_sources=enabled,
+            include_session=context.include_session,
+            event_milestone_group=context.event_milestone_group,
+            prior_candidates=[],
+        )
+        registry = self._registry or default_provider_registry()
+        candidate_lists = registry.recall(recall_context)
+        recalled_candidates = [candidate for candidates in candidate_lists for candidate in candidates]
+        provider_summary = registry.summary(recall_context) if hasattr(registry, "summary") else []
+        return RecallResult(
+            candidate_lists=candidate_lists,
+            recalled_candidates=recalled_candidates,
+            provider_summary=provider_summary,
+        )
+
+
+def _candidate_source_counts(candidates: list[Candidate]) -> dict[str, int]:
+    source_counts: dict[str, int] = {}
+    for candidate in candidates:
+        source_counts[candidate.source] = source_counts.get(candidate.source, 0) + 1
+    return source_counts
+
+
+def _safe_provider_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    safe: dict[str, Any] = {}
+    for key in (
+        "provider_id",
+        "source_family",
+        "output_count",
+        "output_source_counts",
+        "production_default",
+        "shadow_only",
+        "graph_related",
+    ):
+        if key not in summary:
+            continue
+        value = summary[key]
+        if key == "output_source_counts" and isinstance(value, dict):
+            safe[key] = {str(source): int(count) for source, count in value.items()}
+        elif key == "output_count":
+            safe[key] = int(value)
+        elif key in {"production_default", "shadow_only", "graph_related"}:
+            safe[key] = bool(value)
+        else:
+            safe[key] = str(value)
+    return safe
 
 
 @dataclass(frozen=True)

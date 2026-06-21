@@ -10,12 +10,93 @@ from fusion_memory.core.models import QueryPlan
 from fusion_memory.core.models import Scope
 from fusion_memory.core.models import SearchResult
 from fusion_memory.retrieval.pipeline import QueryUnderstandingEngine
+from fusion_memory.retrieval.pipeline import QueryUnderstandingResult
+from fusion_memory.retrieval.pipeline import RecallOrchestrator
+from fusion_memory.retrieval.pipeline import RetrievalExecutionContext
 from fusion_memory.retrieval.pipeline import build_pipeline_record
 from fusion_memory.retrieval.pipeline import selected_temporal_relation_summary
 from fusion_memory.retrieval.raw_evidence_quota import QuotaResult
 
 
 class RetrievalPipelineTests(unittest.TestCase):
+    def test_recall_orchestrator_returns_sanitized_result(self) -> None:
+        test_case = self
+
+        class FakeRegistry:
+            def __init__(self) -> None:
+                self.contexts = []
+
+            def recall(self, context):
+                self.contexts.append(context)
+                return [
+                    [
+                        Candidate("c1", "span", "private token zinc-sparrow-17", "l0_raw", {}, ["s1"], {}),
+                        Candidate("c2", "fact", "another private token", "l1_fact", {}, ["s2"], {}),
+                    ],
+                    [Candidate("c3", "span", "raw session secret", "l0_raw", {}, ["s3"], {})],
+                ]
+
+            def summary(self, context):
+                test_case.assertIs(context, self.contexts[0])
+                return [
+                    {
+                        "provider_id": "fake_raw",
+                        "source_family": "raw",
+                        "output_count": 3,
+                        "output_source_counts": {"l0_raw": 2, "l1_fact": 1},
+                        "sample_text": "private token zinc-sparrow-17",
+                    }
+                ]
+
+        def event_milestone_group(value) -> str | None:
+            return None
+
+        plan = QueryPlan(query="raw private query", query_type="fact_lookup", entities=[], time_constraints=[])
+        query_understanding = QueryUnderstandingResult(
+            plan=plan,
+            language="en",
+            intent="fact_lookup",
+            features=("current_value",),
+            intent_telemetry=None,
+            precomputed=True,
+        )
+        context = RetrievalExecutionContext(
+            service=object(),
+            query="raw private query with zinc-sparrow-17",
+            scope=Scope(workspace_id="ws-recall", user_id="u", agent_id="a", session_id="s"),
+            options={"enabled_sources": ["raw"], "mode": "balanced"},
+            query_understanding=query_understanding,
+            include_session=True,
+            per_source_limit=5,
+            enabled_sources=["raw"],
+            mode="balanced",
+            limit=4,
+            rerank_top_n=3,
+            event_milestone_group=event_milestone_group,
+        )
+        registry = FakeRegistry()
+
+        result = RecallOrchestrator(registry=registry).run(context)
+
+        self.assertEqual(len(result.candidate_lists), 2)
+        self.assertEqual([candidate.id for candidate in result.recalled_candidates], ["c1", "c2", "c3"])
+        self.assertEqual(result.safe_record()["source_counts"], {"l0_raw": 2, "l1_fact": 1})
+        self.assertEqual(
+            result.safe_record()["provider_summary"],
+            [
+                {
+                    "provider_id": "fake_raw",
+                    "source_family": "raw",
+                    "output_count": 3,
+                    "output_source_counts": {"l0_raw": 2, "l1_fact": 1},
+                }
+            ],
+        )
+        self.assertEqual(registry.contexts[0].enabled_sources, {"raw"})
+        self.assertTrue(registry.contexts[0].include_session)
+        self.assertNotIn("zinc-sparrow-17", repr(result.safe_record()))
+        self.assertNotIn("raw private query", repr(result.safe_record()))
+
     def test_query_understanding_engine_sanitizes_raw_query(self) -> None:
         class FakePlanner:
             def __init__(self) -> None:
