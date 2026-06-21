@@ -17,6 +17,18 @@ from fusion_memory.retrieval.providers.structured import (
     ExactProvider,
     FactProvider,
 )
+from fusion_memory.retrieval.providers.raw import (
+    AggregationCoverageProvider,
+    BroadRawProvider,
+    ContradictionClaimProvider,
+    EventOrderingCoverageProvider,
+    EventOrderingEpisodeProvider,
+    EventOrderingTimelineProvider,
+    RawSpanProvider,
+    ScentTrailProvider,
+    TemporalCoverageProvider,
+    TopicScopedRawProvider,
+)
 
 
 @dataclass(frozen=True)
@@ -204,6 +216,88 @@ class StructuredProviderTests(unittest.TestCase):
 
         self.assertEqual(candidates[0].source, "event_timeline_graph")
         self.assertEqual(candidates[0].scores["graph_proximity"], 0.80)
+
+
+class RawProviderTests(unittest.TestCase):
+    def _context(self, query_type: str = "fact_lookup") -> RecallContext:
+        service = SimpleNamespace()
+        service._retrieval_query = lambda query, plan, source: f"{source}:{query}"
+        service.store = SimpleNamespace(
+            search_spans=lambda *args, **kwargs: [
+                (
+                    SimpleNamespace(
+                        span_id="span-1",
+                        content="raw text",
+                        speaker="user",
+                        span_type="turn",
+                        timestamp=datetime(2026, 6, 1, tzinfo=timezone.utc),
+                    ),
+                    {"score": 0.9},
+                )
+            ]
+        )
+        service._topic_scoped_raw_candidates = lambda *args, **kwargs: [
+            Candidate("topic-1", "span", "topic text", "topic_scoped_raw", {"score": 0.8}, ["topic-1"], {})
+        ]
+        service._broad_raw_recall_candidates = lambda *args, **kwargs: [
+            Candidate("broad-1", "span", "broad text", "broad_raw_recall", {"score": 0.7}, ["broad-1"], {})
+        ]
+        service._raw_scent_trail_candidates = lambda query, scope, plan, prior, **kwargs: [
+            Candidate(f"scent-{len(prior)}", "span", "scent text", "raw_scent_trail", {"score": 0.6}, ["scent-1"], {})
+        ]
+        service._contradiction_claim_candidates = lambda *args, **kwargs: [
+            Candidate("claim-1", "claim", "claim text", "contradiction_claim_positive", {"score": 0.5}, ["claim-1"], {})
+        ]
+        service._temporal_coverage_candidates = lambda *args, **kwargs: [
+            Candidate("temporal-1", "span", "temporal text", "temporal_coverage", {"score": 0.5}, ["temporal-1"], {})
+        ]
+        service._aggregation_coverage_candidates = lambda *args, **kwargs: [
+            Candidate("aggregation-1", "span", "aggregation text", "aggregation_coverage", {"score": 0.5}, ["aggregation-1"], {})
+        ]
+        service._event_ordering_coverage_candidates = lambda *args, **kwargs: [
+            Candidate("graph-1", "event", "graph text", "event_ordering_graph_shadow", {"score": 0.9}, ["graph-1"], {}),
+            Candidate("legacy-1", "event", "legacy text", "event_ordering_coverage", {"score": 0.8}, ["legacy-1"], {}),
+        ]
+        service._event_ordering_episode_recall_candidates = lambda *args, **kwargs: [
+            Candidate("episode-1", "span", "episode text", "event_ordering_episode_recall", {"score": 0.7}, ["episode-1"], {})
+        ]
+        service._event_ordering_timeline_candidates = lambda *args, **kwargs: [
+            Candidate("timeline-1", "event", "timeline text", "event_ordering_timeline", {"score": 0.6}, ["timeline-1"], {})
+        ]
+        return RecallContext(
+            service=service,
+            query="Atlas retrieval",
+            scope=Scope(workspace_id="w", user_id="u", agent_id="a"),
+            plan=QueryPlan(query="Atlas retrieval", query_type=query_type, entities=[], time_constraints=[]),
+            per_source_limit=3,
+            enabled_sources=None,
+            include_session=False,
+            event_milestone_group=lambda event: None,
+            prior_candidates=[],
+        )
+
+    def test_raw_provider_sources_match_current_behavior(self) -> None:
+        context = self._context()
+        providers = [RawSpanProvider(), TopicScopedRawProvider(), BroadRawProvider()]
+
+        output = [[candidate.source for candidate in provider.recall(context)] for provider in providers]
+
+        self.assertEqual(output, [["l0_raw_hybrid"], ["topic_scoped_raw"], ["broad_raw_recall"]])
+
+    def test_scent_trail_uses_prior_candidates(self) -> None:
+        context = self._context()
+        context.prior_candidates.append(Candidate("prior", "span", "prior", "l0_raw_hybrid", {}, ["prior"], {}))
+
+        candidates = ScentTrailProvider().recall(context)
+
+        self.assertEqual(candidates[0].id, "scent-1")
+
+    def test_event_ordering_coverage_filters_graph_candidates_in_production(self) -> None:
+        context = self._context(query_type="event_ordering")
+
+        candidates = EventOrderingCoverageProvider().recall(context)
+
+        self.assertEqual([candidate.id for candidate in candidates], ["legacy-1"])
 
 
 if __name__ == "__main__":
