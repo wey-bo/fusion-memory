@@ -628,7 +628,8 @@ class MemoryService:
             object_id=trace_id,
             trace_id=trace_id,
             payload={
-                "query": query,
+                "query_hash": stable_hash(query),
+                "query_length": len(query),
                 "query_type": plan.query_type,
                 "mode": mode,
                 "candidate_count": len(selected),
