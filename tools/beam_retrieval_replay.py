@@ -53,6 +53,48 @@ _SENSITIVE_METADATA_KEYS = {
 _METADATA_KEY_EXCEPTIONS = {
     "text_hash",
 }
+_PLAINTEXT_METADATA_STRINGS = {
+    "answer",
+    "candidate_1",
+    "candidate_2",
+    "current_value",
+    "drop_stale_history",
+    "event_ordering_coverage",
+    "event_ordering_episode_recall",
+    "event_ordering_graph_selector",
+    "event_ordering_timeline",
+    "filter",
+    "filtered",
+    "kept",
+    "l0_raw",
+    "l0_raw_hybrid",
+    "l1_fact_hybrid",
+    "l3_current_view",
+    "observed",
+    "selected",
+    "span_1",
+}
+_PLAINTEXT_METADATA_KEY_VALUES = {
+    "category": {"current_value", "event_ordering", "retrieval"},
+    "decision": {"drop_stale_history", "fallback", "kept", "selected"},
+    "impact": {"filtered", "observed", "selected"},
+    "source": {
+        "candidate_1",
+        "candidate_2",
+        "event_ordering_coverage",
+        "event_ordering_episode_recall",
+        "event_ordering_graph_selector",
+        "event_ordering_timeline",
+        "l0_raw",
+        "l0_raw_hybrid",
+        "l1_fact_hybrid",
+        "l3_current_view",
+        "quality_fallback",
+        "span_1",
+    },
+    "stage": {"evidence_pack_filter", "filter", "search_filter"},
+    "text_hash": None,
+}
 
 ZH_PROBES = [
     SimpleNamespace(id="zh:1", category="zh_recall", query="我现在使用的数据库是什么？"),
@@ -132,6 +174,9 @@ def run_replay(
             "coverage_insufficient": bool(coverage.get("coverage_insufficient", False)),
             "pipeline_trace": _pipeline_trace_from_pack(coverage, getattr(pack, "debug_trace", []) or []),
         }
+        lifecycle = _sanitize_candidate_lifecycle(coverage.get("candidate_lifecycle"))
+        if lifecycle:
+            record["candidate_lifecycle"] = lifecycle
         if "rule_hits" in coverage:
             record["rule_hits"] = _sanitize_rule_hits(coverage["rule_hits"])
         records.append(record)
@@ -258,6 +303,22 @@ def _pipeline_trace_from_pack(coverage: dict[str, Any], debug_trace: Any) -> lis
     if coverage_trace:
         return [coverage_trace]
     return _sanitize_pipeline_trace(debug_trace)
+
+
+def _sanitize_candidate_lifecycle(value: Any) -> dict[str, Any]:
+    data = _object_dict(value)
+    if not data:
+        return {}
+    out: dict[str, Any] = {}
+    for key in ("record_count", "contributed_count", "packed_source_span_count"):
+        count = _sanitize_count_value(data.get(key))
+        if count is not None:
+            out[key] = count
+    for key in ("stage_counts", "source_counts", "reason_counts"):
+        mapping = _sanitize_count_mapping(data.get(key))
+        if mapping:
+            out[key] = mapping
+    return out
 
 
 def _sanitize_pipeline_record(value: Any) -> dict[str, Any]:
@@ -442,29 +503,39 @@ def _sanitize_metadata(value: Any) -> dict[str, Any]:
         key_text = str(key)
         if _metadata_key_contains_raw_text(key_text):
             continue
-        sanitized_value = _sanitize_metadata_value(item)
+        sanitized_value = _sanitize_metadata_value(item, key_text)
         if sanitized_value is not None:
             sanitized[key_text] = sanitized_value
     return sanitized
 
 
-def _sanitize_metadata_value(value: Any) -> Any:
+def _sanitize_metadata_value(value: Any, key: str | None = None) -> Any:
     if isinstance(value, dict):
         return _sanitize_metadata(value)
     if isinstance(value, list):
-        sanitized_items = [_sanitize_metadata_value(item) for item in value]
+        sanitized_items = [_sanitize_metadata_value(item, key) for item in value]
         return [item for item in sanitized_items if item is not None]
     if isinstance(value, tuple):
-        sanitized_items = [_sanitize_metadata_value(item) for item in value]
+        sanitized_items = [_sanitize_metadata_value(item, key) for item in value]
         return [item for item in sanitized_items if item is not None]
     if isinstance(value, bool | int | float):
         return value
     if isinstance(value, str):
         identifier = _sanitize_identifier_string(value)
-        if identifier is not None and len(value) <= 64:
+        if identifier is not None and len(value) <= 64 and _is_plaintext_metadata_string(value, key):
             return identifier
         return {"hash": sha1(value.encode("utf-8")).hexdigest()[:12]}
     return None
+
+
+def _is_plaintext_metadata_string(value: str, key: str | None = None) -> bool:
+    normalized_key = (key or "").lower()
+    if normalized_key in _PLAINTEXT_METADATA_KEY_VALUES and _PLAINTEXT_METADATA_KEY_VALUES[normalized_key] is None:
+        return True
+    allowed_for_key = _PLAINTEXT_METADATA_KEY_VALUES.get(normalized_key)
+    if allowed_for_key is not None:
+        return value in allowed_for_key
+    return value in _PLAINTEXT_METADATA_STRINGS
 
 
 def _metadata_key_contains_raw_text(key: str) -> bool:

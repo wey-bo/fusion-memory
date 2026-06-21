@@ -31,6 +31,7 @@ from fusion_memory.ingestion.views import ViewBuilder
 from fusion_memory.ingestion.window_builder import build_session_summary_span
 from fusion_memory.retrieval.chronology_normalizer import build_chronology_write_batch
 from fusion_memory.retrieval.chronology_selector import select_persisted_graph_event_ordering_candidates
+from fusion_memory.retrieval.candidate_lifecycle import CandidateLifecycleRecorder
 from fusion_memory.retrieval.evidence_pack import EvidencePackBuilder
 from fusion_memory.retrieval.event_graph_selection import (
     _event_milestone_group,
@@ -364,6 +365,7 @@ class MemoryService:
         precomputed_plan = options.get("_plan")
         plan = precomputed_plan or self.planner.plan(query, query_type_hint=options.get("query_type_hint"))
         intent_telemetry = options.get("_intent_telemetry") if precomputed_plan else self.planner.last_intent_telemetry
+        lifecycle = CandidateLifecycleRecorder()
         query_language = "zh" if re.search(r"[\u4e00-\u9fff]", query) else "en"
         query_features = [
             feature
@@ -382,11 +384,14 @@ class MemoryService:
             enabled_sources=options.get("enabled_sources"),
             include_session=include_session,
         )
+        for items in candidate_lists:
+            lifecycle.extend(items, "recalled", "candidate_provider")
         fused = reciprocal_rank_fusion(candidate_lists, k=self.config.rrf_k)
         scored = [score_candidate(candidate, plan) for candidate in fused]
         quota_result = self.quota.enforce(plan, scope, scored, include_session=include_session)
         marked = self._mark_quota_selected(quota_result.candidates, quota_result.selected_span_ids)
         scored_again = [score_candidate(candidate, plan) for candidate in marked]
+        lifecycle.extend(scored_again, "scored", "utility_scoring")
         scored_again.sort(key=lambda candidate: candidate.scores.get("utility_score", 0.0), reverse=True)
         mode = options.get("mode", "fast")
         limit = options.get("limit", self.config.retrieval_output_n)
@@ -397,69 +402,130 @@ class MemoryService:
             if mode == "benchmark"
             else limit
         )
+
+        def candidate_key(candidate: Candidate) -> tuple[str, str]:
+            return (str(candidate.type), str(candidate.id))
+
+        def record_rescued_delta(before: list[Candidate], after: list[Candidate], reason_code: str) -> list[Candidate]:
+            before_keys = {candidate_key(candidate) for candidate in before}
+            for candidate in after:
+                if candidate_key(candidate) not in before_keys:
+                    lifecycle.record(candidate, "rescued", reason_code, contributed=True)
+            return after
+
+        def record_filtered_delta(before: list[Candidate], after: list[Candidate], reason_code: str) -> list[Candidate]:
+            after_keys = {candidate_key(candidate) for candidate in after}
+            for candidate in before:
+                if candidate_key(candidate) not in after_keys:
+                    lifecycle.record(candidate, "filtered", reason_code, contributed=False)
+            return after
+
         preselected = mmr(scored_again, limit=rerank_top_n, lambda_=self.config.mmr_lambda)
-        preselected = self._preserve_high_signal_exact(scored_again, preselected, rerank_top_n)
-        preselected = self._preserve_scent_trail(scored_again, preselected, rerank_top_n)
-        preselected = self._preserve_broad_raw_recall(query, plan, scored_again, preselected, rerank_top_n)
+        before = preselected
+        preselected = record_rescued_delta(before, self._preserve_high_signal_exact(scored_again, before, rerank_top_n), "preserve_high_signal_exact")
+        before = preselected
+        preselected = record_rescued_delta(before, self._preserve_scent_trail(scored_again, before, rerank_top_n), "preserve_scent_trail")
+        before = preselected
+        preselected = record_rescued_delta(before, self._preserve_broad_raw_recall(query, plan, scored_again, before, rerank_top_n), "preserve_broad_raw_recall")
         if plan.query_type == "temporal_lookup":
-            preselected = self._preserve_temporal_coverage(scored_again, preselected, rerank_top_n)
+            before = preselected
+            preselected = record_rescued_delta(before, self._preserve_temporal_coverage(scored_again, before, rerank_top_n), "preserve_temporal_coverage")
         if plan.query_type == "multi_session_reasoning":
-            preselected = self._preserve_aggregation_coverage(query, scored_again, preselected, rerank_top_n)
-            preselected = self._preserve_user_synthesis_anchors(scored_again, preselected, rerank_top_n)
+            before = preselected
+            preselected = record_rescued_delta(before, self._preserve_aggregation_coverage(query, scored_again, before, rerank_top_n), "preserve_aggregation_coverage")
+            before = preselected
+            preselected = record_rescued_delta(before, self._preserve_user_synthesis_anchors(scored_again, before, rerank_top_n), "preserve_user_synthesis_anchors")
         if plan.query_type == "contradiction_resolution":
-            preselected = self._preserve_contradiction_claim_coverage(scored_again, preselected, rerank_top_n)
-        preselected = self._preserve_high_ranked_summaries(scored_again, preselected, rerank_top_n)
+            before = preselected
+            preselected = record_rescued_delta(before, self._preserve_contradiction_claim_coverage(scored_again, before, rerank_top_n), "preserve_contradiction_claim_coverage")
+        before = preselected
+        preselected = record_rescued_delta(before, self._preserve_high_ranked_summaries(scored_again, before, rerank_top_n), "preserve_high_ranked_summaries")
         if plan.query_type == "event_ordering":
-            preselected = self._preserve_event_ordering_events(query, scored_again, preselected, rerank_top_n)
-            preselected = self._preserve_event_ordering_raw_facets(query, scored_again, preselected, rerank_top_n)
+            before = preselected
+            preselected = record_rescued_delta(before, self._preserve_event_ordering_events(query, scored_again, before, rerank_top_n), "preserve_event_ordering_events")
+            before = preselected
+            preselected = record_rescued_delta(before, self._preserve_event_ordering_raw_facets(query, scored_again, before, rerank_top_n), "preserve_event_ordering_raw_facets")
         rerank_applied = mode in {"balanced", "benchmark"}
         if rerank_applied:
             reranked = rerank_candidates(query, preselected, self.reranker)
-            selected = self._preserve_quota_after_rerank(reranked, quota_result.selected_span_ids, limit)
-            selected = self._preserve_high_signal_exact(scored_again, selected, limit)
-            selected = self._preserve_scent_trail(scored_again, selected, limit)
-            selected = self._preserve_broad_raw_recall(query, plan, scored_again, selected, limit)
+            selected = record_rescued_delta(reranked, self._preserve_quota_after_rerank(reranked, quota_result.selected_span_ids, limit), "preserve_quota_after_rerank")
+            before = selected
+            selected = record_rescued_delta(before, self._preserve_high_signal_exact(scored_again, before, limit), "preserve_high_signal_exact")
+            before = selected
+            selected = record_rescued_delta(before, self._preserve_scent_trail(scored_again, before, limit), "preserve_scent_trail")
+            before = selected
+            selected = record_rescued_delta(before, self._preserve_broad_raw_recall(query, plan, scored_again, before, limit), "preserve_broad_raw_recall")
             if plan.query_type == "temporal_lookup":
-                selected = self._preserve_temporal_coverage(scored_again, selected, limit)
+                before = selected
+                selected = record_rescued_delta(before, self._preserve_temporal_coverage(scored_again, before, limit), "preserve_temporal_coverage")
             if plan.query_type == "multi_session_reasoning":
-                selected = self._preserve_aggregation_coverage(query, scored_again, selected, limit)
-                selected = self._preserve_user_synthesis_anchors(scored_again, selected, limit)
+                before = selected
+                selected = record_rescued_delta(before, self._preserve_aggregation_coverage(query, scored_again, before, limit), "preserve_aggregation_coverage")
+                before = selected
+                selected = record_rescued_delta(before, self._preserve_user_synthesis_anchors(scored_again, before, limit), "preserve_user_synthesis_anchors")
             if plan.query_type == "contradiction_resolution":
-                selected = self._preserve_contradiction_claim_coverage(scored_again, selected, limit)
-            selected = self._preserve_high_ranked_summaries(scored_again, selected, limit)
+                before = selected
+                selected = record_rescued_delta(before, self._preserve_contradiction_claim_coverage(scored_again, before, limit), "preserve_contradiction_claim_coverage")
+            before = selected
+            selected = record_rescued_delta(before, self._preserve_high_ranked_summaries(scored_again, before, limit), "preserve_high_ranked_summaries")
             if plan.query_type == "event_ordering":
-                selected = self._preserve_event_ordering_events(query, scored_again, selected, limit)
-                selected = self._preserve_event_ordering_raw_facets(query, scored_again, selected, limit)
+                before = selected
+                selected = record_rescued_delta(before, self._preserve_event_ordering_events(query, scored_again, before, limit), "preserve_event_ordering_events")
+                before = selected
+                selected = record_rescued_delta(before, self._preserve_event_ordering_raw_facets(query, scored_again, before, limit), "preserve_event_ordering_raw_facets")
         else:
             selected = preselected[:limit]
-        selected = self._apply_topic_scope_filter(query, plan, scored_again, selected, limit)
-        selected = self._apply_quality_fallback(query, plan, scope, scored_again, selected, limit, include_session=include_session)
-        selected = self._preserve_broad_raw_recall(query, plan, scored_again, selected, limit)
+        before = selected
+        selected = record_filtered_delta(before, self._apply_topic_scope_filter(query, plan, scored_again, before, limit), "topic_scope_filter")
+        before = selected
+        selected = record_rescued_delta(before, self._apply_quality_fallback(query, plan, scope, scored_again, before, limit, include_session=include_session), "quality_fallback")
+        before = selected
+        selected = record_rescued_delta(before, self._preserve_broad_raw_recall(query, plan, scored_again, before, limit), "preserve_broad_raw_recall")
         if plan.query_type == "temporal_lookup":
-            selected = self._preserve_temporal_coverage(scored_again, selected, limit)
+            before = selected
+            selected = record_rescued_delta(before, self._preserve_temporal_coverage(scored_again, before, limit), "preserve_temporal_coverage")
         if plan.query_type == "multi_session_reasoning":
-            selected = self._preserve_aggregation_coverage(query, scored_again, selected, limit)
-            selected = self._preserve_user_synthesis_anchors(scored_again, selected, limit)
+            before = selected
+            selected = record_rescued_delta(before, self._preserve_aggregation_coverage(query, scored_again, before, limit), "preserve_aggregation_coverage")
+            before = selected
+            selected = record_rescued_delta(before, self._preserve_user_synthesis_anchors(scored_again, before, limit), "preserve_user_synthesis_anchors")
         if plan.query_type == "contradiction_resolution":
-            selected = self._preserve_contradiction_claim_coverage(scored_again, selected, limit)
+            before = selected
+            selected = record_rescued_delta(before, self._preserve_contradiction_claim_coverage(scored_again, before, limit), "preserve_contradiction_claim_coverage")
         if plan.query_type == "event_ordering":
-            selected = self._preserve_event_ordering_events(query, scored_again, selected, limit)
-            selected = self._preserve_event_ordering_raw_facets(query, scored_again, selected, limit)
-        selected = self._apply_topic_scope_filter(query, plan, scored_again, selected, limit)
-        selected = self._preserve_scent_trail(scored_again, selected, limit)
-        selected = self._preserve_broad_raw_recall(query, plan, scored_again, selected, limit)
-        selected = self._filter_stale_current_value_candidates(query, plan, selected)
+            before = selected
+            selected = record_rescued_delta(before, self._preserve_event_ordering_events(query, scored_again, before, limit), "preserve_event_ordering_events")
+            before = selected
+            selected = record_rescued_delta(before, self._preserve_event_ordering_raw_facets(query, scored_again, before, limit), "preserve_event_ordering_raw_facets")
+        before = selected
+        selected = record_filtered_delta(before, self._apply_topic_scope_filter(query, plan, scored_again, before, limit), "topic_scope_filter")
+        before = selected
+        selected = record_rescued_delta(before, self._preserve_scent_trail(scored_again, before, limit), "preserve_scent_trail")
+        before = selected
+        selected = record_rescued_delta(before, self._preserve_broad_raw_recall(query, plan, scored_again, before, limit), "preserve_broad_raw_recall")
+        before = selected
+        selected = record_filtered_delta(before, self._filter_stale_current_value_candidates(query, plan, before), "stale_current_value_filter")
         annotated_candidates = annotate_runtime_preservation_candidates(scored_again)
-        selected, dropped_high_signal = preserve_required_candidates(annotated_candidates, selected, limit)
+        before = selected
+        selected, dropped_high_signal = preserve_required_candidates(annotated_candidates, before, limit)
+        selected = record_rescued_delta(before, selected, "runtime_required_preservation")
         if plan.query_type == "event_ordering":
+            before = selected
             selected, scope_dropped_high_signal = self._apply_event_ordering_post_preservation_topic_scope_filter(
                 query,
                 plan,
                 scored_again,
-                selected,
+                before,
                 limit,
             )
+            selected = record_filtered_delta(before, selected, "event_ordering_topic_scope_filter")
             dropped_high_signal.extend(scope_dropped_high_signal)
+        for candidate in selected:
+            lifecycle.record(candidate, "selected", "final_selection", contributed=True)
+        for dropped in dropped_high_signal:
+            candidate = dropped.get("candidate") if isinstance(dropped, dict) else None
+            if isinstance(candidate, Candidate):
+                lifecycle.record(candidate, "filtered", "runtime_required_preservation", contributed=False)
         for candidate in selected:
             self.store.insert_utility_example(utility_example(trace_id, query, plan, candidate))
         shadow_ranking = self.utility_scorer.rank_shadow(selected, plan) if self.utility_scorer.trained else []
@@ -487,6 +553,8 @@ class MemoryService:
                 )
         if intent_telemetry:
             coverage["query_intent_telemetry"] = intent_telemetry
+        coverage["candidate_lifecycle"] = lifecycle.summary()
+        lifecycle_trace = lifecycle.to_trace()
         pipeline_record = build_pipeline_record(
             plan.query_type,
             str(mode),
@@ -510,6 +578,7 @@ class MemoryService:
             "coverage": coverage,
             "pipeline_trace": pipeline_trace,
             "retrieval_trace": pipeline_trace,
+            "candidate_lifecycle_trace": lifecycle_trace,
             "mode": mode,
             "enabled_sources": options.get("enabled_sources"),
             "allow_cross_session": allow_cross_session,
@@ -559,7 +628,8 @@ class MemoryService:
             object_id=trace_id,
             trace_id=trace_id,
             payload={
-                "query": query,
+                "query_hash": stable_hash(query),
+                "query_length": len(query),
                 "query_type": plan.query_type,
                 "mode": mode,
                 "candidate_count": len(selected),
@@ -635,6 +705,12 @@ class MemoryService:
                 source_span_count=len(pack.source_spans),
                 coverage_insufficient=bool(pack.coverage.get("coverage_insufficient", False)),
             )
+        lifecycle = dict(pack.coverage.get("candidate_lifecycle") or {})
+        stage_counts = dict(lifecycle.get("stage_counts") or {})
+        stage_counts["packed"] = len(pack.source_spans)
+        lifecycle["stage_counts"] = stage_counts
+        lifecycle["packed_source_span_count"] = len(pack.source_spans)
+        pack.coverage["candidate_lifecycle"] = lifecycle
         pack_rule_hits = [hit.__dict__ for hit in rule_hits.drain()]
         if pack_rule_hits:
             seen_hit_keys = {

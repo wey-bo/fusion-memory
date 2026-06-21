@@ -67,6 +67,25 @@ class ConfigAndReportingTests(unittest.TestCase):
         self.assertIn("encoding_report", report)
         self.assertIn("profile_report", report)
 
+    def test_search_audit_event_does_not_store_raw_query_text(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w-audit-safe", user_id="u", agent_id="a")
+        query = "Which private token zinc-sparrow-17 did I mention?"
+        try:
+            memory.add("Remember private token zinc-sparrow-17 for audit safety.", scope)
+            memory.search(query, scope)
+            events = memory.audit_events(scope, event_type="memory.search")
+        finally:
+            memory.close()
+
+        self.assertTrue(events)
+        payload = events[0]["payload"]
+        self.assertNotIn("query", payload)
+        self.assertNotIn(query, repr(payload))
+        self.assertNotIn("zinc-sparrow-17", repr(payload))
+        self.assertRegex(payload["query_hash"], r"^[0-9a-f]{64}$")
+        self.assertEqual(payload["query_length"], len(query))
+
 
 if __name__ == "__main__":
     unittest.main()

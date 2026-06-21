@@ -6,9 +6,11 @@ from types import MethodType
 from fusion_memory.api.service import MemoryService
 from fusion_memory.core.models import Candidate
 from fusion_memory.core.models import EvidencePack
+from fusion_memory.core.models import QueryPlan
 from fusion_memory.core.models import Scope
 from fusion_memory.core.models import SearchResult
 from fusion_memory.retrieval.pipeline import build_pipeline_record
+from fusion_memory.retrieval.raw_evidence_quota import QuotaResult
 
 
 class RetrievalPipelineTests(unittest.TestCase):
@@ -122,3 +124,83 @@ class RetrievalPipelineTests(unittest.TestCase):
 
         evidence_layer = pack.coverage["pipeline_trace"]["pipeline_layers"]["EvidencePackBuilder"]
         self.assertEqual(evidence_layer["source_span_count"], len(pack.source_spans))
+
+    def test_search_coverage_includes_candidate_lifecycle_without_raw_text(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="ws-lifecycle", user_id="u", agent_id="a")
+        raw_memory_text = "Remember private token violet-river-42 for lifecycle tracing."
+        raw_query_text = "Which private token did I ask you to remember for lifecycle tracing?"
+        try:
+            memory.add({"role": "user", "content": raw_memory_text}, scope)
+            result = memory.search(raw_query_text, scope)
+            trace = memory.debug_trace(result.trace_id, scope)
+        finally:
+            memory.close()
+
+        lifecycle = result.coverage["candidate_lifecycle"]
+        self.assertGreater(lifecycle["stage_counts"].get("recalled", 0), 0)
+        self.assertGreater(lifecycle["stage_counts"].get("selected", 0), 0)
+        self.assertIn("candidate_lifecycle_trace", trace)
+        self.assertNotIn(raw_memory_text, repr(lifecycle))
+        self.assertNotIn(raw_query_text, repr(lifecycle))
+        self.assertNotIn(raw_memory_text, repr(trace["candidate_lifecycle_trace"]))
+        self.assertNotIn(raw_query_text, repr(trace["candidate_lifecycle_trace"]))
+
+    def test_search_lifecycle_records_preservation_rescue_delta_without_raw_text(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="ws-lifecycle-rescue", user_id="u", agent_id="a")
+        base = Candidate("base", "span", "base raw token zinc-sparrow-17", "l0_raw", {"utility_score": 0.9}, ["base"], {})
+        rescue = Candidate(
+            "rescue",
+            "span",
+            "rescued raw token zinc-sparrow-17",
+            "raw_scent_trail",
+            {"utility_score": 0.1, "trail_score": 0.9},
+            ["rescue"],
+            {},
+        )
+
+        def fake_candidate_lists(*args, **kwargs):
+            return [[base, rescue]]
+
+        def fake_enforce(plan, search_scope, candidates, *, include_session=False):
+            return QuotaResult(candidates=list(candidates), selected_span_ids=["base"], required=1, coverage_insufficient=False, backfilled=0)
+
+        def fake_mmr_selected(candidates, selected, limit):
+            return [base]
+
+        def fake_preserve_scent(candidates, selected, limit):
+            return [rescue, base][:limit]
+
+        memory._candidate_lists = fake_candidate_lists
+        memory.quota.enforce = fake_enforce
+        memory.planner.plan = lambda query, query_type_hint=None: QueryPlan(query=query, query_type="fact_lookup", entities=[], time_constraints=[])
+        memory._preserve_high_signal_exact = fake_mmr_selected
+        memory._preserve_scent_trail = fake_preserve_scent
+        memory.store.insert_utility_example = lambda example: None
+
+        try:
+            result = memory.search("Which raw token?", scope, {"limit": 2, "mode": "fast"})
+            trace = memory.debug_trace(result.trace_id, scope)
+        finally:
+            memory.close()
+
+        lifecycle = result.coverage["candidate_lifecycle"]
+        self.assertGreater(lifecycle["stage_counts"].get("rescued", 0), 0)
+        self.assertGreater(lifecycle["reason_counts"].get("preserve_scent_trail", 0), 0)
+        self.assertNotIn("zinc-sparrow-17", repr(lifecycle))
+        self.assertNotIn("zinc-sparrow-17", repr(trace["candidate_lifecycle_trace"]))
+
+    def test_answer_context_lifecycle_reports_packed_source_spans(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="ws-lifecycle-pack", user_id="u", agent_id="a")
+        try:
+            memory.add({"role": "user", "content": "Remember private token silver-forest-77 for packed lifecycle."}, scope)
+            pack = memory.answer_context("Which private token did I ask you to remember for packed lifecycle?", scope)
+        finally:
+            memory.close()
+
+        lifecycle = pack.coverage["candidate_lifecycle"]
+        self.assertEqual(lifecycle["stage_counts"].get("packed", 0), len(pack.source_spans))
+        self.assertEqual(lifecycle["packed_source_span_count"], len(pack.source_spans))
+        self.assertNotIn("silver-forest-77", repr(lifecycle))

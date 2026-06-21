@@ -137,6 +137,24 @@ class RuleRegistryTests(unittest.TestCase):
         self.assertNotIn("PostgreSQL for memory", str(hit.metadata))
         self.assertNotIn("默认数据库", str(hit.metadata))
 
+    def test_record_rule_hit_hashes_identifier_like_raw_metadata_under_neutral_keys(self) -> None:
+        hit = record_rule_hit(
+            rule_id="current_value.neutral_metadata",
+            query="What is my private token?",
+            text="My private token is zinc-sparrow-17.",
+            stage="test",
+            metadata={
+                "note": "zinc-sparrow-17",
+                "safe": {"decision": "selected", "source": "l0_raw_hybrid", "category": "current_value"},
+                "stage": "search_filter",
+            },
+        )
+
+        self.assertRegex(str(hit.metadata["note"]), r"^[0-9a-f]{12}$")
+        self.assertEqual(hit.metadata["safe"], {"decision": "selected", "source": "l0_raw_hybrid", "category": "current_value"})
+        self.assertEqual(hit.metadata["stage"], "search_filter")
+        self.assertNotIn("zinc-sparrow-17", repr(hit.metadata))
+
     def test_record_rule_hit_preserves_positional_metadata(self) -> None:
         metadata = {"decision": "drop_stale_history", "source": "candidate_1"}
 

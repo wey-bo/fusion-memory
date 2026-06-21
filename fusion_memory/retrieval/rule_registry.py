@@ -47,6 +47,87 @@ _SENSITIVE_METADATA_KEYS = {
     "conditions",
     "taxonomy_hits",
 }
+_PLAINTEXT_METADATA_STRINGS = {
+    "answer",
+    "candidate_1",
+    "candidate_2",
+    "current_value",
+    "delete_no_hits",
+    "drop_stale_history",
+    "evidence_pack_filter",
+    "event_ordering",
+    "event_ordering_coverage",
+    "event_ordering_episode_recall",
+    "event_ordering_graph_selector",
+    "event_ordering_timeline",
+    "fallback",
+    "filter",
+    "filtered",
+    "first_pass",
+    "generic",
+    "keep_shadow",
+    "kept",
+    "l0_raw",
+    "l0_raw_hybrid",
+    "l1_fact_hybrid",
+    "l3_current_view",
+    "legacy_fallback",
+    "observed",
+    "preserve_language_exact_match",
+    "retrieval",
+    "search_filter",
+    "selected",
+    "span_1",
+    "suppress",
+    "test_exception_cleanup",
+}
+_PLAINTEXT_METADATA_KEY_VALUES = {
+    "category": {
+        "current_value",
+        "event_ordering",
+        "generic",
+        "retrieval",
+    },
+    "decision": {
+        "drop_stale_history",
+        "fallback",
+        "keep",
+        "kept",
+        "legacy_fallback",
+        "preserve_language_exact_match",
+        "selected",
+        "suppress",
+        "test_exception_cleanup",
+    },
+    "impact": {
+        "filtered",
+        "observed",
+        "selected",
+    },
+    "label": {
+        "history-marker",
+    },
+    "source": {
+        "candidate_1",
+        "candidate_2",
+        "event_ordering_coverage",
+        "event_ordering_episode_recall",
+        "event_ordering_graph_selector",
+        "event_ordering_timeline",
+        "l0_raw",
+        "l0_raw_hybrid",
+        "l1_fact_hybrid",
+        "l3_current_view",
+        "quality_fallback",
+        "span_1",
+    },
+    "stage": {
+        "evidence_pack_filter",
+        "filter",
+        "search_filter",
+        "test",
+    },
+}
 
 
 def register_rule(rule: RuleDefinition) -> RuleDefinition:
@@ -126,7 +207,7 @@ def _sanitize_metadata(metadata: dict[str, object] | None) -> dict[str, object]:
         if _metadata_key_contains_raw_text(key):
             sanitized[key] = _hash_metadata_value(value)
             continue
-        sanitized[key] = _sanitize_metadata_value(value)
+        sanitized[key] = _sanitize_metadata_value(value, str(key))
     return sanitized
 
 
@@ -141,24 +222,34 @@ def _hash_metadata_value(value: object) -> str:
     return sha1(repr(value).encode("utf-8")).hexdigest()[:12]
 
 
-def _sanitize_metadata_value(value: object) -> object:
+def _sanitize_metadata_value(value: object, key: str | None = None) -> object:
     if isinstance(value, dict):
         return {
-            str(key): (_hash_metadata_value(item) if _metadata_key_contains_raw_text(str(key)) else _sanitize_metadata_value(item))
-            for key, item in value.items()
+            str(item_key): (
+                _hash_metadata_value(item)
+                if _metadata_key_contains_raw_text(str(item_key))
+                else _sanitize_metadata_value(item, str(item_key))
+            )
+            for item_key, item in value.items()
         }
     if isinstance(value, (list, tuple, set)):
-        return [_sanitize_metadata_value(item) for item in value]
+        return [_sanitize_metadata_value(item, key) for item in value]
     if isinstance(value, str):
-        return value if _is_safe_metadata_string(value) else _hash_metadata_value(value)
+        return value if _is_safe_metadata_string(value, key) else _hash_metadata_value(value)
     if isinstance(value, (int, float, bool)) or value is None:
         return value
     return _hash_metadata_value(value)
 
 
-def _is_safe_metadata_string(value: str) -> bool:
+def _is_safe_metadata_string(value: str, key: str | None = None) -> bool:
     if len(value) > 128:
         return False
     if re.search(r"\s|[\u4e00-\u9fff]", value):
         return False
-    return bool(re.fullmatch(r"[A-Za-z0-9_.:/@+\-]*", value))
+    if not re.fullmatch(r"[A-Za-z0-9_.:/@+\-]*", value):
+        return False
+    normalized_key = (key or "").lower()
+    allowed_for_key = _PLAINTEXT_METADATA_KEY_VALUES.get(normalized_key)
+    if allowed_for_key is not None:
+        return value in allowed_for_key
+    return value in _PLAINTEXT_METADATA_STRINGS
