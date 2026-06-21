@@ -18,6 +18,16 @@ def _duplicate_of(rule_hits: list[dict[str, object]]) -> str | None:
     return None
 
 
+def _string_values(rule_hits: list[dict[str, object]], key: str) -> list[str]:
+    return sorted(
+        {
+            value
+            for hit in rule_hits
+            if isinstance((value := hit.get(key)), str) and value
+        }
+    )
+
+
 def _cleanup_classification(
     rule_id: str,
     hit_count: int,
@@ -69,6 +79,9 @@ def build_rule_audit(
                 if isinstance((audit_input := hit.get("_audit_input")), str) and audit_input
             }
         )
+        provider_ids = _string_values(rule_hits, "provider_id")
+        lifecycle_stages = _string_values(rule_hits, "lifecycle_stage")
+        lifecycle_reasons = _string_values(rule_hits, "lifecycle_reason")
         duplicate_of = _duplicate_of(rule_hits) or rule.duplicate_of
         cleanup_phase, cleanup_action, safe_to_delete = _cleanup_classification(
             rule.rule_id,
@@ -90,6 +103,9 @@ def build_rule_audit(
                 "negative_impact_count": negative_impact_count,
                 "candidate_for_deletion": safe_to_delete,
                 "evidence_inputs": evidence_inputs,
+                "provider_ids": provider_ids,
+                "lifecycle_stages": lifecycle_stages,
+                "lifecycle_reasons": lifecycle_reasons,
                 "duplicate_of": duplicate_of,
                 "cleanup_phase": cleanup_phase,
                 "cleanup_action": cleanup_action,

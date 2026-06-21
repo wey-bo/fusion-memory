@@ -332,6 +332,44 @@ class RuleRegistryTests(unittest.TestCase):
         self.assertEqual(audit[1]["rule_id"], "zh.recall")
         self.assertEqual(audit[1]["hit_count"], 0)
 
+    def test_registered_rule_audit_reports_provider_and_lifecycle_dimensions(self) -> None:
+        rules = [
+            RuleDefinition(
+                rule_id="event.order",
+                module="m",
+                purpose="event order",
+                category="event_ordering",
+                ability="event_ordering",
+            ),
+        ]
+        hits = [
+            {
+                "rule_id": "event.order",
+                "provider_id": "views",
+                "lifecycle_stage": "selected",
+                "lifecycle_reason": "views",
+            },
+            {
+                "rule_id": "event.order",
+                "provider_id": "l3_current_view",
+                "lifecycle_stage": "selected",
+                "lifecycle_reason": "event_ordering_coverage",
+            },
+            {
+                "rule_id": "event.order",
+                "provider_id": ["raw provider value"],
+                "lifecycle_stage": None,
+                "lifecycle_reason": {"raw": "value"},
+            },
+        ]
+
+        audit = build_rule_audit(rules, hits)
+        row = audit[0]
+
+        self.assertEqual(row["provider_ids"], ["l3_current_view", "views"])
+        self.assertEqual(row["lifecycle_stages"], ["selected"])
+        self.assertEqual(row["lifecycle_reasons"], ["event_ordering_coverage", "views"])
+
     def test_registered_rule_audit_marks_zero_hit_rules_for_first_pass_cleanup(self) -> None:
         rules = [
             RuleDefinition(
@@ -355,6 +393,9 @@ class RuleRegistryTests(unittest.TestCase):
         zero_hit = next(row for row in audit if row["rule_id"] == "zh.recall")
 
         self.assertIsNone(zero_hit["duplicate_of"])
+        self.assertEqual(zero_hit["provider_ids"], [])
+        self.assertEqual(zero_hit["lifecycle_stages"], [])
+        self.assertEqual(zero_hit["lifecycle_reasons"], [])
         self.assertEqual(zero_hit["cleanup_phase"], "first_pass")
         self.assertEqual(zero_hit["cleanup_action"], "delete_no_hits")
         self.assertTrue(zero_hit["safe_to_delete"])
