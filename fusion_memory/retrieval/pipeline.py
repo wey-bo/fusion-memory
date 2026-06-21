@@ -8,6 +8,8 @@ from fusion_memory.core.models import Candidate
 from fusion_memory.core.models import Scope
 from fusion_memory.retrieval.providers import RecallContext
 from fusion_memory.retrieval.providers import default_provider_registry
+from fusion_memory.retrieval.rrf import reciprocal_rank_fusion
+from fusion_memory.retrieval.scoring import score_candidate
 from fusion_memory.retrieval.temporal_relations import temporal_relation_summary_from_safe_records
 
 
@@ -146,6 +148,91 @@ class RecallOrchestrator:
             recalled_candidates=recalled_candidates,
             provider_summary=provider_summary,
         )
+
+
+@dataclass(frozen=True)
+class FusionResult:
+    fused: list[Candidate]
+    scored: list[Candidate]
+    quota_result: Any
+    marked: list[Candidate]
+    scored_again: list[Candidate]
+    rerank_top_n: int
+    mode: str
+    limit: int
+
+    def safe_record(self) -> dict[str, Any]:
+        return {
+            "fused_source_counts": _candidate_source_counts(self.fused),
+            "scored_count": len(self.scored),
+            "marked_count": len(self.marked),
+            "scored_again_count": len(self.scored_again),
+            "quota_required": int(getattr(self.quota_result, "required", 0)),
+            "quota_selected": len(getattr(self.quota_result, "selected_span_ids", []) or []),
+            "coverage_insufficient": bool(getattr(self.quota_result, "coverage_insufficient", False)),
+            "backfilled": int(getattr(self.quota_result, "backfilled", 0)),
+            "mode": self.mode,
+            "limit": int(self.limit),
+            "rerank_top_n": int(self.rerank_top_n),
+        }
+
+
+class CandidateFusionEngine:
+    def run(self, context: RetrievalExecutionContext, recall_result: RecallResult) -> FusionResult:
+        service = context.service
+        plan = context.query_understanding.plan
+        fused = reciprocal_rank_fusion(recall_result.candidate_lists, k=service.config.rrf_k)
+        scored = [score_candidate(candidate, plan) for candidate in fused]
+        quota_result = service.quota.enforce(plan, context.scope, scored, include_session=context.include_session)
+        marked = self._mark_quota_selected(quota_result.candidates, quota_result.selected_span_ids)
+        scored_again = [score_candidate(candidate, plan) for candidate in marked]
+        scored_again.sort(key=lambda candidate: candidate.scores.get("utility_score", 0.0), reverse=True)
+        mode = context.options.get("mode", context.mode)
+        limit = context.options.get("limit", context.limit)
+        rerank_top_n = context.options.get("rerank_top_n") or (
+            service.config.balanced_mode_rerank_top_n
+            if mode == "balanced"
+            else service.config.benchmark_mode_rerank_top_n
+            if mode == "benchmark"
+            else limit
+        )
+        return FusionResult(
+            fused=fused,
+            scored=scored,
+            quota_result=quota_result,
+            marked=marked,
+            scored_again=scored_again,
+            rerank_top_n=rerank_top_n,
+            mode=mode,
+            limit=limit,
+        )
+
+    def _mark_quota_selected(self, candidates: list[Candidate], span_ids: list[str]) -> list[Candidate]:
+        selected = set(span_ids)
+        out: list[Candidate] = []
+        for candidate in candidates:
+            metadata = dict(candidate.metadata)
+            if candidate.type == "span" and candidate.id in selected:
+                metadata["quota_selected"] = True
+            if candidate.type == "view" and candidate.source == "l3_current_view":
+                reasons = list(metadata.get("must_preserve_reason") or [])
+                if "current_value" not in reasons:
+                    reasons.append("current_value")
+                metadata["must_preserve_reason"] = reasons
+                metadata["evidence_role"] = "answer"
+                metadata["current_value"] = True
+            out.append(
+                Candidate(
+                    id=candidate.id,
+                    type=candidate.type,
+                    text=candidate.text,
+                    source=candidate.source,
+                    scores=candidate.scores,
+                    source_span_ids=candidate.source_span_ids,
+                    metadata=metadata,
+                )
+            )
+        return out
 
 
 def _candidate_source_counts(candidates: list[Candidate]) -> dict[str, int]:

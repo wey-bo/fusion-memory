@@ -9,9 +9,11 @@ from fusion_memory.core.models import EvidencePack
 from fusion_memory.core.models import QueryPlan
 from fusion_memory.core.models import Scope
 from fusion_memory.core.models import SearchResult
+from fusion_memory.retrieval.pipeline import CandidateFusionEngine
 from fusion_memory.retrieval.pipeline import QueryUnderstandingEngine
 from fusion_memory.retrieval.pipeline import QueryUnderstandingResult
 from fusion_memory.retrieval.pipeline import RecallOrchestrator
+from fusion_memory.retrieval.pipeline import RecallResult
 from fusion_memory.retrieval.pipeline import RetrievalExecutionContext
 from fusion_memory.retrieval.pipeline import build_pipeline_record
 from fusion_memory.retrieval.pipeline import selected_temporal_relation_summary
@@ -19,6 +21,80 @@ from fusion_memory.retrieval.raw_evidence_quota import QuotaResult
 
 
 class RetrievalPipelineTests(unittest.TestCase):
+    def test_candidate_fusion_engine_matches_existing_scoring_shape(self) -> None:
+        class FakeConfig:
+            rrf_k = 1
+            retrieval_output_n = 2
+            balanced_mode_rerank_top_n = 5
+            benchmark_mode_rerank_top_n = 7
+
+        class FakeQuota:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def enforce(self, plan, scope, candidates, *, include_session=False):
+                self.calls.append((plan, scope, [candidate.id for candidate in candidates], include_session))
+                return QuotaResult(
+                    candidates=list(candidates),
+                    selected_span_ids=["span-2"],
+                    required=1,
+                    coverage_insufficient=False,
+                    backfilled=0,
+                )
+
+        class FakeService:
+            def __init__(self) -> None:
+                self.config = FakeConfig()
+                self.quota = FakeQuota()
+
+        def event_milestone_group(value) -> str | None:
+            return None
+
+        plan = QueryPlan(query="private token zinc-sparrow-17", query_type="fact_lookup", entities=[], time_constraints=[])
+        query_understanding = QueryUnderstandingResult(
+            plan=plan,
+            language="en",
+            intent="fact_lookup",
+            features=(),
+            intent_telemetry=None,
+            precomputed=True,
+        )
+        scope = Scope(workspace_id="ws-fusion", user_id="u", agent_id="a", session_id="s")
+        service = FakeService()
+        context = RetrievalExecutionContext(
+            service=service,
+            query="private token zinc-sparrow-17",
+            scope=scope,
+            options={"mode": "balanced", "limit": 2},
+            query_understanding=query_understanding,
+            include_session=True,
+            per_source_limit=3,
+            enabled_sources=None,
+            mode="balanced",
+            limit=2,
+            rerank_top_n=5,
+            event_milestone_group=event_milestone_group,
+        )
+        span_1 = Candidate("span-1", "span", "private candidate alpha", "semantic", {"semantic_score": 0.7}, ["span-1"], {})
+        span_2_semantic = Candidate("span-2", "span", "private candidate beta", "semantic", {"semantic_score": 0.2}, ["span-2"], {})
+        span_2_exact = Candidate("span-2", "span", "private candidate beta", "exact", {"exact_signal": 0.9}, ["span-2"], {})
+        recall_result = RecallResult(candidate_lists=[[span_1, span_2_semantic], [span_2_exact]], recalled_candidates=[span_1, span_2_semantic, span_2_exact])
+
+        result = CandidateFusionEngine().run(context, recall_result)
+
+        self.assertEqual([candidate.id for candidate in result.fused], ["span-2", "span-1"])
+        self.assertEqual(service.quota.calls, [(plan, scope, ["span-2", "span-1"], True)])
+        self.assertEqual([candidate.id for candidate in result.scored], ["span-2", "span-1"])
+        self.assertEqual([candidate.id for candidate in result.marked], ["span-2", "span-1"])
+        self.assertTrue(result.marked[0].metadata["quota_selected"])
+        self.assertEqual([candidate.id for candidate in result.scored_again], ["span-2", "span-1"])
+        self.assertGreaterEqual(result.scored_again[0].scores["utility_score"], result.scored_again[1].scores["utility_score"])
+        self.assertIs(result.quota_result.candidates[0], result.scored[0])
+        self.assertEqual(result.mode, "balanced")
+        self.assertEqual(result.limit, 2)
+        self.assertEqual(result.rerank_top_n, 5)
+        self.assertNotIn("zinc-sparrow-17", repr(result.safe_record()))
+
     def test_recall_orchestrator_returns_sanitized_result(self) -> None:
         test_case = self
 
