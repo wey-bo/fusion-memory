@@ -183,36 +183,47 @@ def update_pipeline_evidence_output(
 
 def selected_temporal_relation_summary(candidates: list[Candidate]) -> dict[str, object] | None:
     safe_records: list[dict[str, object]] = []
-    relation_count = 0
-    relation_types: set[str] = set()
-    role_labels: set[str] = set()
-    reason_codes: set[str] = set()
-    source_span_ids: set[str] = set()
+    summary_relation_count = 0
+    summary_relation_types: set[str] = set()
+    summary_role_labels: set[str] = set()
+    summary_reason_codes: set[str] = set()
+    summary_source_span_ids: set[str] = set()
 
     for candidate in candidates:
         metadata = candidate.metadata if isinstance(candidate.metadata, dict) else {}
         summary = metadata.get("temporal_relation_summary")
         if isinstance(summary, dict):
-            relation_count += int(summary.get("relation_count") or 0)
-            relation_types.update(str(item) for item in (summary.get("relation_types") or []) if item)
-            role_labels.update(str(item) for item in (summary.get("role_labels") or []) if item)
-            reason_codes.update(str(item) for item in (summary.get("reason_codes") or []) if item)
-            source_span_ids.update(str(item) for item in (summary.get("source_span_ids") or []) if item)
-            continue
+            summary_relation_count += int(summary.get("relation_count") or 0)
+            summary_relation_types.update(str(item) for item in (summary.get("relation_types") or []) if item)
+            summary_role_labels.update(str(item) for item in (summary.get("role_labels") or []) if item)
+            summary_reason_codes.update(str(item) for item in (summary.get("reason_codes") or []) if item)
+            summary_source_span_ids.update(str(item) for item in (summary.get("source_span_ids") or []) if item)
 
         relations = metadata.get("temporal_relations")
         if isinstance(relations, list):
             safe_records.extend(item for item in relations if isinstance(item, dict))
 
-    if relation_count > 0:
-        return {
-            "relation_count": relation_count,
-            "relation_types": sorted(relation_types),
-            "role_labels": sorted(role_labels),
-            "reason_codes": sorted(reason_codes),
-            "source_span_count": len(source_span_ids),
-            "source_span_ids": sorted(source_span_ids),
-        }
-    if safe_records:
-        return temporal_relation_summary_from_safe_records(safe_records)
-    return None
+    if summary_relation_count == 0 and not safe_records:
+        return None
+
+    safe_summary = temporal_relation_summary_from_safe_records(safe_records) if safe_records else {
+        "relation_count": 0,
+        "relation_types": [],
+        "role_labels": [],
+        "reason_codes": [],
+        "source_span_count": 0,
+        "source_span_ids": [],
+    }
+
+    relation_types = sorted(summary_relation_types | set(str(item) for item in safe_summary["relation_types"]))
+    role_labels = sorted(summary_role_labels | set(str(item) for item in safe_summary["role_labels"]))
+    reason_codes = sorted(summary_reason_codes | set(str(item) for item in safe_summary["reason_codes"]))
+    source_span_ids = sorted(summary_source_span_ids | set(str(item) for item in safe_summary["source_span_ids"]))
+    return {
+        "relation_count": summary_relation_count + int(safe_summary["relation_count"]),
+        "relation_types": relation_types,
+        "role_labels": role_labels,
+        "reason_codes": reason_codes,
+        "source_span_count": len(source_span_ids),
+        "source_span_ids": source_span_ids,
+    }

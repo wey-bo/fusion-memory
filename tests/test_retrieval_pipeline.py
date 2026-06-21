@@ -10,6 +10,7 @@ from fusion_memory.core.models import QueryPlan
 from fusion_memory.core.models import Scope
 from fusion_memory.core.models import SearchResult
 from fusion_memory.retrieval.pipeline import build_pipeline_record
+from fusion_memory.retrieval.pipeline import selected_temporal_relation_summary
 from fusion_memory.retrieval.raw_evidence_quota import QuotaResult
 
 
@@ -61,6 +62,55 @@ class RetrievalPipelineTests(unittest.TestCase):
         data = record.to_dict()
 
         self.assertEqual(data["pipeline_layers"]["TemporalRelations"]["relation_count"], 2)
+
+    def test_selected_temporal_relation_summary_merges_summary_and_safe_records(self) -> None:
+        candidates = [
+            Candidate(
+                "c1",
+                "event",
+                "before the deadline",
+                "source_a",
+                {"utility_score": 0.6},
+                ["span_1"],
+                {
+                    "temporal_relations": [
+                        {
+                            "relation_type": "before",
+                            "reason_code": "explicit_order_marker",
+                            "role_labels": ["earlier_event"],
+                            "source_span_ids": ["span_1"],
+                        }
+                    ]
+                },
+            ),
+            Candidate(
+                "c2",
+                "fact",
+                "deadline summary",
+                "source_b",
+                {"utility_score": 0.7},
+                ["span_2"],
+                {
+                    "temporal_relation_summary": {
+                        "relation_count": 2,
+                        "relation_types": ["deadline"],
+                        "role_labels": ["deadline"],
+                        "reason_codes": ["deadline_marker"],
+                        "source_span_count": 1,
+                        "source_span_ids": ["span_2"],
+                    }
+                },
+            ),
+        ]
+
+        summary = selected_temporal_relation_summary(candidates)
+
+        self.assertEqual(summary["relation_count"], 3)
+        self.assertEqual(summary["relation_types"], ["before", "deadline"])
+        self.assertEqual(summary["role_labels"], ["deadline", "earlier_event"])
+        self.assertEqual(summary["reason_codes"], ["deadline_marker", "explicit_order_marker"])
+        self.assertEqual(summary["source_span_count"], 2)
+        self.assertEqual(summary["source_span_ids"], ["span_1", "span_2"])
 
     def test_search_attaches_pipeline_trace_without_raw_text(self) -> None:
         memory = MemoryService()
