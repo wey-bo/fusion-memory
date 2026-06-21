@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
 from fusion_memory.core.models import Candidate
+from fusion_memory.core.models import Scope
 from fusion_memory.retrieval.temporal_relations import temporal_relation_summary_from_safe_records
 
 
@@ -19,6 +21,58 @@ class QueryUnderstandingRecord:
             "intent": self.intent,
             "features": list(self.features),
         }
+
+
+@dataclass(frozen=True)
+class QueryUnderstandingResult:
+    plan: Any
+    language: str
+    intent: str
+    features: tuple[str, ...]
+    intent_telemetry: dict[str, Any] | None
+    precomputed: bool
+
+    def safe_record(self) -> dict[str, Any]:
+        return {
+            "language": self.language,
+            "intent": self.intent,
+            "features": list(self.features),
+        }
+
+
+class QueryUnderstandingEngine:
+    def run(
+        self,
+        query: str,
+        scope: Scope,
+        options: dict[str, Any],
+        planner: Any,
+    ) -> QueryUnderstandingResult:
+        del scope
+        options = options or {}
+        precomputed_plan = options.get("_plan")
+        precomputed = precomputed_plan is not None
+        plan = precomputed_plan or planner.plan(query, query_type_hint=options.get("query_type_hint"))
+        intent_telemetry = options.get("_intent_telemetry") if precomputed else getattr(planner, "last_intent_telemetry", None)
+        language = "zh" if re.search(r"[\u4e00-\u9fff]", query) else "en"
+        features = tuple(
+            feature
+            for feature, enabled in {
+                "current_value": bool(getattr(plan, "current_value", False)),
+                "multi_condition": bool(getattr(plan, "constraints", None)),
+                "temporal": getattr(plan, "query_type", None) in {"temporal_lookup", "event_ordering"},
+            }.items()
+            if enabled
+        )
+        intent = str(getattr(plan, "query_type", ""))
+        return QueryUnderstandingResult(
+            plan=plan,
+            language=language,
+            intent=intent,
+            features=features,
+            intent_telemetry=intent_telemetry,
+            precomputed=precomputed,
+        )
 
 
 @dataclass(frozen=True)

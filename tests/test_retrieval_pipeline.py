@@ -9,12 +9,70 @@ from fusion_memory.core.models import EvidencePack
 from fusion_memory.core.models import QueryPlan
 from fusion_memory.core.models import Scope
 from fusion_memory.core.models import SearchResult
+from fusion_memory.retrieval.pipeline import QueryUnderstandingEngine
 from fusion_memory.retrieval.pipeline import build_pipeline_record
 from fusion_memory.retrieval.pipeline import selected_temporal_relation_summary
 from fusion_memory.retrieval.raw_evidence_quota import QuotaResult
 
 
 class RetrievalPipelineTests(unittest.TestCase):
+    def test_query_understanding_engine_sanitizes_raw_query(self) -> None:
+        class FakePlanner:
+            def __init__(self) -> None:
+                self.last_intent_telemetry = {"route": "heuristic", "raw_query": "planner-internal"}
+                self.calls = []
+
+            def plan(self, query: str, *, query_type_hint: str | None = None) -> QueryPlan:
+                self.calls.append((query, query_type_hint))
+                return QueryPlan(
+                    query=query,
+                    query_type=query_type_hint or "fact_lookup",
+                    entities=[],
+                    time_constraints=[],
+                    intent={"answer_shape": "fact"},
+                )
+
+        raw_query = "Which private token zinc-sparrow-17 did I ask you to remember?"
+        planner = FakePlanner()
+        scope = Scope(workspace_id="ws-pipeline", user_id="u", agent_id="a")
+
+        result = QueryUnderstandingEngine().run(
+            raw_query,
+            scope,
+            {"query_type_hint": "event_ordering"},
+            planner,
+        )
+
+        self.assertEqual(planner.calls, [(raw_query, "event_ordering")])
+        self.assertIs(result.plan.query, raw_query)
+        self.assertEqual(result.language, "en")
+        self.assertEqual(result.intent, "event_ordering")
+        self.assertEqual(result.features, ("temporal",))
+        self.assertEqual(result.intent_telemetry, planner.last_intent_telemetry)
+        self.assertFalse(result.precomputed)
+        self.assertEqual(
+            result.safe_record(),
+            {"language": "en", "intent": "event_ordering", "features": ["temporal"]},
+        )
+        self.assertNotIn(raw_query, repr(result.safe_record()))
+
+        precomputed_plan = QueryPlan(
+            query=raw_query,
+            query_type="knowledge_update",
+            entities=[],
+            time_constraints=[],
+        )
+        precomputed = QueryUnderstandingEngine().run(
+            raw_query,
+            scope,
+            {"_plan": precomputed_plan, "_intent_telemetry": {"route": "precomputed"}},
+            planner,
+        )
+
+        self.assertIs(precomputed.plan, precomputed_plan)
+        self.assertEqual(precomputed.intent_telemetry, {"route": "precomputed"})
+        self.assertTrue(precomputed.precomputed)
+
     def test_build_pipeline_record_counts_sources_without_raw_text(self) -> None:
         recalled = [
             Candidate("c1", "span", "raw secret text", "l0_raw", {"utility_score": 0.8}, ["s1"], {}),
