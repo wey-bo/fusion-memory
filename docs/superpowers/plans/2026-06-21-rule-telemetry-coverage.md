@@ -178,7 +178,7 @@ git commit -m "Add observation rule telemetry for recall matches"
 - Consumes: replay artifact format already preserving `coverage.rule_hits` and `CandidateRecall.provider_summary`.
 - Produces: documented audit smoke commands and a small test if replay sanitization drops the new rule ids.
 
-- [ ] **Step 1: Run focused replay-artifact tests**
+- [x] **Step 1: Run focused replay-artifact tests**
 
 Run:
 
@@ -186,13 +186,13 @@ Run:
 python3 -m unittest tests.test_beam_retrieval_replay tests.test_beam_event_ordering_replay tests.test_rule_audit -v
 ```
 
-Expected: PASS.
+Result: PASS via `python3 -m unittest tests.test_beam_retrieval_replay tests.test_beam_event_ordering_replay tests.test_rule_audit -v` (76 tests).
 
-- [ ] **Step 2: Add tests only if needed**
+- [x] **Step 2: Add tests only if needed**
 
-If the new observation rule hits are dropped by replay compaction/sanitization, add a regression test in the affected replay test file proving rule ids and structural metadata survive, while raw text is absent.
+Result: no replay test changes were needed. Existing replay sanitization preserved the new observation-only rule ids and structural metadata well enough for combined rule/provider audit output.
 
-- [ ] **Step 3: Run bounded replay audit smoke**
+- [x] **Step 3: Run bounded replay audit smoke**
 
 Run the existing bounded replay set for:
 
@@ -203,13 +203,31 @@ Run the existing bounded replay set for:
 
 Then run `tools/rule_audit.py` with `--provider-output`.
 
-Expected:
+Commands run:
+
+```bash
+/public/home/wwb/anaconda3/envs/fusion-memory-qwen/bin/python tools/beam_event_ordering_replay.py --workspace beam_100k_rule_qwenembed_sessionized_20260612_1745 --split 100k --dataset /public/home/wwb/datasets/BEAM --db postgresql://fusion:fusion@127.0.0.1:55432/fusion_memory --mode all --max-queries 10 --gate --output /public/home/wwb/memory/.worktrees/rule-telemetry-coverage/.runtime/task3-smoke/event_ordering.json
+/public/home/wwb/anaconda3/envs/fusion-memory-qwen/bin/python tools/beam_retrieval_replay.py --workspace beam_100k_rule_qwenembed_sessionized_20260612_1745 --split 100k --dataset /public/home/wwb/datasets/BEAM --db postgresql://fusion:fusion@127.0.0.1:55432/fusion_memory --categories current_value --max-queries 10 --output /public/home/wwb/memory/.worktrees/rule-telemetry-coverage/.runtime/task3-smoke/current_value.json
+/public/home/wwb/anaconda3/envs/fusion-memory-qwen/bin/python tools/beam_retrieval_replay.py --workspace beam_100k_rule_qwenembed_sessionized_20260612_1745 --split 100k --dataset /public/home/wwb/datasets/BEAM --db postgresql://fusion:fusion@127.0.0.1:55432/fusion_memory --categories multi_condition --max-queries 10 --output /public/home/wwb/memory/.worktrees/rule-telemetry-coverage/.runtime/task3-smoke/multi_condition.json
+/public/home/wwb/anaconda3/envs/fusion-memory-qwen/bin/python tools/beam_retrieval_replay.py --workspace beam_100k_rule_qwenembed_sessionized_20260612_1745 --split 100k --dataset /public/home/wwb/datasets/BEAM --db postgresql://fusion:fusion@127.0.0.1:55432/fusion_memory --categories zh_recall --max-queries 10 --output /public/home/wwb/memory/.worktrees/rule-telemetry-coverage/.runtime/task3-smoke/zh_recall.json
+/public/home/wwb/anaconda3/envs/fusion-memory-qwen/bin/python tools/rule_audit.py --input /public/home/wwb/memory/.worktrees/rule-telemetry-coverage/.runtime/task3-smoke/event_ordering.json --input /public/home/wwb/memory/.worktrees/rule-telemetry-coverage/.runtime/task3-smoke/current_value.json --input /public/home/wwb/memory/.worktrees/rule-telemetry-coverage/.runtime/task3-smoke/multi_condition.json --input /public/home/wwb/memory/.worktrees/rule-telemetry-coverage/.runtime/task3-smoke/zh_recall.json --output /public/home/wwb/memory/.worktrees/rule-telemetry-coverage/.runtime/task3-smoke/rule_audit.json --csv /public/home/wwb/memory/.worktrees/rule-telemetry-coverage/.runtime/task3-smoke/rule_audit.csv --provider-output /public/home/wwb/memory/.worktrees/rule-telemetry-coverage/.runtime/task3-smoke/provider_audit.json --provider-csv /public/home/wwb/memory/.worktrees/rule-telemetry-coverage/.runtime/task3-smoke/provider_audit.csv
+```
+
+Results:
 
 - provider audit row count remains greater than zero.
 - rule audit includes the existing protected rules and any newly observed match-family rules that appear in the bounded replay.
 - no replay/audit JSON or CSV contains raw query text, raw candidate text, source span content, prompt text, or traceback content.
 
-- [ ] **Step 4: Commit**
+Observed:
+
+- Provider audit row count was `15`.
+- Combined rule audit included `current_value.stale_history_marker`, `event_ordering.legacy_rescue`, `multi_condition.query_token_match`, and `taxonomy.alias_match`.
+- `zh_recall.cjk_exact_match` did not appear in this bounded smoke because the replay output for the two built-in `zh_recall` probes did not emit that rule id in these runs.
+- Retrieval replay artifacts (`current_value`, `multi_condition`, `zh_recall`) and both audit outputs stayed free of the checked plaintext query/candidate/traceback markers.
+- `event_ordering.json` still contains large plaintext `reference` and `paths.*.items` strings, so the strict "no raw text in replay JSON" expectation is not currently met for that tool. This task documented the issue and did not change production replay behavior outside the task brief ownership.
+
+- [x] **Step 4: Commit**
 
 If only documentation changed:
 
@@ -219,4 +237,3 @@ git commit -m "Document expanded rule telemetry replay smoke"
 ```
 
 If test changes were needed, include them in the same commit.
-
