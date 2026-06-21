@@ -4,6 +4,11 @@ import re
 from typing import Any
 
 from fusion_memory.core.text import compact_summary
+from fusion_memory.retrieval.temporal_relations import (
+    safe_temporal_relation_records,
+    temporal_relation_summary_from_safe_records,
+    temporal_relations_for_text,
+)
 
 
 TEMPORAL_STOPWORDS = {
@@ -66,6 +71,15 @@ def build_value_history_table(query: str, spans: list[dict[str, Any]], facts: li
             marker_strength = value_update_marker_strength(query_lower, lower, value_text)
             value_role = value_history_value_role(query, context, value_text, value_type)
             context_terms = value_summary_terms(context)
+            relations = safe_temporal_relation_records(
+                temporal_relations_for_text(
+                    context or content,
+                    query=query,
+                    value_text=value_text,
+                    value_type=value_type,
+                    source_span_id=str(span.get("id") or "") or None,
+                )
+            )
             rows.append(
                 {
                     "source_span_id": span.get("id"),
@@ -84,6 +98,7 @@ def build_value_history_table(query: str, spans: list[dict[str, Any]], facts: li
                     "slot_overlap": len(value_topic_terms(query) & value_topic_terms(context)),
                     "value_role": value_role,
                     "update_marker_strength": marker_strength,
+                    "temporal_relations": relations,
                 }
             )
     for fact in facts:
@@ -95,6 +110,15 @@ def build_value_history_table(query: str, spans: list[dict[str, Any]], facts: li
             value_type = str(value.get("type") or "")
             value_role = value_history_value_role(query, context or text, value_text, value_type)
             context_terms = value_summary_terms(context or text)
+            relations = safe_temporal_relation_records(
+                temporal_relations_for_text(
+                    context or text,
+                    query=query,
+                    value_text=value_text,
+                    value_type=value_type,
+                    source_span_id=str(next(iter(fact.get("source_span_ids") or []), "") or "") or None,
+                )
+            )
             rows.append(
                 {
                     "source_span_id": next(iter(fact.get("source_span_ids") or []), None),
@@ -112,6 +136,7 @@ def build_value_history_table(query: str, spans: list[dict[str, Any]], facts: li
                     "slot_overlap": len(value_topic_terms(query) & value_topic_terms(context or text)),
                     "value_role": value_role,
                     "update_marker_strength": value_update_marker_strength(query_lower, text.lower(), value_text),
+                    "temporal_relations": relations,
                 }
             )
     rows.sort(key=value_history_sort_key(query))
@@ -141,6 +166,7 @@ def value_history_summary(query: str, rows: list[dict[str, Any]]) -> dict[str, A
     current_candidates: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     sorted_rows = sorted(rows, key=value_history_sort_key(query))
+    selected_row_relations: list[dict[str, object]] = []
     for row in sorted_rows:
         value = str(row.get("value") or "").strip()
         if not value:
@@ -156,6 +182,9 @@ def value_history_summary(query: str, rows: list[dict[str, Any]]) -> dict[str, A
         if key in seen:
             continue
         seen.add(key)
+        selected_row_relations.extend(
+            item for item in (row.get("temporal_relations") or []) if isinstance(item, dict)
+        )
         current_candidates.append(
             {
                 "value": value,
@@ -171,6 +200,7 @@ def value_history_summary(query: str, rows: list[dict[str, Any]]) -> dict[str, A
                 "slot_overlap": row.get("slot_overlap"),
                 "value_role": role,
                 "context": compact_summary(str(row.get("context") or ""), 180),
+                "temporal_relations": [item for item in (row.get("temporal_relations") or []) if isinstance(item, dict)],
             }
         )
         if len(current_candidates) >= 6:
@@ -194,6 +224,7 @@ def value_history_summary(query: str, rows: list[dict[str, Any]]) -> dict[str, A
         **({"target_value_types": target_type_priority} if target_type_priority else {}),
         "recency_priority": recency_priority,
         "guidance": guidance,
+        "temporal_relation_summary": temporal_relation_summary_from_safe_records(selected_row_relations),
     }
 
 

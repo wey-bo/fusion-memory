@@ -41,6 +41,18 @@ _RULE_HIT_DIMENSION_KEYS = {
     "protected_reason",
 }
 
+_TEMPORAL_RELATION_SAFE_KEYS = (
+    "relation_type",
+    "confidence",
+    "reason_code",
+    "source_span_id",
+    "value_type",
+    "value_hash",
+    "normalized_date",
+    "role_labels",
+    "source_span_ids",
+)
+
 _SAFE_DIMENSION_IDENTIFIERS = {
     "aggregation_context_support",
     "aggregation_coverage",
@@ -238,6 +250,9 @@ def run_replay(
             "coverage_insufficient": bool(coverage.get("coverage_insufficient", False)),
             "pipeline_trace": _pipeline_trace_from_pack(coverage, getattr(pack, "debug_trace", []) or []),
         }
+        temporal_relation_summary = _temporal_relation_summary_from_coverage(coverage)
+        if temporal_relation_summary:
+            record["temporal_relation_summary"] = temporal_relation_summary
         lifecycle = _sanitize_candidate_lifecycle(coverage.get("candidate_lifecycle"))
         if lifecycle:
             record["candidate_lifecycle"] = lifecycle
@@ -375,6 +390,15 @@ def _pipeline_trace_from_pack(coverage: dict[str, Any], debug_trace: Any) -> lis
     return _sanitize_pipeline_trace(debug_trace)
 
 
+def _temporal_relation_summary_from_coverage(coverage: dict[str, Any]) -> dict[str, Any]:
+    summary = _sanitize_temporal_relation_summary(coverage.get("temporal_relation_summary"))
+    if summary:
+        return summary
+    pipeline_trace = _object_dict(coverage.get("pipeline_trace"))
+    layers = _object_dict(pipeline_trace.get("pipeline_layers"))
+    return _sanitize_temporal_relation_summary(layers.get("TemporalRelations"))
+
+
 def _sanitize_candidate_lifecycle(value: Any) -> dict[str, Any]:
     data = _object_dict(value)
     if not data:
@@ -419,6 +443,9 @@ def _sanitize_candidate_lifecycle_records(value: Any) -> list[dict[str, Any]]:
             sanitized["scores"] = scores
         if isinstance(record_dict.get("contributed"), bool):
             sanitized["contributed"] = record_dict["contributed"]
+        temporal_relations = _sanitize_temporal_relations(record_dict.get("temporal_relations"))
+        if temporal_relations:
+            sanitized["temporal_relations"] = temporal_relations
         if sanitized:
             sanitized_records.append(sanitized)
     return sanitized_records
@@ -432,6 +459,7 @@ def _sanitize_pipeline_record(value: Any) -> dict[str, Any]:
     recall = _object_dict(layers.get("CandidateRecall"))
     fusion = _object_dict(layers.get("CandidateFusion"))
     evidence = _object_dict(layers.get("EvidencePackBuilder"))
+    temporal_relations = _sanitize_temporal_relation_summary(layers.get("TemporalRelations"))
     entry: dict[str, Any] = {"layer": "retrieval"}
     for key in ("query_type", "mode"):
         if key in record:
@@ -450,6 +478,8 @@ def _sanitize_pipeline_record(value: Any) -> dict[str, Any]:
             entry["source_span_count"] = value
     if "coverage_insufficient" in evidence:
         entry["coverage_insufficient"] = bool(evidence["coverage_insufficient"])
+    if temporal_relations:
+        entry["temporal_relation_summary"] = temporal_relations
     return entry if len(entry) > 1 else {}
 
 
@@ -482,6 +512,10 @@ def _sanitize_pipeline_trace_entry(entry: dict[str, Any]) -> dict[str, Any]:
             sanitized["source_span_count"] = value
     if "coverage_insufficient" in entry:
         sanitized["coverage_insufficient"] = bool(entry["coverage_insufficient"])
+    if "temporal_relation_summary" in entry:
+        temporal_relation_summary = _sanitize_temporal_relation_summary(entry["temporal_relation_summary"])
+        if temporal_relation_summary:
+            sanitized["temporal_relation_summary"] = temporal_relation_summary
     rule_hit_count = _rule_hit_count(entry)
     if rule_hit_count is not None:
         sanitized["rule_hit_count"] = rule_hit_count
@@ -504,6 +538,65 @@ def _sanitize_count_mapping(value: Any) -> dict[str, int | float | bool]:
         if count is not None:
             sanitized[safe_key] = count
     return sanitized
+
+
+def _sanitize_temporal_relation_summary(value: Any) -> dict[str, Any]:
+    summary = _object_dict(value)
+    if not summary:
+        return {}
+    sanitized: dict[str, Any] = {}
+    relation_count = _sanitize_count_value(summary.get("relation_count"))
+    if isinstance(relation_count, int):
+        sanitized["relation_count"] = relation_count
+    relation_types = _sanitize_identifier_list(summary.get("relation_types"))
+    if relation_types:
+        sanitized["relation_types"] = relation_types
+    source_span_count = _sanitize_count_value(summary.get("source_span_count"))
+    if isinstance(source_span_count, int):
+        sanitized["source_span_count"] = source_span_count
+    reason_codes = _sanitize_identifier_list(summary.get("reason_codes"))
+    if reason_codes:
+        sanitized["reason_codes"] = reason_codes
+    role_labels = _sanitize_identifier_list(summary.get("role_labels"))
+    if role_labels:
+        sanitized["role_labels"] = role_labels
+    source_span_ids = _sanitize_identifier_list(summary.get("source_span_ids"))
+    if source_span_ids:
+        sanitized["source_span_ids"] = source_span_ids
+    return sanitized
+
+
+def _sanitize_temporal_relations(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    sanitized_relations: list[dict[str, Any]] = []
+    for relation in value:
+        relation_dict = _object_dict(relation)
+        if not relation_dict:
+            continue
+        sanitized: dict[str, Any] = {}
+        for key in _TEMPORAL_RELATION_SAFE_KEYS:
+            item = relation_dict.get(key)
+            if item is None:
+                continue
+            if key in {"role_labels", "source_span_ids"}:
+                identifiers = _sanitize_identifier_list(item)
+                if identifiers:
+                    sanitized[key] = identifiers
+                continue
+            if key == "confidence":
+                confidence = _sanitize_count_value(item)
+                if isinstance(confidence, bool):
+                    continue
+                if isinstance(confidence, int | float):
+                    sanitized[key] = confidence
+                continue
+            value_text = _sanitize_identifier_string(item)
+            if value_text is not None:
+                sanitized[key] = value_text
+        if sanitized:
+            sanitized_relations.append(sanitized)
+    return sanitized_relations
 
 
 def _sanitize_selected_sources(value: Any) -> list[dict[str, Any]]:
