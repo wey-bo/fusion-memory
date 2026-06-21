@@ -183,6 +183,41 @@ def temporal_relation_summary(relations: list[TemporalRelation]) -> dict[str, ob
     }
 
 
+def temporal_relation_summary_from_safe_records(records: list[dict[str, object]]) -> dict[str, object]:
+    relation_types = sorted({str(record.get("relation_type") or "") for record in records if record.get("relation_type")})
+    role_labels = sorted(
+        {
+            str(role_label)
+            for record in records
+            for role_label in (record.get("role_labels") or [])
+            if role_label
+        }
+    )
+    reason_codes = sorted(
+        {
+            str(record.get("reason_code") or "")
+            for record in records
+            if str(record.get("reason_code") or "") in _ALLOWED_REASON_CODES
+        }
+    )
+    source_span_ids = sorted(
+        {
+            str(source_id)
+            for record in records
+            for source_id in (record.get("source_span_ids") or [])
+            if source_id
+        }
+    )
+    return {
+        "relation_count": len(records),
+        "relation_types": relation_types,
+        "role_labels": role_labels,
+        "reason_codes": reason_codes,
+        "source_span_count": len(source_span_ids),
+        "source_span_ids": source_span_ids,
+    }
+
+
 def safe_temporal_relation_records(relations: list[TemporalRelation], *, limit: int = 12) -> list[dict[str, object]]:
     return [relation.to_safe_dict() for relation in relations[: max(0, limit)]]
 

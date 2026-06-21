@@ -5,6 +5,7 @@ from datetime import date, datetime, timezone
 from typing import Any
 
 from fusion_memory.core.text import compact_summary, tokenize
+from fusion_memory.retrieval.temporal_relations import safe_temporal_relation_records, temporal_relations_for_text
 
 
 TOPIC_SCOPE_STOPWORDS = {
@@ -301,6 +302,13 @@ def temporal_mentions(query: str, content: str, span_timestamp: object = None) -
             "role": role,
             "role_confidence": confidence,
             "context": compact_summary(context, 220),
+            "temporal_relations": safe_temporal_relation_records(
+                temporal_relations_for_text(
+                    role_text,
+                    query=query,
+                    normalized_date=normalized_date,
+                )
+            ),
         }
         if endpoint:
             mention["range_endpoint"] = endpoint
@@ -338,6 +346,9 @@ def temporal_candidate_table(query: str, spans: list[dict[str, Any]], *, limit: 
                     "target_role_order": target_role_order.get(role, 999),
                     "query_overlap": query_context_overlap_score(query_lower, context.lower()),
                     "range_endpoint": mention.get("range_endpoint"),
+                    "temporal_relations": [
+                        item for item in (mention.get("temporal_relations") or []) if isinstance(item, dict)
+                    ],
                 }
             )
     candidates.sort(
@@ -437,6 +448,10 @@ def merge_temporal_candidate_metadata(existing: dict[str, Any], candidate: dict[
             existing[key] = candidate.get(key)
     if len(str(candidate.get("context") or "")) > len(str(existing.get("context") or "")):
         existing["context"] = candidate.get("context")
+    if candidate.get("temporal_relations") and not existing.get("temporal_relations"):
+        existing["temporal_relations"] = [
+            item for item in (candidate.get("temporal_relations") or []) if isinstance(item, dict)
+        ]
 
 
 def temporal_answer_candidates(

@@ -19,6 +19,8 @@ from fusion_memory.ingestion.llm_extractor import StructuredLLMExtractor
 from fusion_memory.retrieval.evidence_pack import _exact_answer_candidates, _value_context_is_target_goal, _value_mentions
 from fusion_memory.retrieval.mmr import mmr
 from fusion_memory.retrieval.rrf import reciprocal_rank_fusion
+from fusion_memory.retrieval.temporal_pack import temporal_candidate_table, temporal_mentions
+from fusion_memory.retrieval.value_history_pack import build_value_history_table
 
 
 def ts(value: str) -> datetime:
@@ -26,6 +28,38 @@ def ts(value: str) -> datetime:
 
 
 class FusionMemoryTests(unittest.TestCase):
+    def test_value_history_rows_include_safe_temporal_relations_without_affecting_sort(self) -> None:
+        spans = [
+            {"id": "old", "speaker": "user", "content": "Previously my snack budget was $20.", "timeline_index": 1, "recency_rank": 2},
+            {"id": "new", "speaker": "user", "content": "I updated my snack budget to $35 now.", "timeline_index": 2, "recency_rank": 1},
+        ]
+
+        rows = build_value_history_table("what is my current snack budget?", spans, [])
+
+        self.assertEqual(rows[0]["source_span_id"], "new")
+        self.assertTrue(rows[0]["temporal_relations"])
+        self.assertIn("changed_to", {item["relation_type"] for item in rows[0]["temporal_relations"]})
+        self.assertNotIn("content", rows[0]["temporal_relations"][0])
+
+    def test_temporal_candidate_table_includes_safe_relation_summary(self) -> None:
+        mention_rows = [
+            {
+                "id": "span-date",
+                "speaker": "user",
+                "timeline_index": 1,
+                "temporal_mentions": temporal_mentions(
+                    "when is the deployment deadline?",
+                    "The deployment deadline is July 1, 2026.",
+                ),
+            }
+        ]
+
+        candidates = temporal_candidate_table("when is the deployment deadline?", mention_rows)
+
+        self.assertTrue(candidates)
+        self.assertTrue(candidates[0]["temporal_relations"])
+        self.assertIn("deadline", {item["relation_type"] for item in candidates[0]["temporal_relations"]})
+
     def test_event_ordering_dual_shadow_is_disabled_by_default(self) -> None:
         service = MemoryService()
         try:

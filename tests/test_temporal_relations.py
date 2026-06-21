@@ -5,6 +5,7 @@ import unittest
 from fusion_memory.retrieval.temporal_relations import (
     safe_temporal_relation_records,
     temporal_relation_summary,
+    temporal_relation_summary_from_safe_records,
     temporal_relations_for_text,
 )
 
@@ -86,3 +87,20 @@ class TemporalRelationTests(unittest.TestCase):
         self.assertGreaterEqual(summary["relation_count"], 1)
         self.assertIn("changed_to", summary["relation_types"])
         self.assertEqual(summary["source_span_count"], 1)
+
+    def test_safe_record_summary_counts_only_structural_fields(self) -> None:
+        records = safe_temporal_relation_records(
+            temporal_relations_for_text(
+                "We decided on June 3, 2026 and the deployment deadline is July 1, 2026.",
+                query="when was the decision and deadline?",
+                normalized_date="2026-07-01",
+                source_span_id="span-2",
+            )
+        )
+
+        summary = temporal_relation_summary_from_safe_records(records)
+
+        self.assertEqual(summary["relation_count"], len(records))
+        self.assertIn("deadline", summary["relation_types"])
+        self.assertIn("decision_marker", summary["reason_codes"])
+        self.assertEqual(summary["source_span_ids"], ["span-2"])
