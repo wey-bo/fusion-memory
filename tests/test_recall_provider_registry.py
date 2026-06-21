@@ -2,10 +2,21 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from typing import Any
 
 from fusion_memory.core.models import Candidate, QueryPlan, Scope
 from fusion_memory.retrieval.providers.base import RecallContext
 from fusion_memory.retrieval.providers.registry import ProviderRegistry
+from fusion_memory.retrieval.providers.structured import (
+    CurrentViewProvider,
+    EntityProfileProvider,
+    EntityProvider,
+    EventProvider,
+    ExactProvider,
+    FactProvider,
+)
 
 
 @dataclass(frozen=True)
@@ -91,6 +102,99 @@ class RecallProviderRegistryTests(unittest.TestCase):
         self.assertEqual(summary[0]["source_family"], "raw")
         self.assertEqual(summary[0]["output_count"], 1)
         self.assertNotIn("raw private query", repr(summary))
+
+
+class StructuredProviderTests(unittest.TestCase):
+    def _service(self) -> Any:
+        service = SimpleNamespace()
+        service._retrieval_query = lambda query, plan, source: f"{source}:{query}"
+        service._plan_uses_source = lambda plan, source: True
+        service._event_ordering_observed_at = lambda event: event.time_start
+        service._exact_candidates = lambda query, scope, limit, plan=None, include_session=False: [
+            Candidate("exact-1", "span", "exact text", "exact_answer", {"score": 1.0}, ["s-exact"], {})
+        ]
+        service._entity_candidates = lambda query, scope, limit, include_session=False: [
+            Candidate("entity-1", "entity", "entity text", "entity_graph", {"score": 1.0}, ["s-entity"], {})
+        ]
+        fact = SimpleNamespace(
+            fact_id="fact-1",
+            text="fact text",
+            source_span_ids=["s-fact"],
+            category="preference",
+            confidence=0.9,
+        )
+        event = SimpleNamespace(
+            event_id="event-1",
+            description="event text",
+            source_span_ids=["s-event"],
+            event_type="decision",
+            time_start=datetime(2026, 6, 1, tzinfo=timezone.utc),
+        )
+        view = SimpleNamespace(
+            view_id="view-1",
+            text="view text",
+            source_span_ids=["s-view"],
+            view_type="current",
+            confidence=0.8,
+        )
+        profile = SimpleNamespace(
+            profile_id="profile-1",
+            text="profile text",
+            source_span_ids=["s-profile"],
+            profile_type="person",
+            support_count=2,
+        )
+        service.store = SimpleNamespace(
+            search_facts=lambda *args, **kwargs: [(fact, {"score": 0.7})],
+            search_events=lambda *args, **kwargs: [(event, {"score": 0.6})],
+            list_current_views=lambda *args, **kwargs: [view],
+            search_entity_profiles=lambda *args, **kwargs: [(profile, {"score": 0.5})],
+        )
+        return service
+
+    def _context(self, *, query_type: str = "fact_lookup") -> RecallContext:
+        return RecallContext(
+            service=self._service(),
+            query="Atlas retrieval",
+            scope=Scope(workspace_id="w", user_id="u", agent_id="a"),
+            plan=QueryPlan(query="Atlas retrieval", query_type=query_type, entities=[], time_constraints=[]),
+            per_source_limit=3,
+            enabled_sources=None,
+            include_session=False,
+            event_milestone_group=lambda event: "decision",
+            prior_candidates=[],
+        )
+
+    def test_structured_providers_emit_current_candidate_sources(self) -> None:
+        context = self._context()
+        providers = [FactProvider(), EventProvider(), CurrentViewProvider(), EntityProfileProvider(), ExactProvider(), EntityProvider()]
+
+        output = [[candidate.source for candidate in provider.recall(context)] for provider in providers]
+
+        self.assertEqual(
+            output,
+            [["l1_fact_hybrid"], ["l2_event_graph"], ["l3_current_view"], ["l3_entity_profile"], ["exact_answer"], ["entity_graph"]],
+        )
+
+    def test_event_provider_preserves_event_ordering_source(self) -> None:
+        context = self._context(query_type="event_ordering")
+        context.service._event_ordering_event_candidates = lambda *args, **kwargs: [
+            (
+                SimpleNamespace(
+                    event_id="event-order-1",
+                    description="event order text",
+                    source_span_ids=["s-event-order"],
+                    event_type="milestone",
+                    time_start=datetime(2026, 6, 2, tzinfo=timezone.utc),
+                ),
+                {"score": 0.8},
+            )
+        ]
+
+        candidates = EventProvider().recall(context)
+
+        self.assertEqual(candidates[0].source, "event_timeline_graph")
+        self.assertEqual(candidates[0].scores["graph_proximity"], 0.80)
 
 
 if __name__ == "__main__":
