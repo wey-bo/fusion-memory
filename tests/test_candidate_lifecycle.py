@@ -48,6 +48,31 @@ class CandidateLifecycleTests(unittest.TestCase):
         self.assertEqual(summary["source_counts"]["l1_fact_hybrid"], 1)
         self.assertEqual(summary["contributed_count"], 1)
 
+    def test_trace_limit_keeps_terminal_records_visible(self) -> None:
+        recorder = CandidateLifecycleRecorder()
+        for index in range(12):
+            candidate = Candidate(f"recall-{index}", "span", f"secret recall {index}", "l0_raw", {}, [f"s{index}"], {})
+            recorder.record(candidate, "recalled", "candidate_provider")
+        rescued = Candidate("rescued", "span", "rescued secret", "quality_fallback", {}, ["sr"], {})
+        filtered = Candidate("filtered", "span", "filtered secret", "l0_raw", {}, ["sf"], {})
+        selected = Candidate("selected", "span", "selected secret", "l0_raw", {}, ["ss"], {})
+        packed = Candidate("packed", "span", "packed secret", "l0_raw", {}, ["sp"], {})
+
+        recorder.record(rescued, "rescued", "quality_fallback")
+        recorder.record(filtered, "filtered", "topic_scope_filter")
+        recorder.record(selected, "selected", "final_selection")
+        recorder.record(packed, "packed", "answer_pack")
+
+        trace = recorder.to_trace(limit=5)
+        stages = [entry["stage"] for entry in trace]
+
+        self.assertEqual(len(trace), 5)
+        self.assertIn("rescued", stages)
+        self.assertIn("filtered", stages)
+        self.assertIn("selected", stages)
+        self.assertIn("packed", stages)
+        self.assertNotIn("rescued secret", repr(trace))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,6 +6,7 @@ from fusion_memory.core.models import Candidate
 
 
 _ALLOWED_STAGES = {"recalled", "scored", "filtered", "rescued", "selected", "packed"}
+_TERMINAL_STAGES = {"filtered", "rescued", "selected", "packed"}
 
 
 @dataclass(frozen=True)
@@ -72,7 +73,22 @@ class CandidateLifecycleRecorder:
             self.record(candidate, stage, reason_code)
 
     def to_trace(self, limit: int = 200) -> list[dict[str, object]]:
-        return [record.to_dict() for record in self._records[: max(0, int(limit))]]
+        bounded_limit = max(0, int(limit))
+        if bounded_limit == 0:
+            return []
+        if len(self._records) <= bounded_limit:
+            return [record.to_dict() for record in self._records]
+        terminal_records = [record for record in self._records if record.stage in _TERMINAL_STAGES]
+        if len(terminal_records) >= bounded_limit:
+            return [record.to_dict() for record in terminal_records[-bounded_limit:]]
+        terminal_ids = {id(record) for record in terminal_records}
+        retained = [
+            record
+            for record in self._records
+            if id(record) not in terminal_ids
+        ][: bounded_limit - len(terminal_records)]
+        retained.extend(terminal_records)
+        return [record.to_dict() for record in retained]
 
     def summary(self) -> dict[str, object]:
         stage_counts: dict[str, int] = {}
