@@ -23,9 +23,12 @@ def _cleanup_classification(
     hit_count: int,
     contribution_count: int,
     duplicate_of: str | None,
+    protected: bool,
 ) -> tuple[str, str, bool]:
     if rule_id.startswith("event_ordering.legacy"):
         cleanup_action = "keep_shadow"
+    elif protected:
+        cleanup_action = "keep_protected"
     elif duplicate_of is not None:
         cleanup_action = "delete_duplicate"
     elif hit_count == 0:
@@ -66,12 +69,13 @@ def build_rule_audit(
                 if isinstance((audit_input := hit.get("_audit_input")), str) and audit_input
             }
         )
-        duplicate_of = _duplicate_of(rule_hits)
+        duplicate_of = _duplicate_of(rule_hits) or rule.duplicate_of
         cleanup_phase, cleanup_action, safe_to_delete = _cleanup_classification(
             rule.rule_id,
             len(rule_hits),
             contribution_count,
             duplicate_of,
+            rule.protected,
         )
         rows.append(
             {
@@ -79,6 +83,8 @@ def build_rule_audit(
                 "ability": rule.ability,
                 "category": rule.category,
                 "module": rule.module,
+                "protected": rule.protected,
+                "protected_reason": rule.protected_reason,
                 "hit_count": len(rule_hits),
                 "contribution_count": contribution_count,
                 "negative_impact_count": negative_impact_count,

@@ -245,6 +245,23 @@ class RuleRegistryTests(unittest.TestCase):
         self.assertRegex(str(hit.metadata["note"]), r"^[0-9a-f]{12}$")
         self.assertNotIn("PostgreSQL", repr(hit.metadata))
 
+    def test_record_rule_hit_hashes_raw_provider_and_lifecycle_dimensions(self) -> None:
+        hit = record_rule_hit(
+            "current_value.stale_history_marker",
+            query="What is my current database?",
+            text="I now use PostgreSQL.",
+            stage="evidence_pack_filter",
+            provider_id="private provider PostgreSQL",
+            lifecycle_stage="数据库 selected",
+            lifecycle_reason="current database is PostgreSQL",
+        )
+
+        self.assertRegex(str(hit.provider_id), r"^[0-9a-f]{12}$")
+        self.assertRegex(str(hit.lifecycle_stage), r"^[0-9a-f]{12}$")
+        self.assertRegex(str(hit.lifecycle_reason), r"^[0-9a-f]{12}$")
+        self.assertNotIn("PostgreSQL", repr(hit))
+        self.assertNotIn("数据库", repr(hit))
+
     def test_collect_rule_hits_isolates_and_clears_on_exception(self) -> None:
         record_rule_hit(
             rule_id="outer.rule",
@@ -359,6 +376,41 @@ class RuleRegistryTests(unittest.TestCase):
         self.assertFalse(legacy["candidate_for_deletion"])
         self.assertEqual(legacy["cleanup_action"], "keep_shadow")
         self.assertFalse(legacy["safe_to_delete"])
+
+    def test_registered_rule_audit_keeps_protected_zero_hit_rules(self) -> None:
+        rules = [
+            RuleDefinition(
+                rule_id="current_value.stale_history_marker",
+                module="m",
+                purpose="drop stale current-value history",
+                category="high_risk",
+                ability="current_value",
+                protected=True,
+                protected_reason="high_precision_current_value",
+            ),
+            RuleDefinition(
+                rule_id="current_value.stale_history_marker.cn_alias",
+                module="m",
+                purpose="duplicate Chinese alias",
+                category="current_value",
+                duplicate_of="current_value.stale_history_marker",
+            ),
+        ]
+
+        audit = build_rule_audit(rules, [])
+        protected = next(row for row in audit if row["rule_id"] == "current_value.stale_history_marker")
+        duplicate = next(row for row in audit if row["rule_id"] == "current_value.stale_history_marker.cn_alias")
+
+        self.assertTrue(protected["protected"])
+        self.assertEqual(protected["protected_reason"], "high_precision_current_value")
+        self.assertIsNone(protected["duplicate_of"])
+        self.assertFalse(protected["candidate_for_deletion"])
+        self.assertEqual(protected["cleanup_phase"], "")
+        self.assertEqual(protected["cleanup_action"], "keep_protected")
+        self.assertFalse(protected["safe_to_delete"])
+        self.assertEqual(duplicate["duplicate_of"], "current_value.stale_history_marker")
+        self.assertEqual(duplicate["cleanup_action"], "delete_duplicate")
+        self.assertTrue(duplicate["safe_to_delete"])
 
 
 class RuleInstrumentationTests(unittest.TestCase):
