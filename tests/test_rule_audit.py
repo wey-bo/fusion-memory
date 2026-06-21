@@ -208,6 +208,32 @@ class RuleAuditTests(unittest.TestCase):
         self.assertNotIn("/var/lib", repr(row))
         self.assertNotIn("@example.com", repr(row))
 
+    def test_build_rule_audit_hashes_unknown_identifier_like_dimensions(self) -> None:
+        records = [
+            {
+                "query_id": "q1",
+                "rule_hits": [
+                    {
+                        "rule_id": "rule.identifier_like_values",
+                        "provider_id": "source_private_project",
+                        "lifecycle_stage": "l3_private_goal",
+                        "lifecycle_reason": "event_ordering_secret",
+                        "impact": "selected",
+                    }
+                ],
+            }
+        ]
+
+        audit = build_rule_audit(records)
+        row = next(item for item in audit if item["rule_id"] == "rule.identifier_like_values")
+
+        self.assertTrue(all(len(item) == 12 for item in row["provider_ids"]))
+        self.assertTrue(all(len(item) == 12 for item in row["lifecycle_stages"]))
+        self.assertTrue(all(len(item) == 12 for item in row["lifecycle_reasons"]))
+        self.assertNotIn("source_private_project", repr(row))
+        self.assertNotIn("event_ordering_secret", repr(row))
+        self.assertNotIn("l3_private_goal", repr(row))
+
     def test_build_rule_audit_correlates_lifecycle_with_raw_candidate_ids_before_hashing(self) -> None:
         records = [
             {
@@ -402,7 +428,7 @@ class RuleAuditTests(unittest.TestCase):
 
             audit = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertEqual([row["rule_id"] for row in audit], ["rule.alpha", "rule.beta"])
-            self.assertEqual(audit[0]["candidate_sources"], ["source_a", "source_b"])
+            self.assertTrue(all(len(item) == 12 for item in audit[0]["candidate_sources"]))
             self.assertEqual(audit[0]["recommendation"], "keep")
             self.assertEqual(audit[1]["recommendation"], "delete_candidate")
 
@@ -435,7 +461,8 @@ class RuleAuditTests(unittest.TestCase):
                 rows = list(reader)
 
             self.assertEqual([row["rule_id"] for row in rows], ["rule.alpha", "rule.beta"])
-            self.assertEqual(rows[0]["candidate_sources"], "source_a;source_b")
+            self.assertNotIn("source_a", rows[0]["candidate_sources"])
+            self.assertNotIn("source_b", rows[0]["candidate_sources"])
             self.assertEqual(rows[0]["evidence_inputs"], str(input_path))
 
     def test_cli_csv_includes_rule_governance_columns(self) -> None:
@@ -486,6 +513,55 @@ class RuleAuditTests(unittest.TestCase):
                 self.assertIn("lifecycle_reasons", reader.fieldnames)
                 self.assertIn("protected", reader.fieldnames)
                 self.assertIn("protected_reason", reader.fieldnames)
+
+    def test_cli_hashes_unknown_identifier_like_dimensions(self) -> None:
+        payload = {
+            "records": [
+                {
+                    "query_id": "q1",
+                    "rule_hits": [
+                        {
+                            "rule_id": "rule.identifier_like_values",
+                            "provider_id": "source_private_project",
+                            "lifecycle_stage": "l3_private_goal",
+                            "lifecycle_reason": "event_ordering_secret",
+                        }
+                    ],
+                }
+            ]
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            input_path = tmp / "replay.json"
+            output_path = tmp / "audit.json"
+            input_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "tools/rule_audit.py",
+                    "--input",
+                    str(input_path),
+                    "--output",
+                    str(output_path),
+                ],
+                cwd=REPO_ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            output_text = output_path.read_text(encoding="utf-8")
+            audit = json.loads(output_text)
+            row = audit[0]
+            self.assertTrue(all(len(item) == 12 for item in row["provider_ids"]))
+            self.assertTrue(all(len(item) == 12 for item in row["lifecycle_stages"]))
+            self.assertTrue(all(len(item) == 12 for item in row["lifecycle_reasons"]))
+            self.assertNotIn("source_private_project", output_text)
+            self.assertNotIn("event_ordering_secret", output_text)
+            self.assertNotIn("l3_private_goal", output_text)
 
     def test_cli_merges_multiple_replay_inputs_and_marks_evidence_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -653,7 +729,8 @@ class RuleAuditTests(unittest.TestCase):
                 rows = list(csv.DictReader(handle))
 
             self.assertEqual([row["rule_id"] for row in rows], ["rule.delta", "rule.gamma"])
-            self.assertEqual(rows[0]["candidate_sources"], "source_c")
+            self.assertNotEqual(rows[0]["candidate_sources"], "source_c")
+            self.assertEqual(len(rows[0]["candidate_sources"]), 12)
             self.assertEqual(rows[0]["evidence_inputs"], str(input_path))
 
 

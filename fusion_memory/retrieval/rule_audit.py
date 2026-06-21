@@ -1,8 +1,62 @@
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 from fusion_memory.retrieval.rule_registry import RuleDefinition
+
+_SAFE_DIMENSION_IDENTIFIERS = {
+    "aggregation_context_support",
+    "aggregation_coverage",
+    "aggregation_coverage_raw",
+    "broad_raw",
+    "broad_raw_recall",
+    "contradiction_claim",
+    "contradiction_claim_negative",
+    "contradiction_claim_positive",
+    "contradiction_claim_uncertain",
+    "dropped",
+    "entities",
+    "entity_graph",
+    "event_ordering_coverage",
+    "event_ordering_coverage_support",
+    "event_ordering_episode",
+    "event_ordering_episode_recall",
+    "event_ordering_timeline",
+    "event_timeline_graph",
+    "events",
+    "exact",
+    "exact_answer",
+    "facts",
+    "filtered",
+    "final_selection",
+    "hybrid",
+    "l0_raw_hybrid",
+    "l1_fact_hybrid",
+    "l2_event_graph",
+    "l3_current_view",
+    "l3_entity_profile",
+    "legacy_fallback",
+    "misranked",
+    "packed",
+    "profiles",
+    "quality_fallback",
+    "raw_provider",
+    "raw_scent_trail",
+    "raw_span",
+    "recalled",
+    "rescued",
+    "scent_trail",
+    "scored",
+    "selected",
+    "taxonomy",
+    "temporal_coverage",
+    "temporal_coverage_raw",
+    "timeline",
+    "topic_scope",
+    "topic_scoped_raw",
+    "views",
+}
 
 
 def _as_dict(value: object) -> dict[str, object]:
@@ -21,11 +75,29 @@ def _duplicate_of(rule_hits: list[dict[str, object]]) -> str | None:
 def _string_values(rule_hits: list[dict[str, object]], key: str) -> list[str]:
     return sorted(
         {
-            value
+            safe_value
             for hit in rule_hits
-            if isinstance((value := hit.get(key)), str) and value
+            if (safe_value := _safe_string(hit.get(key))) is not None
         }
     )
+
+
+def _safe_string(value: object) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    if _is_safe_identifier(value):
+        return value
+    return hashlib.sha1(repr(value).encode("utf-8")).hexdigest()[:12]
+
+
+def _is_safe_identifier(value: str) -> bool:
+    if len(value) > 128:
+        return False
+    if value != value.strip():
+        return False
+    if any(char.isspace() or "\u4e00" <= char <= "\u9fff" for char in value):
+        return False
+    return value in _SAFE_DIMENSION_IDENTIFIERS
 
 
 def _cleanup_classification(

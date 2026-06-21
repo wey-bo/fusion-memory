@@ -370,6 +370,35 @@ class RuleRegistryTests(unittest.TestCase):
         self.assertEqual(row["lifecycle_stages"], ["selected"])
         self.assertEqual(row["lifecycle_reasons"], ["event_ordering_coverage", "views"])
 
+    def test_registered_rule_audit_hashes_raw_provider_and_lifecycle_dimensions(self) -> None:
+        rules = [
+            RuleDefinition(
+                rule_id="event.order",
+                module="m",
+                purpose="event order",
+                category="event_ordering",
+                ability="event_ordering",
+            ),
+        ]
+        hits = [
+            {
+                "rule_id": "event.order",
+                "provider_id": "private provider PostgreSQL",
+                "lifecycle_stage": "数据库 selected",
+                "lifecycle_reason": "source_private_project",
+            }
+        ]
+
+        audit = build_rule_audit(rules, hits)
+        row = audit[0]
+
+        self.assertTrue(all(len(item) == 12 for item in row["provider_ids"]))
+        self.assertTrue(all(len(item) == 12 for item in row["lifecycle_stages"]))
+        self.assertTrue(all(len(item) == 12 for item in row["lifecycle_reasons"]))
+        self.assertNotIn("private provider PostgreSQL", repr(row))
+        self.assertNotIn("数据库 selected", repr(row))
+        self.assertNotIn("source_private_project", repr(row))
+
     def test_registered_rule_audit_marks_zero_hit_rules_for_first_pass_cleanup(self) -> None:
         rules = [
             RuleDefinition(

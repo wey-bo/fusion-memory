@@ -4,35 +4,63 @@ import argparse
 import csv
 import hashlib
 import json
-import re
 import sys
 from pathlib import Path
 from typing import Any
 
 
 _SAFE_DIMENSION_IDENTIFIERS = {
-    "views",
-    "selected",
-    "rescued",
-    "filtered",
+    "aggregation_context_support",
+    "aggregation_coverage",
+    "aggregation_coverage_raw",
+    "broad_raw",
+    "broad_raw_recall",
+    "contradiction_claim",
+    "contradiction_claim_negative",
+    "contradiction_claim_positive",
+    "contradiction_claim_uncertain",
     "dropped",
-    "misranked",
+    "entities",
+    "entity_graph",
     "event_ordering_coverage",
-    "l3_current_view",
+    "event_ordering_coverage_support",
+    "event_ordering_episode",
+    "event_ordering_episode_recall",
+    "event_ordering_timeline",
+    "event_timeline_graph",
+    "events",
+    "exact",
+    "exact_answer",
+    "facts",
+    "filtered",
+    "final_selection",
+    "hybrid",
     "l0_raw_hybrid",
     "l1_fact_hybrid",
-    "event_ordering_timeline",
-    "event_ordering_episode_recall",
-    "timeline",
+    "l2_event_graph",
+    "l3_current_view",
+    "l3_entity_profile",
+    "legacy_fallback",
+    "misranked",
+    "packed",
+    "profiles",
+    "quality_fallback",
+    "raw_provider",
+    "raw_scent_trail",
+    "raw_span",
+    "recalled",
+    "rescued",
+    "scent_trail",
+    "scored",
+    "selected",
     "taxonomy",
-    "hybrid",
+    "temporal_coverage",
+    "temporal_coverage_raw",
+    "timeline",
+    "topic_scope",
+    "topic_scoped_raw",
+    "views",
 }
-
-_SAFE_DIMENSION_PATTERNS = (
-    re.compile(r"l[0-9]+_[a-z0-9_]+"),
-    re.compile(r"event_ordering_[a-z0-9_]+"),
-    re.compile(r"source_[a-z0-9_]+"),
-)
 
 _PROTECTED_RULE_REASONS = {
     "current_value.stale_history_marker": "high_precision_current_value",
@@ -79,11 +107,11 @@ def _safe_string(value: Any) -> str | None:
 def _is_safe_identifier(value: str) -> bool:
     if len(value) > 128:
         return False
-    if value != value.strip() or re.search(r"\s|[\u4e00-\u9fff]", value):
+    if value != value.strip():
         return False
-    if value in _SAFE_DIMENSION_IDENTIFIERS:
-        return True
-    return any(pattern.fullmatch(value) for pattern in _SAFE_DIMENSION_PATTERNS)
+    if any(char.isspace() or "\u4e00" <= char <= "\u9fff" for char in value):
+        return False
+    return value in _SAFE_DIMENSION_IDENTIFIERS
 
 
 def _protected_governance_for_rule(rule_id: str) -> tuple[bool, str]:
@@ -112,7 +140,7 @@ def _candidate_sources_for_record(record: dict[str, object]) -> list[str]:
     paths = _as_dict(record.get("paths"))
     hybrid = _as_dict(paths.get("hybrid"))
     sources = _as_list(hybrid.get("sources"))
-    return sorted({source for source in sources if isinstance(source, str)})
+    return sorted({safe_source for source in sources if (safe_source := _safe_string(source)) is not None})
 
 
 def _dropped_candidate_ids(record: dict[str, object]) -> set[str]:
