@@ -1,9 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
+import re
+from dataclasses import dataclass, field
+from typing import Any, Callable
 
 from fusion_memory.core.models import Candidate
+from fusion_memory.core.models import Scope
+from fusion_memory.retrieval.providers import RecallContext
+from fusion_memory.retrieval.providers import default_provider_registry
+from fusion_memory.retrieval.rrf import reciprocal_rank_fusion
+from fusion_memory.retrieval.scoring import score_candidate
 from fusion_memory.retrieval.temporal_relations import temporal_relation_summary_from_safe_records
 
 
@@ -19,6 +25,246 @@ class QueryUnderstandingRecord:
             "intent": self.intent,
             "features": list(self.features),
         }
+
+
+@dataclass(frozen=True)
+class QueryUnderstandingResult:
+    plan: Any
+    language: str
+    intent: str
+    features: tuple[str, ...]
+    intent_telemetry: dict[str, Any] | None
+    precomputed: bool
+
+    def safe_record(self) -> dict[str, Any]:
+        return {
+            "language": self.language,
+            "intent": self.intent,
+            "features": list(self.features),
+        }
+
+
+class QueryUnderstandingEngine:
+    def run(
+        self,
+        query: str,
+        scope: Scope,
+        options: dict[str, Any],
+        planner: Any,
+    ) -> QueryUnderstandingResult:
+        del scope
+        options = options or {}
+        precomputed_plan = options.get("_plan")
+        precomputed = precomputed_plan is not None
+        plan = precomputed_plan if precomputed else planner.plan(query, query_type_hint=options.get("query_type_hint"))
+        intent_telemetry = options.get("_intent_telemetry") if precomputed else getattr(planner, "last_intent_telemetry", None)
+        return query_understanding_result_from_plan(
+            plan=plan,
+            query=query,
+            intent_telemetry=intent_telemetry,
+            precomputed=precomputed,
+        )
+
+
+def query_understanding_result_from_plan(
+    *,
+    plan: Any,
+    query: str,
+    intent_telemetry: dict[str, Any] | None = None,
+    precomputed: bool = True,
+) -> QueryUnderstandingResult:
+    language = "zh" if re.search(r"[\u4e00-\u9fff]", query) else "en"
+    features = tuple(
+        feature
+        for feature, enabled in {
+            "current_value": bool(getattr(plan, "current_value", False)),
+            "multi_condition": bool(getattr(plan, "constraints", None)),
+            "temporal": getattr(plan, "query_type", None) in {"temporal_lookup", "event_ordering"},
+        }.items()
+        if enabled
+    )
+    return QueryUnderstandingResult(
+        plan=plan,
+        language=language,
+        intent=str(getattr(plan, "query_type", "")),
+        features=features,
+        intent_telemetry=intent_telemetry,
+        precomputed=precomputed,
+    )
+
+
+@dataclass(frozen=True)
+class RetrievalExecutionContext:
+    service: Any
+    query: str
+    scope: Scope
+    options: dict[str, Any]
+    query_understanding: QueryUnderstandingResult
+    include_session: bool
+    per_source_limit: int
+    enabled_sources: list[str] | set[str] | None
+    mode: str
+    limit: int
+    rerank_top_n: int
+    event_milestone_group: Callable[[Any], str | None]
+
+
+@dataclass(frozen=True)
+class RecallResult:
+    candidate_lists: list[list[Candidate]]
+    recalled_candidates: list[Candidate]
+    provider_summary: list[dict[str, Any]] = field(default_factory=list)
+
+    def safe_record(self) -> dict[str, Any]:
+        record: dict[str, Any] = {"source_counts": _candidate_source_counts(self.recalled_candidates)}
+        if self.provider_summary:
+            record["provider_summary"] = [_safe_provider_summary(item) for item in self.provider_summary]
+        return record
+
+
+class RecallOrchestrator:
+    def __init__(self, registry: Any | None = None) -> None:
+        self._registry = registry
+
+    def run(self, context: RetrievalExecutionContext) -> RecallResult:
+        enabled = set(context.enabled_sources) if context.enabled_sources is not None else None
+        recall_context = RecallContext(
+            service=context.service,
+            query=context.query,
+            scope=context.scope,
+            plan=context.query_understanding.plan,
+            per_source_limit=context.per_source_limit,
+            enabled_sources=enabled,
+            include_session=context.include_session,
+            event_milestone_group=context.event_milestone_group,
+            prior_candidates=[],
+        )
+        registry = self._registry or default_provider_registry()
+        candidate_lists = registry.recall(recall_context)
+        recalled_candidates = [candidate for candidates in candidate_lists for candidate in candidates]
+        provider_summary = registry.summary(recall_context) if hasattr(registry, "summary") else []
+        return RecallResult(
+            candidate_lists=candidate_lists,
+            recalled_candidates=recalled_candidates,
+            provider_summary=provider_summary,
+        )
+
+
+@dataclass(frozen=True)
+class FusionResult:
+    fused: list[Candidate]
+    scored: list[Candidate]
+    quota_result: Any
+    marked: list[Candidate]
+    scored_again: list[Candidate]
+    rerank_top_n: int
+    mode: str
+    limit: int
+
+    def safe_record(self) -> dict[str, Any]:
+        return {
+            "fused_source_counts": _candidate_source_counts(self.fused),
+            "scored_count": len(self.scored),
+            "marked_count": len(self.marked),
+            "scored_again_count": len(self.scored_again),
+            "quota_required": int(getattr(self.quota_result, "required", 0)),
+            "quota_selected": len(getattr(self.quota_result, "selected_span_ids", []) or []),
+            "coverage_insufficient": bool(getattr(self.quota_result, "coverage_insufficient", False)),
+            "backfilled": int(getattr(self.quota_result, "backfilled", 0)),
+            "mode": self.mode,
+            "limit": int(self.limit),
+            "rerank_top_n": int(self.rerank_top_n),
+        }
+
+
+class CandidateFusionEngine:
+    def run(self, context: RetrievalExecutionContext, recall_result: RecallResult) -> FusionResult:
+        service = context.service
+        plan = context.query_understanding.plan
+        fused = reciprocal_rank_fusion(recall_result.candidate_lists, k=service.config.rrf_k)
+        scored = [score_candidate(candidate, plan) for candidate in fused]
+        quota_result = service.quota.enforce(plan, context.scope, scored, include_session=context.include_session)
+        marked = self._mark_quota_selected(quota_result.candidates, quota_result.selected_span_ids)
+        scored_again = [score_candidate(candidate, plan) for candidate in marked]
+        scored_again.sort(key=lambda candidate: candidate.scores.get("utility_score", 0.0), reverse=True)
+        mode = context.options.get("mode", context.mode)
+        limit = context.options.get("limit", context.limit)
+        rerank_top_n = context.options.get("rerank_top_n") or (
+            service.config.balanced_mode_rerank_top_n
+            if mode == "balanced"
+            else service.config.benchmark_mode_rerank_top_n
+            if mode == "benchmark"
+            else limit
+        )
+        return FusionResult(
+            fused=fused,
+            scored=scored,
+            quota_result=quota_result,
+            marked=marked,
+            scored_again=scored_again,
+            rerank_top_n=rerank_top_n,
+            mode=mode,
+            limit=limit,
+        )
+
+    def _mark_quota_selected(self, candidates: list[Candidate], span_ids: list[str]) -> list[Candidate]:
+        selected = set(span_ids)
+        out: list[Candidate] = []
+        for candidate in candidates:
+            metadata = dict(candidate.metadata)
+            if candidate.type == "span" and candidate.id in selected:
+                metadata["quota_selected"] = True
+            if candidate.type == "view" and candidate.source == "l3_current_view":
+                reasons = list(metadata.get("must_preserve_reason") or [])
+                if "current_value" not in reasons:
+                    reasons.append("current_value")
+                metadata["must_preserve_reason"] = reasons
+                metadata["evidence_role"] = "answer"
+                metadata["current_value"] = True
+            out.append(
+                Candidate(
+                    id=candidate.id,
+                    type=candidate.type,
+                    text=candidate.text,
+                    source=candidate.source,
+                    scores=candidate.scores,
+                    source_span_ids=candidate.source_span_ids,
+                    metadata=metadata,
+                )
+            )
+        return out
+
+
+def _candidate_source_counts(candidates: list[Candidate]) -> dict[str, int]:
+    source_counts: dict[str, int] = {}
+    for candidate in candidates:
+        source_counts[candidate.source] = source_counts.get(candidate.source, 0) + 1
+    return source_counts
+
+
+def _safe_provider_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    safe: dict[str, Any] = {}
+    for key in (
+        "provider_id",
+        "source_family",
+        "output_count",
+        "output_source_counts",
+        "production_default",
+        "shadow_only",
+        "graph_related",
+    ):
+        if key not in summary:
+            continue
+        value = summary[key]
+        if key == "output_source_counts" and isinstance(value, dict):
+            safe[key] = {str(source): int(count) for source, count in value.items()}
+        elif key == "output_count":
+            safe[key] = int(value)
+        elif key in {"production_default", "shadow_only", "graph_related"}:
+            safe[key] = bool(value)
+        else:
+            safe[key] = str(value)
+    return safe
 
 
 @dataclass(frozen=True)
@@ -117,6 +363,14 @@ class RetrievalPipelineRecord:
         }
 
 
+class RetrievalTraceRecorder:
+    def __init__(self, record: RetrievalPipelineRecord) -> None:
+        self._record = record
+
+    def flush(self) -> dict[str, Any]:
+        return self._record.to_dict()
+
+
 def build_pipeline_record(
     query_type: str,
     mode: str,
@@ -158,6 +412,21 @@ def build_pipeline_record(
             else None
         ),
     )
+
+
+class EvidencePackAssembler:
+    def update_pipeline_output(
+        self,
+        value: Any,
+        *,
+        source_span_count: int,
+        coverage_insufficient: bool,
+    ) -> dict[str, Any]:
+        return update_pipeline_evidence_output(
+            value,
+            source_span_count=source_span_count,
+            coverage_insufficient=coverage_insufficient,
+        )
 
 
 def update_pipeline_evidence_output(

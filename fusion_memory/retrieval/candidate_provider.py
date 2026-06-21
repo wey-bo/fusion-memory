@@ -3,7 +3,9 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from fusion_memory.core.models import Candidate, Scope
-from fusion_memory.retrieval.providers import RecallContext, default_provider_registry
+from fusion_memory.retrieval.pipeline import RecallOrchestrator
+from fusion_memory.retrieval.pipeline import RetrievalExecutionContext
+from fusion_memory.retrieval.pipeline import query_understanding_result_from_plan
 
 
 def build_candidate_lists(
@@ -17,16 +19,19 @@ def build_candidate_lists(
     *,
     event_milestone_group: Callable[[Any], str | None],
 ) -> list[list[Candidate]]:
-    enabled = set(enabled_sources) if enabled_sources is not None else None
-    context = RecallContext(
+    query_understanding = query_understanding_result_from_plan(plan=plan, query=query)
+    context = RetrievalExecutionContext(
         service=service,
         query=query,
         scope=scope,
-        plan=plan,
-        per_source_limit=per_source_limit,
-        enabled_sources=enabled,
+        options={},
+        query_understanding=query_understanding,
         include_session=include_session,
+        per_source_limit=per_source_limit,
+        enabled_sources=enabled_sources,
+        mode="fast",
+        limit=0,
+        rerank_top_n=0,
         event_milestone_group=event_milestone_group,
-        prior_candidates=[],
     )
-    return default_provider_registry().recall(context)
+    return RecallOrchestrator().run(context).candidate_lists

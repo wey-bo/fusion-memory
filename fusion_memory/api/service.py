@@ -52,17 +52,20 @@ from fusion_memory.retrieval.aggregation_keys import (
 )
 from fusion_memory.retrieval.mmr import mmr
 from fusion_memory.retrieval.pipeline import (
+    CandidateFusionEngine,
+    EvidencePackAssembler,
+    QueryUnderstandingEngine,
+    RecallOrchestrator,
+    RetrievalExecutionContext,
+    RetrievalTraceRecorder,
     build_pipeline_record,
     selected_temporal_relation_summary,
-    update_pipeline_evidence_output,
 )
 from fusion_memory.retrieval.query_planner import QueryPlanner
 from fusion_memory.retrieval.raw_evidence_quota import RawEvidenceQuota
 from fusion_memory.retrieval.preservation import annotate_runtime_preservation_candidates, must_preserve_reasons, preserve_required_candidates
 from fusion_memory.retrieval.reranker import LexicalCrossEncoderReranker, Reranker, rerank_candidates
 from fusion_memory.retrieval.rule_registry import RuleDefinition, collect_rule_hits, record_rule_hit, register_rule
-from fusion_memory.retrieval.rrf import reciprocal_rank_fusion
-from fusion_memory.retrieval.scoring import score_candidate
 from fusion_memory.retrieval.structured_annotations import select_event_ordering_timeline
 from fusion_memory.retrieval.utility_model import LogisticUtilityScorer, UtilityTrainingReport
 from fusion_memory.retrieval.utility_scorer import utility_example
@@ -369,46 +372,38 @@ class MemoryService:
         )
         model_call_marks = self._model_call_marks()
         trace_id = new_id("trace")
-        precomputed_plan = options.get("_plan")
-        plan = precomputed_plan or self.planner.plan(query, query_type_hint=options.get("query_type_hint"))
-        intent_telemetry = options.get("_intent_telemetry") if precomputed_plan else self.planner.last_intent_telemetry
+        query_understanding = QueryUnderstandingEngine().run(query, scope, options, self.planner)
+        plan = query_understanding.plan
+        intent_telemetry = query_understanding.intent_telemetry
         lifecycle = CandidateLifecycleRecorder()
-        query_language = "zh" if re.search(r"[\u4e00-\u9fff]", query) else "en"
-        query_features = [
-            feature
-            for feature, enabled in {
-                "current_value": bool(getattr(plan, "current_value", False)),
-                "multi_condition": bool(getattr(plan, "constraints", None)),
-                "temporal": plan.query_type in {"temporal_lookup", "event_ordering"},
-            }.items()
-            if enabled
-        ]
-        candidate_lists = self._candidate_lists(
-            query,
-            scope,
-            plan,
+        retrieval_context = RetrievalExecutionContext(
+            service=self,
+            query=query,
+            scope=scope,
+            options=options,
+            query_understanding=query_understanding,
+            include_session=include_session,
             per_source_limit=options.get("per_source_limit", self.config.retrieval_top_k_per_source),
             enabled_sources=options.get("enabled_sources"),
-            include_session=include_session,
+            mode=options.get("mode", "fast"),
+            limit=options.get("limit", self.config.retrieval_output_n),
+            rerank_top_n=options.get("rerank_top_n") or 0,
+            event_milestone_group=_event_milestone_group,
         )
+        recall_result = self._recall_candidates(retrieval_context)
+        candidate_lists = recall_result.candidate_lists
         for items in candidate_lists:
             lifecycle.extend(items, "recalled", "candidate_provider")
-        fused = reciprocal_rank_fusion(candidate_lists, k=self.config.rrf_k)
-        scored = [score_candidate(candidate, plan) for candidate in fused]
-        quota_result = self.quota.enforce(plan, scope, scored, include_session=include_session)
-        marked = self._mark_quota_selected(quota_result.candidates, quota_result.selected_span_ids)
-        scored_again = [score_candidate(candidate, plan) for candidate in marked]
+        fusion_result = CandidateFusionEngine().run(retrieval_context, recall_result)
+        fused = fusion_result.fused
+        scored = fusion_result.scored
+        quota_result = fusion_result.quota_result
+        marked = fusion_result.marked
+        scored_again = fusion_result.scored_again
+        mode = fusion_result.mode
+        limit = fusion_result.limit
+        rerank_top_n = fusion_result.rerank_top_n
         lifecycle.extend(scored_again, "scored", "utility_scoring")
-        scored_again.sort(key=lambda candidate: candidate.scores.get("utility_score", 0.0), reverse=True)
-        mode = options.get("mode", "fast")
-        limit = options.get("limit", self.config.retrieval_output_n)
-        rerank_top_n = options.get("rerank_top_n") or (
-            self.config.balanced_mode_rerank_top_n
-            if mode == "balanced"
-            else self.config.benchmark_mode_rerank_top_n
-            if mode == "benchmark"
-            else limit
-        )
 
         def candidate_key(candidate: Candidate) -> tuple[str, str]:
             return (str(candidate.type), str(candidate.id))
@@ -565,17 +560,17 @@ class MemoryService:
         pipeline_record = build_pipeline_record(
             plan.query_type,
             str(mode),
-            language=query_language,
-            intent=plan.query_type,
-            features=query_features,
-            recalled=[candidate for items in candidate_lists for candidate in items],
+            language=query_understanding.language,
+            intent=query_understanding.intent,
+            features=list(query_understanding.features),
+            recalled=recall_result.recalled_candidates,
             selected=selected,
             dropped_count=len(dropped_high_signal),
             source_span_count=len(quota_result.selected_span_ids),
             coverage_insufficient=quota_result.coverage_insufficient,
             temporal_relation_summary=selected_temporal_relation_summary(selected),
         )
-        pipeline_trace = pipeline_record.to_dict()
+        pipeline_trace = RetrievalTraceRecorder(pipeline_record).flush()
         coverage["pipeline_trace"] = pipeline_trace
         trace = {
             "operation": "search",
@@ -708,7 +703,7 @@ class MemoryService:
             token_budget=token_budget,
         )
         if "pipeline_trace" in pack.coverage:
-            pack.coverage["pipeline_trace"] = update_pipeline_evidence_output(
+            pack.coverage["pipeline_trace"] = EvidencePackAssembler().update_pipeline_output(
                 pack.coverage["pipeline_trace"],
                 source_span_count=len(pack.source_spans),
                 coverage_insufficient=bool(pack.coverage.get("coverage_insufficient", False)),
@@ -1603,6 +1598,9 @@ class MemoryService:
             include_session=include_session,
             event_milestone_group=_event_milestone_group,
         )
+
+    def _recall_candidates(self, context: RetrievalExecutionContext) -> RecallResult:
+        return RecallOrchestrator().run(context)
 
     def _event_ordering_graph_selector_candidates(
         self,
@@ -2789,33 +2787,6 @@ class MemoryService:
                 source_span_ids=event.source_span_ids,
                 observed_at=event.time_start,
             )
-
-    def _mark_quota_selected(self, candidates: list[Candidate], span_ids: list[str]) -> list[Candidate]:
-        selected = set(span_ids)
-        out: list[Candidate] = []
-        for candidate in candidates:
-            metadata = dict(candidate.metadata)
-            if candidate.type == "span" and candidate.id in selected:
-                metadata["quota_selected"] = True
-            if candidate.type == "view" and candidate.source == "l3_current_view":
-                reasons = list(metadata.get("must_preserve_reason") or [])
-                if "current_value" not in reasons:
-                    reasons.append("current_value")
-                metadata["must_preserve_reason"] = reasons
-                metadata["evidence_role"] = "answer"
-                metadata["current_value"] = True
-            out.append(
-                Candidate(
-                    id=candidate.id,
-                    type=candidate.type,
-                    text=candidate.text,
-                    source=candidate.source,
-                    scores=candidate.scores,
-                    source_span_ids=candidate.source_span_ids,
-                    metadata=metadata,
-                )
-            )
-        return out
 
     def _preserve_quota_after_rerank(self, candidates: list[Candidate], quota_span_ids: list[str], limit: int) -> list[Candidate]:
         quota_set = set(quota_span_ids)
