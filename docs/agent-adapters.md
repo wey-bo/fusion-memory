@@ -128,6 +128,6 @@ On Windows, set `PSI_MEMORY_BASE_URL` with the PowerShell or cmd examples above
 before starting the session. If Fusion Memory is unavailable, Fusion-Agent should
 continue the session without memory and show beginner-safe recovery guidance.
 
-For test model configuration, pass `/public/home/wwb/test_key/key.txt` as a file
-path to test commands that accept a model config file. Do not paste key content
-into logs or docs.
+For test model configuration, set `MODEL_CONFIG_FILE` to a local key file path
+and pass it to commands that accept a model config file. Do not paste key
+content into logs or docs.

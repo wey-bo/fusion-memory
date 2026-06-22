@@ -32,9 +32,13 @@ from tools.beam_retrieval_replay import _sanitize_pipeline_record  # noqa: E402
 REPLAY_PATHS = ("graph", "legacy", "dual", "hybrid")
 
 
+def _default_beam_dataset() -> str:
+    return os.getenv("BEAM_DATASET", "datasets/BEAM")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Replay BEAM event_ordering queries through graph, legacy, dual, and hybrid retrieval paths.")
-    parser.add_argument("--dataset", default="/public/home/wwb/datasets/BEAM")
+    parser.add_argument("--dataset", default=_default_beam_dataset())
     parser.add_argument("--split", default="100k")
     parser.add_argument("--workspace", required=True)
     parser.add_argument("--user-id", default="beam_user")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -9,7 +10,7 @@ from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
-HERMES_ROOT = Path("/public/home/wwb/GitHub/hermes-agent")
+HERMES_ROOT = Path(os.getenv("HERMES_AGENT_ROOT", str(Path.home() / "GitHub" / "hermes-agent"))).expanduser()
 PROVIDER_PATH = ROOT / "integrations" / "hermes-fusion-memory" / "__init__.py"
 
 

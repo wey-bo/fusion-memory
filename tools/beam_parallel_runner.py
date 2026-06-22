@@ -23,9 +23,13 @@ from fusion_memory.core.runtime_config import memory_service_from_env  # noqa: E
 from fusion_memory.eval.beam_adapter import BeamAdapter, _beam_session_id_from_id, _load_official_beam_dataset  # noqa: E402
 
 
+def _default_beam_dataset() -> str:
+    return os.getenv("BEAM_DATASET", "datasets/BEAM")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="BEAM parallel resume/query runner")
-    parser.add_argument("--dataset", default="/public/home/wwb/datasets/BEAM")
+    parser.add_argument("--dataset", default=_default_beam_dataset())
     parser.add_argument("--split", default="100k", choices=["small", "dev", "100k", "500k", "1m", "10m"])
     parser.add_argument("--workspace", required=True)
     parser.add_argument("--user-id", default=None)

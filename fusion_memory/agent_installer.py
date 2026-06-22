@@ -10,7 +10,6 @@ VALID_TARGETS = ("openclaw", "hermes", "fusion-agent")
 ROOT = Path(__file__).resolve().parents[1]
 OPENCLAW_PLUGIN = ROOT / "integrations" / "openclaw-fusion-memory"
 HERMES_PROVIDER = ROOT / "integrations" / "hermes-fusion-memory"
-FUSION_AGENT_ROOT = Path("/public/home/wwb/Fusion-Agent")
 _INSTALL_ERROR = "Install failed. Check permissions and run fusion-memory doctor."
 
 
@@ -99,7 +98,7 @@ def _fusion_agent_root(home: str | Path | None = None) -> Path:
     env_root = os.getenv("FUSION_AGENT_ROOT")
     if env_root:
         return Path(env_root).expanduser()
-    return FUSION_AGENT_ROOT
+    return Path.home() / "Fusion-Agent"
 
 
 def _smoke_command(target: str) -> list[str]:

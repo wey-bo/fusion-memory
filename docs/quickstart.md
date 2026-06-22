@@ -7,7 +7,7 @@
 Linux / macOS:
 
 ```bash
-cd /public/home/wwb/memory
+cd /path/to/fusion-memory
 sh install.sh
 ```
 

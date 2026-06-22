@@ -26,3 +26,4 @@ dist/
 *.egg-info/
 
 docs/alpha-beta/*-latest.json
+docs/superpowers/

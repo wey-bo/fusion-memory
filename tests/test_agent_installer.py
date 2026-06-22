@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from fusion_memory.agent_installer import _action_for, install_agent
+from fusion_memory.agent_installer import _action_for, _fusion_agent_root, install_agent
 
 
 class AgentInstallerTests(unittest.TestCase):
@@ -69,6 +69,13 @@ class AgentInstallerTests(unittest.TestCase):
             action = _action_for("fusion-agent")
 
         self.assertEqual(action["path"], tmp)
+
+    def test_fusion_agent_default_root_is_user_home_relative(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict("os.environ", {"HOME": tmp}, clear=True):
+            root = _fusion_agent_root()
+
+        self.assertEqual(root, Path(tmp) / "Fusion-Agent")
+        self.assertNotIn("/public/home/wwb", str(root))
 
 
 if __name__ == "__main__":

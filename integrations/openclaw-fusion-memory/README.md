@@ -11,7 +11,8 @@ fusion-memory install-agent --target openclaw
 Manual local install:
 
 ```bash
-openclaw plugins install --link /public/home/wwb/memory/integrations/openclaw-fusion-memory
+cd /path/to/fusion-memory
+openclaw plugins install --link "$PWD/integrations/openclaw-fusion-memory"
 openclaw gateway restart
 ```
 

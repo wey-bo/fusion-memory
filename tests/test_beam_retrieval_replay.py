@@ -12,6 +12,12 @@ from tools.rule_audit import build_provider_audit, build_rule_audit
 
 
 class BeamRetrievalReplayTests(unittest.TestCase):
+    def test_default_dataset_is_environment_or_relative_path(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(replay._default_beam_dataset(), "datasets/BEAM")
+        with patch.dict("os.environ", {"BEAM_DATASET": "/data/BEAM"}, clear=True):
+            self.assertEqual(replay._default_beam_dataset(), "/data/BEAM")
+
     def test_category_filter_parses_current_multi_and_zh_aliases(self) -> None:
         self.assertEqual(
             replay._parse_categories("current_value,multi_condition,zh_recall"),

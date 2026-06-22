@@ -8,6 +8,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 
 def _load_runner_module():
@@ -21,6 +22,13 @@ def _load_runner_module():
 
 
 class BeamParallelRunnerResumeTests(unittest.TestCase):
+    def test_default_dataset_is_environment_or_relative_path(self) -> None:
+        runner = _load_runner_module()
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(runner._default_beam_dataset(), "datasets/BEAM")
+        with patch.dict("os.environ", {"BEAM_DATASET": "/data/BEAM"}, clear=True):
+            self.assertEqual(runner._default_beam_dataset(), "/data/BEAM")
+
     def test_resume_loads_all_worker_partials_and_prefers_completed_records(self) -> None:
         runner = _load_runner_module()
         with tempfile.TemporaryDirectory() as tmp:

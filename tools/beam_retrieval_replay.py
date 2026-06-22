@@ -179,9 +179,13 @@ ZH_PROBES = [
 ]
 
 
+def _default_beam_dataset() -> str:
+    return os.getenv("BEAM_DATASET", "datasets/BEAM")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Replay BEAM retrieval categories through Fusion Memory.")
-    parser.add_argument("--dataset", default="/public/home/wwb/datasets/BEAM")
+    parser.add_argument("--dataset", default=_default_beam_dataset())
     parser.add_argument("--split", default="100k")
     parser.add_argument("--workspace", required=True)
     parser.add_argument("--categories", default="current_value,multi_condition,zh_recall")
@@ -224,10 +228,11 @@ def run_replay(
     categories: set[str],
     output_path: Path,
     query_limit: int | None,
-    dataset: str | Path = "/public/home/wwb/datasets/BEAM",
+    dataset: str | Path | None = None,
     split: str = "100k",
 ) -> dict[str, Any]:
     selected_categories = set(categories)
+    dataset = dataset or _default_beam_dataset()
     queries = _select_queries(_load_queries(dataset, split), selected_categories)
     if query_limit is not None:
         queries = queries[: max(0, query_limit)]

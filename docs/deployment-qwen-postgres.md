@@ -8,46 +8,46 @@ Current target:
 - Reranker: `Qwen/Qwen3-Reranker-0.6B`
 - Extractor: memory-owned configurable LLM extractor
 
-## Environment Status
+## Prerequisites
 
-Checked on 2026-06-09:
+- Python 3.11 or 3.12.
+- PostgreSQL with the `pgvector` extension, or Docker Compose for the bundled
+  development database.
+- Optional local Qwen runtime dependencies if you do not use hosted HTTP model
+  APIs.
+- Optional GPU for lower local model latency. CPU works for smoke tests but is
+  slower.
 
-- Docker and Docker Compose are installed.
-- NVIDIA H100 GPUs are visible with `nvidia-smi`.
-- System `python3` is 3.13.5.
-- Conda `env1` has `torch 2.8.0+cu128` and was used as an initial fallback smoke environment.
-- Python 3.12 conda env `fusion-memory-qwen` is now the target local environment.
-- `fusion-memory-qwen` has `torch 2.8.0+cu128`, `transformers 5.10.2`, `sentence-transformers 5.5.1`, and `psycopg2-binary 2.9.12`.
-- `pip check` passes in `fusion-memory-qwen`.
-- `/public` has ample free space; model cache target is `/public/home/wwb/model/fusion-memory`.
-- `hf-mirror.com` is reachable from this host; `huggingface.co` is not reliably reachable.
-- Qwen local model weights are downloaded:
-  - `/public/home/wwb/model/fusion-memory/Qwen3-Embedding-0.6B`
-  - `/public/home/wwb/model/fusion-memory/Qwen3-Reranker-0.6B`
+Use a writable model cache outside the repository:
 
-This is enough for Postgres smoke, code verification, and local Qwen embedding/reranker smoke. The remaining deployment gap is the production LLM extractor endpoint/model/API key.
+```bash
+export FUSION_MEMORY_MODEL_CACHE="$HOME/.cache/fusion-memory/models"
+```
+
+The remaining production-specific inputs are the LLM extractor endpoint/model
+and API key, if you choose to enable the extractor.
 
 ## Start Postgres
 
 Docker path:
 
 ```bash
-cd /public/home/wwb/memory
+cd /path/to/fusion-memory
 docker compose -f deploy/docker-compose.postgres.yml up -d
 python -m fusion_memory.cli migrate-postgres postgresql://fusion:fusion@localhost:5432/fusion_memory
 python -m fusion_memory.cli verify-postgres postgresql://fusion:fusion@localhost:5432/fusion_memory
 ```
 
 Rootless Docker can fail on some filesystems while registering the pgvector image
-layer. The current host uses a conda-backed local Postgres fallback:
+layer. A local Postgres fallback looks like this:
 
 ```bash
-cd /public/home/wwb/memory
+cd /path/to/fusion-memory
 conda activate fusion-memory-qwen
 conda install -y -c conda-forge postgresql pgvector
 mkdir -p .runtime/postgres-data .runtime/postgres-run
 initdb -D .runtime/postgres-data --auth=trust --username=fusion --no-locale --encoding=UTF8
-pg_ctl -D .runtime/postgres-data -l .runtime/postgres.log -o "-p 55432 -k /public/home/wwb/memory/.runtime/postgres-run" start
+pg_ctl -D .runtime/postgres-data -l .runtime/postgres.log -o "-p 55432 -k $PWD/.runtime/postgres-run" start
 createdb -h 127.0.0.1 -p 55432 -U fusion fusion_memory
 psql -h 127.0.0.1 -p 55432 -U fusion -d fusion_memory -c 'create extension if not exists vector;'
 python -m fusion_memory.cli migrate-postgres postgresql://fusion:fusion@127.0.0.1:55432/fusion_memory
@@ -61,8 +61,8 @@ The migration now uses `vector(1024)` for `evidence_spans`, `memory_facts`, and 
 Use Python 3.11 or 3.12. Python 3.14 is not recommended for the ML stack.
 
 ```bash
-cd /public/home/wwb/memory
-/public/home/wwb/anaconda3/bin/conda create -y -n fusion-memory-qwen python=3.12 pip
+cd /path/to/fusion-memory
+conda create -y -n fusion-memory-qwen python=3.12 pip
 conda activate fusion-memory-qwen
 pip install --no-deps -e . psycopg2-binary sentence-transformers transformers huggingface-hub tokenizers safetensors numpy scipy scikit-learn tqdm pyyaml regex requests filelock fsspec jinja2 networkx sympy typing-extensions
 pip install torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128 --extra-index-url https://pypi.org/simple
@@ -70,21 +70,25 @@ pip install tokenizers==0.22.2 typer click hf-xet httpx certifi charset-normaliz
 pip check
 ```
 
-The explicit install sequence avoids the resolver selecting a newer CUDA 13 PyTorch build and keeps the environment aligned with the existing H100/CUDA 12.8 runtime.
+The explicit install sequence avoids the resolver selecting an incompatible
+PyTorch build. Adjust the PyTorch package for your CUDA or CPU runtime.
 
 The model weights were downloaded with:
 
 ```bash
+export FUSION_MEMORY_MODEL_CACHE="$HOME/.cache/fusion-memory/models"
 HF_ENDPOINT=https://hf-mirror.com python - <<'PY'
+import os
 from huggingface_hub import snapshot_download
 
+cache = os.environ["FUSION_MEMORY_MODEL_CACHE"]
 snapshot_download(
     "Qwen/Qwen3-Embedding-0.6B",
-    local_dir="/public/home/wwb/model/fusion-memory/Qwen3-Embedding-0.6B",
+    local_dir=f"{cache}/Qwen3-Embedding-0.6B",
 )
 snapshot_download(
     "Qwen/Qwen3-Reranker-0.6B",
-    local_dir="/public/home/wwb/model/fusion-memory/Qwen3-Reranker-0.6B",
+    local_dir=f"{cache}/Qwen3-Reranker-0.6B",
 )
 PY
 ```
@@ -92,14 +96,14 @@ PY
 ## Qwen Smoke
 
 ```bash
-cd /public/home/wwb/memory
+cd /path/to/fusion-memory
 conda activate fusion-memory-qwen
-FUSION_MEMORY_MODEL_CACHE=/public/home/wwb/model/fusion-memory \
+export FUSION_MEMORY_MODEL_CACHE="$HOME/.cache/fusion-memory/models"
 python deploy/qwen_smoke.py \
-  --embedding-model /public/home/wwb/model/fusion-memory/Qwen3-Embedding-0.6B \
-  --reranker-model /public/home/wwb/model/fusion-memory/Qwen3-Reranker-0.6B \
-  --device cuda:0 \
-  --cache-dir /public/home/wwb/model/fusion-memory
+  --embedding-model "$FUSION_MEMORY_MODEL_CACHE/Qwen3-Embedding-0.6B" \
+  --reranker-model "$FUSION_MEMORY_MODEL_CACHE/Qwen3-Reranker-0.6B" \
+  --device "${FUSION_MEMORY_QWEN_DEVICE:-cpu}" \
+  --cache-dir "$FUSION_MEMORY_MODEL_CACHE"
 ```
 
 Expected:
@@ -108,12 +112,6 @@ Expected:
 - reranker returns two numeric scores.
 
 CPU smoke may be slow. Production traffic should use a GPU-backed model host or an HTTP model service.
-
-Current smoke result in `fusion-memory-qwen`:
-
-- `embedding_dimension` is `1024`.
-- reranker returns two numeric scores.
-- Runtime config smoke successfully loads local Qwen models and runs `add/search`.
 
 ## Runtime Environment Variables
 
@@ -183,7 +181,7 @@ The extractor should be owned by the memory system. Agent models can pass hints 
 ## Persistent HTTP Service
 
 ```bash
-cd /public/home/wwb/memory
+cd /path/to/fusion-memory
 source deploy/fusion-memory.local.env
 python -m fusion_memory.server \
   --host "$FUSION_MEMORY_SERVER_HOST" \

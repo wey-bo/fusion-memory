@@ -26,6 +26,12 @@ from tools.beam_event_ordering_replay import (
 
 
 class BeamReplaySummaryTests(unittest.TestCase):
+    def test_default_dataset_is_environment_or_relative_path(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(replay._default_beam_dataset(), "datasets/BEAM")
+        with patch.dict("os.environ", {"BEAM_DATASET": "/data/BEAM"}, clear=True):
+            self.assertEqual(replay._default_beam_dataset(), "/data/BEAM")
+
     def test_summary_for_stdout_includes_dual_and_cluster_fields(self) -> None:
         report = {
             "workspace": "w",

@@ -13,4 +13,4 @@ fusion-memory beta-test --report docs/alpha-beta/beta-latest.json
 ```
 
 The reports never include model API keys. Test model configuration may be passed
-by path with `/public/home/wwb/test_key/key.txt` when benchmark commands need it.
+by path with your local `MODEL_CONFIG_FILE` when benchmark commands need it.

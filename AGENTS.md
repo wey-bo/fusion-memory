@@ -53,14 +53,14 @@ Final report:
 
 ## Runtime Resources
 
-Repo root:
-- `/public/home/wwb/memory`
+Set these paths locally instead of hard-coding machine-specific directories:
 
-Python:
-- `/public/home/wwb/anaconda3/envs/fusion-memory-qwen/bin/python`
-
-Dataset:
-- `/public/home/wwb/datasets/BEAM`
+```bash
+export FUSION_MEMORY_REPO=/path/to/fusion-memory
+export FUSION_MEMORY_PYTHON=python
+export BEAM_DATASET=/path/to/BEAM
+export MODEL_CONFIG_FILE=/path/to/model-config.txt
+```
 
 Workspace:
 - `beam_100k_rule_qwenembed_sessionized_20260612_1745`
@@ -69,18 +69,19 @@ Postgres DSN:
 - `postgresql://fusion:fusion@127.0.0.1:55433/fusion_memory`
 
 Model config:
-- `/public/home/wwb/test_key/key.txt`
+- `$MODEL_CONFIG_FILE`
 - Do not print secrets.
 
 Runner pattern:
 ```bash
-/public/home/wwb/anaconda3/envs/fusion-memory-qwen/bin/python tools/beam_parallel_runner.py \
-  --dataset /public/home/wwb/datasets/BEAM --split 100k \
+cd "$FUSION_MEMORY_REPO"
+"$FUSION_MEMORY_PYTHON" tools/beam_parallel_runner.py \
+  --dataset "$BEAM_DATASET" --split 100k \
   --workspace beam_100k_rule_qwenembed_sessionized_20260612_1745 \
   --db postgresql://fusion:fusion@127.0.0.1:55433/fusion_memory \
   --output .runtime/beam-runs/current_validation_20260616/<run>.json \
   query --workers 24 --progress-every 20 \
-  --model-config-file /public/home/wwb/test_key/key.txt --model-timeout-seconds 300 \
+  --model-config-file "$MODEL_CONFIG_FILE" --model-timeout-seconds 300 \
   --partial-dir .runtime/beam-runs/current_validation_20260616/<run>.partials \
   --diagnostic-output .runtime/beam-runs/current_validation_20260616/<run>.diagnostic.json \
   --max-consecutive-answer-failures 3 --answer-failure-retries 1

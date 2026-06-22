@@ -84,5 +84,6 @@ Fusion-Agent recovery: set `PSI_MEMORY_BASE_URL` in the current shell, start the
 session with `--memory-enabled`, and allow the agent to continue without memory
 if the local service is unavailable.
 
-For test model configuration, pass `/public/home/wwb/test_key/key.txt` by path.
-Never paste key contents into an issue, log, or chat.
+For test model configuration, set `MODEL_CONFIG_FILE` to your local key file
+path and pass that path to benchmark commands. Never paste key contents into an
+issue, log, or chat.

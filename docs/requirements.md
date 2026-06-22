@@ -186,7 +186,7 @@ Layer 8 Benchmark/Product Integration:
 Local verification:
 
 ```bash
-cd /public/home/wwb/memory
+cd /path/to/fusion-memory
 python -Werror::ResourceWarning -m unittest discover -s tests -v
 python -m compileall -q fusion_memory tests deploy
 ```
@@ -194,7 +194,7 @@ python -m compileall -q fusion_memory tests deploy
 Postgres smoke:
 
 ```bash
-cd /public/home/wwb/memory
+cd /path/to/fusion-memory
 docker compose -f deploy/docker-compose.postgres.yml up -d
 python -m fusion_memory.cli migrate-postgres postgresql://fusion:fusion@localhost:5432/fusion_memory
 python -m fusion_memory.cli verify-postgres postgresql://fusion:fusion@localhost:5432/fusion_memory
@@ -203,7 +203,7 @@ python -m fusion_memory.cli verify-postgres postgresql://fusion:fusion@localhost
 Qwen smoke, after installing optional dependencies:
 
 ```bash
-cd /public/home/wwb/memory
+cd /path/to/fusion-memory
 source deploy/fusion-memory.env.example
 python deploy/qwen_smoke.py \
   --embedding-model "$FUSION_MEMORY_EMBEDDING_MODEL" \

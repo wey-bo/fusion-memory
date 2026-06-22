@@ -19,9 +19,13 @@ from fusion_memory.eval.beam_adapter import BeamAdapter, _load_official_beam_dat
 from fusion_memory.eval.model_adapters import _pack_for_model  # noqa: E402
 
 
+def _default_beam_dataset() -> str:
+    return os.getenv("BEAM_DATASET", "datasets/BEAM")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Inspect current Fusion Memory evidence/model packs for BEAM query ids.")
-    parser.add_argument("--dataset", default="/public/home/wwb/datasets/BEAM")
+    parser.add_argument("--dataset", default=_default_beam_dataset())
     parser.add_argument("--split", default="100k")
     parser.add_argument("--workspace", required=True)
     parser.add_argument("--user-id", default="beam_user")
