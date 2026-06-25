@@ -16,7 +16,7 @@ UNAVAILABLE_MESSAGE = (
 )
 
 
-async def memory_add(content: str, source: str | None = None) -> str:
+async def memory_add(content: str, source: str = "dolphin-tool") -> str:
     """Store durable information in Fusion Memory.
 
     Args:
