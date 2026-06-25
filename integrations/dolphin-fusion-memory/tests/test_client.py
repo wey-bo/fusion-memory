@@ -12,7 +12,7 @@ TOOLS_DIR = Path(__file__).resolve().parents[1] / "workspace" / "tools"
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
-from _client import format_context_pack, post_json
+from _client import _normalize_timeout_seconds, format_context_pack, post_json
 
 
 @pytest.mark.anyio
@@ -45,3 +45,8 @@ async def test_post_json_sends_payload_and_returns_json() -> None:
         assert format_context_pack(data).startswith("Fusion Memory context:")
     finally:
         await runner.cleanup()
+
+
+def test_normalize_timeout_seconds_uses_default_for_non_positive_values() -> None:
+    assert _normalize_timeout_seconds(0) == 2.0
+    assert _normalize_timeout_seconds(-1) == 2.0

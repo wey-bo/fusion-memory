@@ -9,7 +9,7 @@ UNAVAILABLE_MESSAGE = "Fusion Memory request failed"
 
 
 async def post_json(base_url: str, path: str, payload: dict[str, Any], timeout_seconds: float) -> dict[str, Any]:
-    timeout = aiohttp.ClientTimeout(total=_clamp_timeout(timeout_seconds))
+    timeout = aiohttp.ClientTimeout(total=_normalize_timeout_seconds(timeout_seconds))
     url = f"{base_url.rstrip('/')}/{path.lstrip('/')}"
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(url, json=payload) as response:
@@ -38,7 +38,9 @@ def format_context_pack(pack: dict[str, Any], limit: int = 8) -> str:
     return "Fusion Memory context:\n" + "\n".join(lines) if lines else ""
 
 
-def _clamp_timeout(value: float) -> float:
+def _normalize_timeout_seconds(value: float) -> float:
+    if value <= 0:
+        return 2.0
     return max(0.1, min(5.0, value))
 
 
