@@ -28,17 +28,32 @@ def _has_failure_message(text: str) -> bool:
     return '"ok": false' in lowered or "fusion memory is not available" in lowered
 
 
+def _write_succeeded(write_result: str) -> bool:
+    if _has_failure_message(write_result):
+        return False
+    try:
+        payload = json.loads(write_result)
+    except json.JSONDecodeError:
+        return '"saved": true' in write_result.lower()
+    if isinstance(payload, dict):
+        if payload.get("saved") is True:
+            return True
+        result = payload.get("result")
+        if isinstance(result, dict):
+            return result.get("saved") is True
+    return False
+
+
 async def main() -> int:
     token = f"dolphin-smoke-{uuid4().hex}"
     content = f"Dolphin-Agent Fusion Memory smoke token {token}"
 
-    write_result = await memory_add(content)
+    write_result = await memory_add(content, source="smoke")
     search_result = await memory_search(token, limit=3)
     context_result = await memory_answer_context(token)
 
     ok = (
-        '"saved": true' in write_result.lower()
-        and not _has_failure_message(write_result)
+        _write_succeeded(write_result)
         and token in search_result
         and not _has_failure_message(search_result)
         and token in context_result
