@@ -50,3 +50,21 @@ async def test_post_json_sends_payload_and_returns_json() -> None:
 def test_normalize_timeout_seconds_uses_default_for_non_positive_values() -> None:
     assert _normalize_timeout_seconds(0) == 2.0
     assert _normalize_timeout_seconds(-1) == 2.0
+
+
+def test_format_context_pack_includes_search_candidates() -> None:
+    result = format_context_pack(
+        {
+            "candidates": [
+                {
+                    "id": "span-1",
+                    "type": "span",
+                    "text": "Dolphin-Agent Fusion Memory smoke token dolphin-smoke-token",
+                    "source": "l0_raw_hybrid",
+                }
+            ]
+        }
+    )
+
+    assert result.startswith("Fusion Memory context:")
+    assert "dolphin-smoke-token" in result

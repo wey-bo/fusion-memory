@@ -25,13 +25,19 @@ async def post_json(base_url: str, path: str, payload: dict[str, Any], timeout_s
 
 def format_context_pack(pack: dict[str, Any], limit: int = 8) -> str:
     lines: list[str] = []
-    for key in ("current_views", "entity_profiles", "facts", "events", "source_spans"):
+    for key in ("candidates", "current_views", "entity_profiles", "facts", "events", "source_spans"):
         items = pack.get(key)
         if not isinstance(items, list):
             continue
         for item in items[:limit]:
             if isinstance(item, dict):
-                text = item.get("text") or item.get("summary") or item.get("content") or str(item)
+                text = (
+                    item.get("text")
+                    or item.get("summary")
+                    or item.get("content")
+                    or item.get("candidate", {}).get("text")
+                    or str(item)
+                )
             else:
                 text = str(item)
             lines.append(f"- {text}")
