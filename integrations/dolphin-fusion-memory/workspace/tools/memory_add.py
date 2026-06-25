@@ -8,7 +8,7 @@ TOOLS_DIR = Path(__file__).resolve().parent
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
-from _client import post_json
+from _client import post_json as _post_json
 from _config import CONFIG
 
 UNAVAILABLE_MESSAGE = (
@@ -27,7 +27,7 @@ async def memory_add(content: str, source: str | None = None) -> str:
         A JSON string describing the result of the add request.
     """
     try:
-        data = await post_json(
+        data = await _post_json(
             CONFIG.base_url,
             "/add",
             {

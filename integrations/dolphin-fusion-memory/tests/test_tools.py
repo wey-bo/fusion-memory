@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import importlib
 import socket
 import sys
@@ -34,6 +35,28 @@ def _cfg(base_url: str, session_id: str | None = None) -> MemoryConfig:
         agent_id="dolphin",
         session_id=session_id,
     )
+
+
+def test_empty_session_id_allows_cross_session_scope() -> None:
+    cfg = _cfg("http://example.invalid:1234", session_id="")
+    assert cfg.allow_cross_session is True
+    assert cfg.scope["session_id"] is None
+
+
+def test_tool_modules_only_export_expected_public_async_callables() -> None:
+    modules = {
+        "memory_add": memory_add,
+        "memory_search": memory_search,
+        "memory_answer_context": memory_answer_context,
+    }
+
+    for module_name, module in modules.items():
+        public_async_callables = {
+            name
+            for name, value in vars(module).items()
+            if not name.startswith("_") and inspect.iscoroutinefunction(value)
+        }
+        assert public_async_callables == {module_name}
 
 
 @pytest.mark.anyio
