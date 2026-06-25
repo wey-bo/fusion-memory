@@ -7,7 +7,7 @@ TOOLS_DIR = Path(__file__).resolve().parent
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
 
-from _client import format_context_pack, post_json as _post_json
+from _client import format_context_pack as _format_context_pack, post_json as _post_json
 from _config import CONFIG
 
 UNAVAILABLE_MESSAGE = (
@@ -37,6 +37,6 @@ async def memory_search(query: str, limit: int = 8) -> str:
             },
             CONFIG.timeout_seconds,
         )
-        return format_context_pack(data, limit=limit)
+        return _format_context_pack(data, limit=limit)
     except Exception:
         return UNAVAILABLE_MESSAGE

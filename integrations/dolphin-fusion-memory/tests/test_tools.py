@@ -43,7 +43,7 @@ def test_empty_session_id_allows_cross_session_scope() -> None:
     assert cfg.scope["session_id"] is None
 
 
-def test_tool_modules_only_export_expected_public_async_callables() -> None:
+def test_tool_modules_only_export_expected_public_callables() -> None:
     modules = {
         "memory_add": memory_add,
         "memory_search": memory_search,
@@ -51,12 +51,12 @@ def test_tool_modules_only_export_expected_public_async_callables() -> None:
     }
 
     for module_name, module in modules.items():
-        public_async_callables = {
+        public_functions = {
             name
             for name, value in vars(module).items()
-            if not name.startswith("_") and inspect.iscoroutinefunction(value)
+            if not name.startswith("_") and inspect.isroutine(value)
         }
-        assert public_async_callables == {module_name}
+        assert public_functions == {module_name}
 
 
 @pytest.mark.anyio
