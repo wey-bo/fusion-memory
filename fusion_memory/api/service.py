@@ -225,6 +225,46 @@ class MemoryService:
         except Exception:
             pass
 
+    def ingest_turn(
+        self,
+        messages: list[dict[str, Any]],
+        scope: Scope,
+        *,
+        turn_id: str | None = None,
+        turn_index: int | None = None,
+        session_time: datetime | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> AddResult:
+        scope.validate_for_add()
+        session_time = session_time or datetime.now(timezone.utc)
+        resolved_turn_id = turn_id or f"turn_{turn_index or 0}"
+        base_metadata = dict(metadata or {})
+        payload_messages: list[dict[str, Any]] = []
+
+        for index, message in enumerate(messages):
+            role = str(message.get("role") or "user")
+            payload_messages.append(
+                {
+                    "role": role,
+                    "content": str(message.get("content") or ""),
+                    "turn_id": resolved_turn_id,
+                    "timestamp": message.get("timestamp") or session_time.isoformat(),
+                    "span_type": "tool_result" if role == "tool" else "turn",
+                    "metadata": {
+                        **base_metadata,
+                        **dict(message.get("metadata") or {}),
+                        "ingestion_kind": "turn",
+                        "turn_index": turn_index,
+                        "message_index_in_turn": index,
+                        "message_role": role,
+                        "tool_name": message.get("name"),
+                        "tool_call_id": message.get("tool_call_id"),
+                    },
+                }
+            )
+
+        return self.add({"messages": payload_messages}, scope, session_time=session_time)
+
     def add(self, input: Any, scope: Scope, session_time: datetime | None = None, metadata: dict[str, Any] | None = None) -> AddResult:
         with collect_rule_hits() as rule_hits:
             return self._add_with_rule_hits(input, scope, session_time, metadata, rule_hits)

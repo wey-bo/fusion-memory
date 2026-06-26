@@ -70,6 +70,64 @@ class FusionMemoryTests(unittest.TestCase):
         finally:
             service.close()
 
+    def test_ingest_turn_persists_raw_messages_in_order(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="ws", user_id="u", agent_id="a", session_id="s")
+
+        result = memory.ingest_turn(
+            [
+                {"role": "user", "content": "book the train to Hangzhou"},
+                {"role": "assistant", "content": "I will compare the morning options."},
+                {"role": "tool", "content": "draft booking created", "name": "rail_search"},
+            ],
+            scope,
+            turn_id="turn-1",
+            turn_index=1,
+            session_time=ts("2026-06-26T09:00:00+00:00"),
+        )
+
+        spans = [
+            span
+            for span in memory.store.list_spans(scope, include_session=True)
+            if span.turn_id == "turn-1" and span.span_type in {"turn", "tool_result"}
+        ]
+
+        self.assertTrue(result.span_ids)
+        self.assertEqual([span.speaker for span in spans], ["user", "assistant", "tool"])
+        self.assertEqual([span.metadata["message_index_in_turn"] for span in spans], [0, 1, 2])
+        self.assertEqual(
+            [span.content for span in spans],
+            [
+                "book the train to Hangzhou",
+                "I will compare the morning options.",
+                "draft booking created",
+            ],
+        )
+
+    def test_ingest_turn_keeps_user_message_for_error_turn(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="ws", user_id="u", agent_id="a", session_id="s")
+
+        memory.ingest_turn(
+            [{"role": "user", "content": "delete the stale branch"}],
+            scope,
+            turn_id="turn-error",
+            turn_index=8,
+            metadata={"ended_with_error": True},
+            session_time=ts("2026-06-26T09:05:00+00:00"),
+        )
+
+        spans = [
+            span
+            for span in memory.store.list_spans(scope, include_session=True)
+            if span.turn_id == "turn-error" and span.span_type == "turn"
+        ]
+
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(spans[0].speaker, "user")
+        self.assertEqual(spans[0].content, "delete the stale branch")
+        self.assertTrue(spans[0].metadata["ended_with_error"])
+
     def test_exact_answer_candidates_rank_user_distance_location_fact(self) -> None:
         plan = QueryPlan(
             query="How far away did I say my parents live from me, and in which town?",
