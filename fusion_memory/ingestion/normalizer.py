@@ -55,7 +55,7 @@ def normalize_input(
                 speaker=speaker,
                 span_type=span_type,
                 content=content,
-                content_hash=stable_hash(f"{speaker}:{content}"),
+                content_hash=_content_hash_for_message(scope, message, index, speaker, content),
                 timestamp=_parse_ts(message.get("timestamp")) or timestamp,
                 source_uri=message.get("source_uri") or metadata.get("source_uri"),
                 parent_span_id=message.get("parent_span_id"),
@@ -90,6 +90,16 @@ def _to_messages(input_data: Any) -> list[dict[str, Any]]:
                 out.append(dict(item))
         return out
     raise TypeError("input must be a string, dict, or list of messages")
+
+
+def _content_hash_for_message(scope: Scope, message: dict[str, Any], index: int, speaker: str, content: str) -> str:
+    message_metadata = dict(message.get("metadata") or {})
+    if message_metadata.get("ingestion_kind") == "turn":
+        turn_id = message.get("turn_id") or f"turn_{index}"
+        message_index = message_metadata.get("message_index_in_turn", index)
+        session_key = scope.session_id or ""
+        return stable_hash(f"{speaker}:turn:{session_key}:{turn_id}:{message_index}:{content}")
+    return stable_hash(f"{speaker}:{content}")
 
 
 def _parse_ts(value: Any) -> datetime | None:

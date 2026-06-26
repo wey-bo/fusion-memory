@@ -128,6 +128,91 @@ class FusionMemoryTests(unittest.TestCase):
         self.assertEqual(spans[0].content, "delete the stale branch")
         self.assertTrue(spans[0].metadata["ended_with_error"])
 
+    def test_ingest_turn_persists_identical_messages_across_turns(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="ws", user_id="u", agent_id="a", session_id="s")
+
+        memory.ingest_turn(
+            [{"role": "user", "content": "same request"}],
+            scope,
+            turn_id="turn-1",
+            turn_index=1,
+            session_time=ts("2026-06-26T09:10:00+00:00"),
+        )
+        memory.ingest_turn(
+            [{"role": "user", "content": "same request"}],
+            scope,
+            turn_id="turn-2",
+            turn_index=2,
+            session_time=ts("2026-06-26T09:11:00+00:00"),
+        )
+
+        spans = [
+            span
+            for span in memory.store.list_spans(scope, include_session=True)
+            if span.span_type == "turn" and span.content == "same request"
+        ]
+
+        self.assertEqual(len(spans), 2)
+        self.assertEqual([span.turn_id for span in spans], ["turn-1", "turn-2"])
+        self.assertEqual(len({span.span_id for span in spans}), 2)
+
+    def test_ingest_turn_persists_identical_messages_across_sessions(self) -> None:
+        memory = MemoryService()
+        scope_one = Scope(workspace_id="ws", user_id="u", agent_id="a", session_id="s1")
+        scope_two = Scope(workspace_id="ws", user_id="u", agent_id="a", session_id="s2")
+
+        memory.ingest_turn(
+            [{"role": "user", "content": "same request"}],
+            scope_one,
+            turn_id="turn-1",
+            turn_index=1,
+            session_time=ts("2026-06-26T09:12:00+00:00"),
+        )
+        memory.ingest_turn(
+            [{"role": "user", "content": "same request"}],
+            scope_two,
+            turn_id="turn-1",
+            turn_index=1,
+            session_time=ts("2026-06-26T09:13:00+00:00"),
+        )
+
+        session_one_spans = [
+            span
+            for span in memory.store.list_spans(scope_one, include_session=True)
+            if span.span_type == "turn" and span.content == "same request"
+        ]
+        session_two_spans = [
+            span
+            for span in memory.store.list_spans(scope_two, include_session=True)
+            if span.span_type == "turn" and span.content == "same request"
+        ]
+
+        self.assertEqual(len(session_one_spans), 1)
+        self.assertEqual(len(session_two_spans), 1)
+        self.assertNotEqual(session_one_spans[0].span_id, session_two_spans[0].span_id)
+
+    def test_ingest_turn_uses_tool_name_alias_for_tool_messages(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="ws", user_id="u", agent_id="a", session_id="s")
+
+        memory.ingest_turn(
+            [{"role": "tool", "content": "draft booking created", "tool_name": "rail_search"}],
+            scope,
+            turn_id="turn-tool",
+            turn_index=3,
+            session_time=ts("2026-06-26T09:14:00+00:00"),
+        )
+
+        spans = [
+            span
+            for span in memory.store.list_spans(scope, include_session=True)
+            if span.turn_id == "turn-tool" and span.span_type == "tool_result"
+        ]
+
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(spans[0].metadata["tool_name"], "rail_search")
+
     def test_exact_answer_candidates_rank_user_distance_location_fact(self) -> None:
         plan = QueryPlan(
             query="How far away did I say my parents live from me, and in which town?",

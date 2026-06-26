@@ -237,7 +237,7 @@ class MemoryService:
     ) -> AddResult:
         scope.validate_for_add()
         session_time = session_time or datetime.now(timezone.utc)
-        resolved_turn_id = turn_id or f"turn_{turn_index or 0}"
+        resolved_turn_id = turn_id or (f"turn_{turn_index}" if turn_index is not None else new_id("turn"))
         base_metadata = dict(metadata or {})
         payload_messages: list[dict[str, Any]] = []
 
@@ -257,7 +257,7 @@ class MemoryService:
                         "turn_index": turn_index,
                         "message_index_in_turn": index,
                         "message_role": role,
-                        "tool_name": message.get("name"),
+                        "tool_name": message.get("tool_name") or message.get("name"),
                         "tool_call_id": message.get("tool_call_id"),
                     },
                 }
