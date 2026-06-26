@@ -129,3 +129,21 @@ class EventOrderingGraphTests(unittest.TestCase):
         )
 
         self.assertTrue("event_ordering_graph" in pack.coverage or "event_ordering_shadow" in pack.coverage)
+
+    def test_event_ordering_pack_reports_single_topic_scope_passes(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="w-order", user_id="u", agent_id="a", session_id="s")
+        memory.add("First I booked the outbound flight to Shanghai.", scope, ts("2026-06-01T10:00:00+00:00"))
+        memory.add("Then I reserved the hotel near the Bund.", scope, ts("2026-06-02T10:00:00+00:00"))
+        memory.add("After that I submitted the visa application.", scope, ts("2026-06-03T10:00:00+00:00"))
+
+        pack = memory.answer_context(
+            "按时间顺序总结我的航班、酒店和签证事项。",
+            scope,
+            budget={"limit": 6, "mode": "benchmark"},
+        )
+
+        selection = pack.coverage["event_ordering_selection"]
+        self.assertEqual(selection["topic_scope_filter_passes"], 1)
+        self.assertTrue(selection["graph_candidates"])
+        self.assertIn("timeline_representatives", selection)

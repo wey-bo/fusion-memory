@@ -171,6 +171,22 @@ class RetrievalRegressionFixtureTests(unittest.TestCase):
         self.assertIn("one command", text)
         self.assertIn("beginner friendly", text)
 
+    def test_event_ordering_restore_reports_structured_reason_codes(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="preserve-order", user_id="u", agent_id="a", session_id="s")
+        memory.add("First I drafted the itinerary.", scope, datetime(2026, 6, 1, tzinfo=timezone.utc))
+        memory.add("Then I changed the hotel to one near the station.", scope, datetime(2026, 6, 2, tzinfo=timezone.utc))
+        memory.add("Finally I moved the departure to Friday night.", scope, datetime(2026, 6, 3, tzinfo=timezone.utc))
+
+        result = memory.search(
+            "按时间顺序列出我改动过的行程。",
+            scope,
+            {"mode": "benchmark", "limit": 6},
+        )
+
+        restored = result.coverage["event_ordering_selection"]["preservation_restored"]
+        self.assertTrue(all("reason" in item for item in restored))
+
 
 if __name__ == "__main__":
     unittest.main()

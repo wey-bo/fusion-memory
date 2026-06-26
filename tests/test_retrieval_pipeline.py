@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from datetime import datetime, timezone
 from types import MethodType
 
 from fusion_memory.api.service import MemoryService
@@ -20,6 +21,10 @@ from fusion_memory.retrieval.pipeline import RetrievalTraceRecorder
 from fusion_memory.retrieval.pipeline import build_pipeline_record
 from fusion_memory.retrieval.pipeline import selected_temporal_relation_summary
 from fusion_memory.retrieval.raw_evidence_quota import QuotaResult
+
+
+def ts(value: str) -> datetime:
+    return datetime.fromisoformat(value).replace(tzinfo=timezone.utc)
 
 
 class RetrievalPipelineTests(unittest.TestCase):
@@ -614,6 +619,20 @@ class RetrievalPipelineTests(unittest.TestCase):
         self.assertNotIn(raw_query_text, repr(lifecycle))
         self.assertNotIn(raw_memory_text, repr(trace["candidate_lifecycle_trace"]))
         self.assertNotIn(raw_query_text, repr(trace["candidate_lifecycle_trace"]))
+
+    def test_event_ordering_selection_is_exposed_in_search_coverage(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="pipeline-order", user_id="u", agent_id="a", session_id="s")
+        memory.add("First I prepared the migration checklist.", scope, ts("2026-06-01T10:00:00+00:00"))
+        memory.add("Then I applied the schema changes.", scope, ts("2026-06-02T10:00:00+00:00"))
+
+        result = memory.search(
+            "List the migration work in chronological order.",
+            scope,
+            {"mode": "benchmark", "limit": 6},
+        )
+
+        self.assertIn("event_ordering_selection", result.coverage)
 
     def test_search_lifecycle_records_preservation_rescue_delta_without_raw_text(self) -> None:
         memory = MemoryService()

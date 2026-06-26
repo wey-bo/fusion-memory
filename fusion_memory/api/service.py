@@ -55,6 +55,7 @@ from fusion_memory.retrieval.pipeline import (
     CandidateFusionEngine,
     EvidencePackAssembler,
     QueryUnderstandingEngine,
+    query_understanding_result_from_plan,
     RecallOrchestrator,
     RetrievalExecutionContext,
     RetrievalTraceRecorder,
@@ -457,6 +458,15 @@ class MemoryService:
         trace_id = new_id("trace")
         query_understanding = QueryUnderstandingEngine().run(query, scope, options, self.planner)
         plan = query_understanding.plan
+        if plan.query_type != "event_ordering" and _explicit_event_ordering_request(query):
+            plan.query_type = "event_ordering"
+            plan.must_include_sources = ["raw_evidence", "events"]
+            query_understanding = query_understanding_result_from_plan(
+                plan=plan,
+                query=query,
+                intent_telemetry=query_understanding.intent_telemetry,
+                precomputed=query_understanding.precomputed,
+            )
         intent_telemetry = query_understanding.intent_telemetry
         lifecycle = CandidateLifecycleRecorder()
         retrieval_context = RetrievalExecutionContext(
@@ -525,11 +535,6 @@ class MemoryService:
             preselected = record_rescued_delta(before, self._preserve_contradiction_claim_coverage(scored_again, before, rerank_top_n), "preserve_contradiction_claim_coverage")
         before = preselected
         preselected = record_rescued_delta(before, self._preserve_high_ranked_summaries(scored_again, before, rerank_top_n), "preserve_high_ranked_summaries")
-        if plan.query_type == "event_ordering":
-            before = preselected
-            preselected = record_rescued_delta(before, self._preserve_event_ordering_events(query, scored_again, before, rerank_top_n), "preserve_event_ordering_events")
-            before = preselected
-            preselected = record_rescued_delta(before, self._preserve_event_ordering_raw_facets(query, scored_again, before, rerank_top_n), "preserve_event_ordering_raw_facets")
         rerank_applied = mode in {"balanced", "benchmark"}
         if rerank_applied:
             reranked = rerank_candidates(query, preselected, self.reranker)
@@ -553,15 +558,11 @@ class MemoryService:
                 selected = record_rescued_delta(before, self._preserve_contradiction_claim_coverage(scored_again, before, limit), "preserve_contradiction_claim_coverage")
             before = selected
             selected = record_rescued_delta(before, self._preserve_high_ranked_summaries(scored_again, before, limit), "preserve_high_ranked_summaries")
-            if plan.query_type == "event_ordering":
-                before = selected
-                selected = record_rescued_delta(before, self._preserve_event_ordering_events(query, scored_again, before, limit), "preserve_event_ordering_events")
-                before = selected
-                selected = record_rescued_delta(before, self._preserve_event_ordering_raw_facets(query, scored_again, before, limit), "preserve_event_ordering_raw_facets")
         else:
             selected = preselected[:limit]
-        before = selected
-        selected = record_filtered_delta(before, self._apply_topic_scope_filter(query, plan, scored_again, before, limit), "topic_scope_filter")
+        if plan.query_type != "event_ordering":
+            before = selected
+            selected = record_filtered_delta(before, self._apply_topic_scope_filter(query, plan, scored_again, before, limit), "topic_scope_filter")
         before = selected
         selected = record_rescued_delta(before, self._apply_quality_fallback(query, plan, scope, scored_again, before, limit, include_session=include_session), "quality_fallback")
         before = selected
@@ -577,13 +578,9 @@ class MemoryService:
         if plan.query_type == "contradiction_resolution":
             before = selected
             selected = record_rescued_delta(before, self._preserve_contradiction_claim_coverage(scored_again, before, limit), "preserve_contradiction_claim_coverage")
-        if plan.query_type == "event_ordering":
+        if plan.query_type != "event_ordering":
             before = selected
-            selected = record_rescued_delta(before, self._preserve_event_ordering_events(query, scored_again, before, limit), "preserve_event_ordering_events")
-            before = selected
-            selected = record_rescued_delta(before, self._preserve_event_ordering_raw_facets(query, scored_again, before, limit), "preserve_event_ordering_raw_facets")
-        before = selected
-        selected = record_filtered_delta(before, self._apply_topic_scope_filter(query, plan, scored_again, before, limit), "topic_scope_filter")
+            selected = record_filtered_delta(before, self._apply_topic_scope_filter(query, plan, scored_again, before, limit), "topic_scope_filter")
         before = selected
         selected = record_rescued_delta(before, self._preserve_scent_trail(scored_again, before, limit), "preserve_scent_trail")
         before = selected
@@ -591,12 +588,16 @@ class MemoryService:
         before = selected
         selected = record_filtered_delta(before, self._filter_stale_current_value_candidates(query, plan, before), "stale_current_value_filter")
         annotated_candidates = annotate_runtime_preservation_candidates(scored_again)
-        before = selected
-        selected, dropped_high_signal = preserve_required_candidates(annotated_candidates, before, limit)
-        selected = record_rescued_delta(before, selected, "runtime_required_preservation")
+        event_ordering_selection: dict[str, Any] | None = None
         if plan.query_type == "event_ordering":
             before = selected
-            selected, scope_dropped_high_signal = self._apply_event_ordering_post_preservation_topic_scope_filter(
+            selected = record_rescued_delta(
+                before,
+                self._select_event_ordering_candidates(query, plan, scored_again, before, limit),
+                "event_ordering_selection",
+            )
+            before = selected
+            selected, topic_scope_dropped = self._apply_event_ordering_topic_scope(
                 query,
                 plan,
                 scored_again,
@@ -604,7 +605,29 @@ class MemoryService:
                 limit,
             )
             selected = record_filtered_delta(before, selected, "event_ordering_topic_scope_filter")
-            dropped_high_signal.extend(scope_dropped_high_signal)
+            before = selected
+            selected, preservation_restored = self._restore_required_event_ordering_candidates(annotated_candidates, before, limit)
+            selected = record_rescued_delta(before, selected, "runtime_required_preservation")
+            dropped_high_signal = [
+                item
+                for item in [*topic_scope_dropped, *preservation_restored]
+                if item.get("reason") == "budget_limit" or item.get("must_preserve_reasons")
+            ]
+            event_ordering_selection = {
+                "graph_candidates": [candidate.id for candidate in selected],
+                "timeline_representatives": [
+                    candidate.id
+                    for candidate in selected
+                    if candidate.source.startswith("event_ordering_graph")
+                ],
+                "topic_scope_dropped": topic_scope_dropped,
+                "preservation_restored": preservation_restored,
+                "topic_scope_filter_passes": 1,
+            }
+        else:
+            before = selected
+            selected, dropped_high_signal = preserve_required_candidates(annotated_candidates, before, limit)
+            selected = record_rescued_delta(before, selected, "runtime_required_preservation")
         for candidate in selected:
             lifecycle.record(candidate, "selected", "final_selection", contributed=True)
         for dropped in dropped_high_signal:
@@ -627,6 +650,13 @@ class MemoryService:
             "dropped_high_signal_candidates": dropped_high_signal,
         }
         if plan.query_type == "event_ordering":
+            coverage["event_ordering_selection"] = event_ordering_selection or {
+                "graph_candidates": [],
+                "timeline_representatives": [],
+                "topic_scope_dropped": [],
+                "preservation_restored": [],
+                "topic_scope_filter_passes": 1,
+            }
             coverage.update(self._event_ordering_shadow_coverage(candidate_lists, selected))
             if getattr(self.retrieval_flags, "dual_event_ordering_shadow", False):
                 coverage["event_ordering_dual_shadow"] = self._event_ordering_dual_shadow_coverage(
@@ -3556,6 +3586,64 @@ class MemoryService:
                 break
         return out
 
+    def _select_event_ordering_candidates(
+        self,
+        query: str,
+        plan: Any,
+        candidates: list[Candidate],
+        selected: list[Candidate],
+        limit: int,
+    ) -> list[Candidate]:
+        selected = self._preserve_event_ordering_events(query, candidates, selected, limit)
+        return self._preserve_event_ordering_raw_facets(query, candidates, selected, limit)
+
+    def _apply_event_ordering_topic_scope(
+        self,
+        query: str,
+        plan: Any,
+        candidates: list[Candidate],
+        selected: list[Candidate],
+        limit: int,
+    ) -> tuple[list[Candidate], list[dict[str, object]]]:
+        filtered = self._apply_topic_scope_filter(query, plan, candidates, selected, limit)
+        filtered_keys = {(candidate.type, candidate.id) for candidate in filtered}
+        dropped: list[dict[str, object]] = []
+        for candidate in selected:
+            if (candidate.type, candidate.id) in filtered_keys:
+                continue
+            item: dict[str, object] = {
+                "candidate_id": candidate.id,
+                "reason": "topic_scope_filter",
+                "source": candidate.source,
+            }
+            reasons = must_preserve_reasons(candidate)
+            if reasons:
+                item["must_preserve_reasons"] = reasons
+                item["evidence_role"] = candidate.metadata.get("evidence_role", "answer")
+            dropped.append(item)
+        return filtered, dropped
+
+    def _restore_required_event_ordering_candidates(
+        self,
+        scored_candidates: list[Candidate],
+        selected: list[Candidate],
+        limit: int,
+    ) -> tuple[list[Candidate], list[dict[str, object]]]:
+        selected_ids = {candidate.id for candidate in selected}
+        preserved, dropped = preserve_required_candidates(scored_candidates, selected, limit=limit)
+        restored = [
+            {
+                "candidate_id": candidate.id,
+                "reason": ",".join(must_preserve_reasons(candidate)),
+                "must_preserve_reasons": must_preserve_reasons(candidate),
+                "evidence_role": candidate.metadata.get("evidence_role", "answer"),
+                "source": candidate.source,
+            }
+            for candidate in preserved
+            if candidate.id not in selected_ids and must_preserve_reasons(candidate)
+        ]
+        return preserved, [*restored, *dropped]
+
     def _candidate_timeline_position(self, candidate: Candidate) -> tuple[tuple[tuple[int, int | str], ...], tuple[tuple[int, int | str], ...], str] | None:
         source_uri = candidate.metadata.get("source_uri")
         turn_id = candidate.metadata.get("turn_id")
@@ -3996,6 +4084,14 @@ def _event_ordering_support_option_signal(query: str, text: str) -> float:
 
 def _event_ordering_support_option_query(query: str) -> bool:
     return bool(re.search(r"\b(?:strateg(?:y|ies)|support|options?|resources?|tools?|help|ways?)\b", query.lower()))
+
+
+def _explicit_event_ordering_request(query: str) -> bool:
+    lower = query.lower()
+    return bool(
+        re.search(r"按(?:时间)?顺序|时间顺序|先后顺序|时间线|依次|先.*再", lower)
+        or re.search(r"\b(?:chronological|chronology|timeline|in order|order in which|what order)\b", lower)
+    )
 
 
 def _event_ordering_term_variants_for_service(term: str) -> set[str]:
