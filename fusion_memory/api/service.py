@@ -248,6 +248,29 @@ class MemoryService:
             "state_change_hint": False,
         }
 
+    def _turn_message_content(self, message: dict[str, Any]) -> str:
+        content = str(message.get("content") or "")
+        if content or str(message.get("role") or "") != "assistant":
+            return content
+
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list) or not tool_calls:
+            return content
+
+        names: list[str] = []
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get("function")
+            if not isinstance(function, dict):
+                continue
+            name = function.get("name")
+            if name:
+                names.append(str(name))
+        if not names:
+            return "[assistant tool call]"
+        return f"[assistant tool call: {', '.join(names)}]"
+
     def ingest_turn(
         self,
         messages: list[dict[str, Any]],
@@ -270,6 +293,9 @@ class MemoryService:
         for index, message in enumerate(messages):
             role = str(message.get("role") or "user")
             annotations = self._turn_message_annotations(message)
+            message_metadata = {**base_metadata, **dict(message.get("metadata") or {})}
+            if "tool_calls" in message:
+                message_metadata["tool_calls"] = message.get("tool_calls")
             role_breakdown[role] = role_breakdown.get(role, 0) + 1
             if role == "assistant" and annotations["importance_hint"] in {"medium", "high"}:
                 promoted_assistant_count += 1
@@ -278,13 +304,12 @@ class MemoryService:
             payload_messages.append(
                 {
                     "role": role,
-                    "content": str(message.get("content") or ""),
+                    "content": self._turn_message_content(message),
                     "turn_id": resolved_turn_id,
                     "timestamp": message.get("timestamp") or session_time.isoformat(),
                     "span_type": "tool_result" if role == "tool" else "turn",
                     "metadata": {
-                        **base_metadata,
-                        **dict(message.get("metadata") or {}),
+                        **message_metadata,
                         "ingestion_kind": "turn",
                         "turn_index": turn_index,
                         "message_index_in_turn": index,

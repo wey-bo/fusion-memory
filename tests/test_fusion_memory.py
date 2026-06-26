@@ -104,6 +104,43 @@ class FusionMemoryTests(unittest.TestCase):
             ],
         )
 
+    def test_ingest_turn_preserves_assistant_tool_call_without_content(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="ws", user_id="u", agent_id="a", session_id="s")
+
+        memory.ingest_turn(
+            [
+                {"role": "user", "content": "please inspect the workspace"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "bash", "arguments": '{"command":"pwd"}'},
+                        }
+                    ],
+                },
+                {"role": "tool", "content": "/tmp/project", "name": "bash", "tool_call_id": "call-1"},
+            ],
+            scope,
+            turn_id="turn-tool-call",
+            turn_index=2,
+            session_time=ts("2026-06-26T09:02:00+00:00"),
+        )
+
+        spans = [
+            span
+            for span in memory.store.list_spans(scope, include_session=True)
+            if span.turn_id == "turn-tool-call" and span.span_type in {"turn", "tool_result"}
+        ]
+
+        self.assertEqual([span.speaker for span in spans], ["user", "assistant", "tool"])
+        self.assertEqual([span.metadata["message_index_in_turn"] for span in spans], [0, 1, 2])
+        self.assertEqual(spans[1].content, "[assistant tool call: bash]")
+        self.assertEqual(spans[1].metadata["tool_calls"][0]["function"]["name"], "bash")
+        self.assertEqual(spans[1].metadata["importance_hint"], "low")
+
     def test_ingest_turn_keeps_user_message_for_error_turn(self) -> None:
         memory = MemoryService()
         scope = Scope(workspace_id="ws", user_id="u", agent_id="a", session_id="s")
