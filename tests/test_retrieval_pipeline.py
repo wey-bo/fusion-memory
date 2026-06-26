@@ -634,6 +634,27 @@ class RetrievalPipelineTests(unittest.TestCase):
 
         self.assertIn("event_ordering_selection", result.coverage)
 
+    def test_explicit_ordering_phrase_does_not_override_precomputed_query_type(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="pipeline-precomputed-order", user_id="u", agent_id="a", session_id="s")
+        memory.add("First I prepared the migration checklist.", scope, ts("2026-06-01T10:00:00+00:00"))
+        memory.add("Then I applied the schema changes.", scope, ts("2026-06-02T10:00:00+00:00"))
+        plan = QueryPlan(
+            query="按时间顺序总结我的迁移工作。",
+            query_type="summarization",
+            entities=[],
+            time_constraints=[],
+        )
+
+        result = memory.search(
+            "按时间顺序总结我的迁移工作。",
+            scope,
+            {"mode": "benchmark", "limit": 6, "_plan": plan},
+        )
+
+        self.assertEqual(result.coverage["query_type"], "summarization")
+        self.assertNotIn("event_ordering_selection", result.coverage)
+
     def test_search_lifecycle_records_preservation_rescue_delta_without_raw_text(self) -> None:
         memory = MemoryService()
         scope = Scope(workspace_id="ws-lifecycle-rescue", user_id="u", agent_id="a")

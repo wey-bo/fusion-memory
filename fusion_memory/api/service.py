@@ -55,7 +55,6 @@ from fusion_memory.retrieval.pipeline import (
     CandidateFusionEngine,
     EvidencePackAssembler,
     QueryUnderstandingEngine,
-    query_understanding_result_from_plan,
     RecallOrchestrator,
     RetrievalExecutionContext,
     RetrievalTraceRecorder,
@@ -458,15 +457,6 @@ class MemoryService:
         trace_id = new_id("trace")
         query_understanding = QueryUnderstandingEngine().run(query, scope, options, self.planner)
         plan = query_understanding.plan
-        if plan.query_type != "event_ordering" and _explicit_event_ordering_request(query):
-            plan.query_type = "event_ordering"
-            plan.must_include_sources = ["raw_evidence", "events"]
-            query_understanding = query_understanding_result_from_plan(
-                plan=plan,
-                query=query,
-                intent_telemetry=query_understanding.intent_telemetry,
-                precomputed=query_understanding.precomputed,
-            )
         intent_telemetry = query_understanding.intent_telemetry
         lifecycle = CandidateLifecycleRecorder()
         retrieval_context = RetrievalExecutionContext(
@@ -4084,14 +4074,6 @@ def _event_ordering_support_option_signal(query: str, text: str) -> float:
 
 def _event_ordering_support_option_query(query: str) -> bool:
     return bool(re.search(r"\b(?:strateg(?:y|ies)|support|options?|resources?|tools?|help|ways?)\b", query.lower()))
-
-
-def _explicit_event_ordering_request(query: str) -> bool:
-    lower = query.lower()
-    return bool(
-        re.search(r"按(?:时间)?顺序|时间顺序|先后顺序|时间线|依次|先.*再", lower)
-        or re.search(r"\b(?:chronological|chronology|timeline|in order|order in which|what order)\b", lower)
-    )
 
 
 def _event_ordering_term_variants_for_service(term: str) -> set[str]:

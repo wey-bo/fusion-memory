@@ -7,11 +7,13 @@ from datetime import datetime, timezone
 from fusion_memory import MemoryService, Scope
 from fusion_memory.core.models import Candidate, EvidenceSpan, QueryPlan, Scope
 from fusion_memory.retrieval.evidence_pack import EvidencePackBuilder
+from fusion_memory.retrieval.pipeline import RecallResult
 from fusion_memory.retrieval.preservation import (
     annotate_runtime_preservation_candidates,
     mark_must_preserve,
     preserve_required_candidates,
 )
+from fusion_memory.retrieval.raw_evidence_quota import QuotaResult
 
 
 class _StoreStub:
@@ -174,18 +176,53 @@ class RetrievalRegressionFixtureTests(unittest.TestCase):
     def test_event_ordering_restore_reports_structured_reason_codes(self) -> None:
         memory = MemoryService()
         scope = Scope(workspace_id="preserve-order", user_id="u", agent_id="a", session_id="s")
-        memory.add("First I drafted the itinerary.", scope, datetime(2026, 6, 1, tzinfo=timezone.utc))
-        memory.add("Then I changed the hotel to one near the station.", scope, datetime(2026, 6, 2, tzinfo=timezone.utc))
-        memory.add("Finally I moved the departure to Friday night.", scope, datetime(2026, 6, 3, tzinfo=timezone.utc))
+        selected = Candidate(
+            "selected",
+            "span",
+            "Selected itinerary step.",
+            "event_ordering_timeline",
+            {"utility_score": 1.0, "semantic_score": 0.9},
+            ["selected"],
+            {},
+        )
+        required = Candidate(
+            "graph",
+            "span",
+            "Graph chronology anchor.",
+            "event_ordering_persisted_graph",
+            {"utility_score": 0.1, "semantic_score": 0.1},
+            ["graph"],
+            {},
+        )
+
+        memory._recall_candidates = lambda context: RecallResult(
+            candidate_lists=[[selected, required]],
+            recalled_candidates=[selected, required],
+        )
+        memory.quota.enforce = lambda plan, search_scope, candidates, include_session=False: QuotaResult(
+            candidates=list(candidates),
+            selected_span_ids=["selected"],
+            required=1,
+            coverage_insufficient=False,
+            backfilled=0,
+        )
+        memory._select_event_ordering_candidates = lambda query, plan, candidates, selected_candidates, limit: [
+            candidate for candidate in selected_candidates if candidate.id == "selected"
+        ]
+        memory.store.insert_utility_example = lambda example: None
 
         result = memory.search(
-            "按时间顺序列出我改动过的行程。",
+            "List the itinerary changes in chronological order.",
             scope,
-            {"mode": "benchmark", "limit": 6},
+            {"mode": "fast", "limit": 2, "query_type_hint": "event_ordering"},
         )
 
         restored = result.coverage["event_ordering_selection"]["preservation_restored"]
-        self.assertTrue(all("reason" in item for item in restored))
+        self.assertTrue(restored)
+        self.assertEqual(restored[0]["candidate_id"], "graph")
+        self.assertEqual(restored[0]["reason"], "graph_chronology_anchor")
+        self.assertEqual(restored[0]["must_preserve_reasons"], ["graph_chronology_anchor"])
+        self.assertEqual(restored[0]["source"], "event_ordering_persisted_graph")
 
 
 if __name__ == "__main__":
