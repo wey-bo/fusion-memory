@@ -80,18 +80,54 @@ class RawSpanProvider(_RawProvider):
             speaker=speaker,
             include_session=context.include_session,
         )
-        return [
-            Candidate(
-                id=span.span_id,
-                type="span",
-                text=span.content,
-                source="l0_raw_hybrid",
-                scores=scores,
-                source_span_ids=[span.span_id],
-                metadata={"speaker": span.speaker, "span_type": span.span_type, "timestamp": span.timestamp.isoformat()},
+        candidates: list[Candidate] = []
+        for span, scores in raw_span_results:
+            scores = dict(scores)
+            metadata = {
+                "speaker": span.speaker,
+                "span_type": span.span_type,
+                "timestamp": span.timestamp.isoformat(),
+                "session_id": span.scope.session_id,
+                "turn_id": span.turn_id,
+                "source_uri": span.source_uri,
+                "message_index_in_turn": span.metadata.get("message_index_in_turn"),
+                "message_role": span.metadata.get("message_role") or span.speaker,
+                "message_kind": span.metadata.get("message_kind"),
+                "importance_hint": span.metadata.get("importance_hint"),
+                "state_change_hint": bool(span.metadata.get("state_change_hint")),
+                "tool_name": span.metadata.get("tool_name"),
+            }
+            boost = _role_importance_boost(metadata)
+            if context.scope.session_id and span.scope.session_id == context.scope.session_id:
+                boost += 0.08
+                scores["session_priority_boost"] = 0.08
+            if boost:
+                scores["score"] = scores.get("score", 0.0) + boost
+            scores["role_importance_boost"] = boost
+            candidates.append(
+                Candidate(
+                    id=span.span_id,
+                    type="span",
+                    text=span.content,
+                    source="l0_raw_hybrid",
+                    scores=scores,
+                    source_span_ids=[span.span_id],
+                    metadata=metadata,
+                )
             )
-            for span, scores in raw_span_results
-        ]
+        candidates.sort(key=lambda candidate: candidate.scores.get("score", 0.0), reverse=True)
+        return candidates
+
+
+def _role_importance_boost(metadata: dict) -> float:
+    hint = str(metadata.get("importance_hint") or "")
+    role = str(metadata.get("message_role") or metadata.get("speaker") or "")
+    boost = {"high": 0.20, "medium": 0.08, "low": -0.18}.get(hint, 0.0)
+    if role == "user":
+        boost += 0.05
+    if bool(metadata.get("state_change_hint")):
+        boost += 0.20
+    return boost
 
 
 class TopicScopedRawProvider(_RawProvider):

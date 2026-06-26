@@ -265,6 +265,87 @@ class FusionMemoryTests(unittest.TestCase):
         self.assertEqual(trace["turn_ingestion"]["raw_message_count"], 1)
         self.assertEqual(trace["turn_ingestion"]["role_breakdown"]["user"], 1)
 
+    def test_default_search_uses_long_term_view_with_current_session_priority(self) -> None:
+        memory = MemoryService()
+        older_scope = Scope(workspace_id="ws", user_id="u", agent_id="a", session_id="older")
+        current_scope = Scope(workspace_id="ws", user_id="u", agent_id="a", session_id="current")
+
+        memory.add("Roadmap alpha migration retained the legacy parser.", older_scope, ts("2026-06-24T10:00:00+00:00"))
+        memory.add("Roadmap alpha migration now prioritizes the current session.", current_scope, ts("2026-06-26T10:00:00+00:00"))
+
+        result = memory.search("roadmap alpha migration", current_scope, options={"limit": 4})
+
+        texts = [candidate.text for candidate in result.candidates]
+        self.assertIn("Roadmap alpha migration retained the legacy parser.", texts)
+        self.assertIn("Roadmap alpha migration now prioritizes the current session.", texts)
+        self.assertEqual(result.candidates[0].metadata.get("session_id"), "current")
+        self.assertTrue(result.coverage["allow_cross_session"])
+        self.assertFalse(result.coverage["include_session"])
+
+    def test_default_answer_context_includes_long_term_view_with_current_session_first(self) -> None:
+        memory = MemoryService()
+        older_scope = Scope(workspace_id="ws", user_id="u", agent_id="a", session_id="older")
+        current_scope = Scope(workspace_id="ws", user_id="u", agent_id="a", session_id="current")
+
+        memory.add("The deployment checklist originally used blue labels.", older_scope, ts("2026-06-24T10:00:00+00:00"))
+        memory.add("The deployment checklist current session uses green labels.", current_scope, ts("2026-06-26T10:00:00+00:00"))
+
+        pack = memory.answer_context("deployment checklist labels", current_scope, budget={"limit": 4})
+        contents = [span["content"] for span in pack.source_spans]
+
+        self.assertIn("The deployment checklist originally used blue labels.", contents)
+        self.assertIn("The deployment checklist current session uses green labels.", contents)
+        self.assertEqual(pack.source_spans[0]["session_id"], "current")
+
+    def test_raw_retrieval_uses_role_importance_hints(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="ws", user_id="u", agent_id="a", session_id="s")
+
+        memory.ingest_turn(
+            [
+                {"role": "assistant", "content": "Aisle seat preference echo"},
+                {"role": "user", "content": "Aisle seat preference source"},
+            ],
+            scope,
+            turn_id="turn-role",
+            turn_index=1,
+            session_time=ts("2026-06-26T10:00:00+00:00"),
+        )
+
+        result = memory.search("aisle seat preference", scope, options={"limit": 4, "enabled_sources": ["raw_span"]})
+
+        self.assertEqual(result.candidates[0].metadata["message_role"], "user")
+        self.assertGreater(
+            result.candidates[0].scores["role_importance_boost"],
+            result.candidates[1].scores["role_importance_boost"],
+        )
+
+    def test_state_changing_tool_result_beats_read_only_tool_result(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="ws", user_id="u", agent_id="a", session_id="s")
+
+        memory.ingest_turn(
+            [
+                {"role": "tool", "content": "preference api returned aisle seat status", "name": "preference_api"},
+                {
+                    "role": "tool",
+                    "content": "preference api updated aisle seat status",
+                    "name": "preference_api",
+                    "metadata": {"state_changed": True},
+                },
+            ],
+            scope,
+            turn_id="turn-tool-state",
+            turn_index=2,
+            session_time=ts("2026-06-26T10:05:00+00:00"),
+        )
+
+        result = memory.search("preference api aisle seat status", scope, options={"limit": 4, "enabled_sources": ["raw_span"]})
+
+        self.assertTrue(result.candidates[0].metadata["state_change_hint"])
+        self.assertIn("updated aisle seat status", result.candidates[0].text)
+        self.assertGreater(result.candidates[0].scores["role_importance_boost"], 0)
+
     def test_exact_answer_candidates_rank_user_distance_location_fact(self) -> None:
         plan = QueryPlan(
             query="How far away did I say my parents live from me, and in which town?",
@@ -804,6 +885,46 @@ class FusionMemoryTests(unittest.TestCase):
         self.assertEqual(dropped[0]["candidate_id"], "graph-off-topic")
         self.assertEqual(dropped[0]["reason"], "topic_scope_filter")
         self.assertEqual(dropped[0]["must_preserve_reasons"], ["graph_chronology_anchor"])
+
+    def test_event_ordering_preservation_reports_restored_and_dropped_separately(self) -> None:
+        service = MemoryService()
+        selected = [
+            Candidate(
+                id="selected",
+                type="span",
+                text="selected candidate",
+                source="event_ordering_coverage",
+                scores={},
+                source_span_ids=["selected"],
+            )
+        ]
+        scored = [
+            *selected,
+            Candidate(
+                id="restored",
+                type="event",
+                text="restored graph anchor",
+                source="event_ordering_persisted_graph",
+                scores={},
+                source_span_ids=["restored"],
+                metadata={"must_preserve_reason": ["graph_chronology_anchor"], "evidence_role": "answer"},
+            ),
+            Candidate(
+                id="dropped",
+                type="event",
+                text="budget-limited graph anchor",
+                source="event_ordering_persisted_graph",
+                scores={},
+                source_span_ids=["dropped"],
+                metadata={"must_preserve_reason": ["graph_chronology_anchor"], "evidence_role": "answer"},
+            ),
+        ]
+
+        preserved, restored, dropped = service._restore_required_event_ordering_candidates(scored, selected, limit=2)
+
+        self.assertEqual([candidate.id for candidate in preserved], ["selected", "restored"])
+        self.assertEqual([item["candidate_id"] for item in restored], ["restored"])
+        self.assertEqual([item["candidate_id"] for item in dropped], ["dropped"])
 
     def test_event_ordering_preserve_episode_recall_uses_time_bucket_coverage(self) -> None:
         service = MemoryService()

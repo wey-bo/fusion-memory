@@ -20,24 +20,28 @@ class ScopeGuardTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             memory.history(Scope())
 
-    def test_search_defaults_to_session_isolation_and_can_opt_in_cross_session(self) -> None:
+    def test_search_defaults_to_current_session_plus_long_term_recall(self) -> None:
         memory = MemoryService()
         scope_s1 = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s1")
         scope_s2 = Scope(workspace_id="w", user_id="u", agent_id="a", session_id="s2")
         memory.add("I prefer Qdrant for Atlas retrieval.", scope_s1, ts("2026-06-01T10:00:00+00:00"))
-        memory.add("I prefer Chroma for notes.", scope_s2, ts("2026-06-02T10:00:00+00:00"))
+        memory.add("I prefer Qdrant for Atlas retrieval in this session.", scope_s2, ts("2026-06-02T10:00:00+00:00"))
 
-        isolated = memory.search("Qdrant Atlas", scope_s2)
-        self.assertFalse(any("Qdrant" in candidate.text for candidate in isolated.candidates))
-        isolated_trace = memory.debug_trace(isolated.trace_id)
-        self.assertFalse(isolated_trace["allow_cross_session"])
-        self.assertTrue(isolated_trace["include_session"])
+        result = memory.search("Qdrant Atlas", scope_s2)
+        self.assertTrue(any(candidate.metadata.get("session_id") == "s2" for candidate in result.candidates))
+        self.assertTrue(any("this session" not in candidate.text and "Qdrant" in candidate.text for candidate in result.candidates))
+        self.assertIn("this session", result.candidates[0].text)
+        trace = memory.debug_trace(result.trace_id)
+        self.assertTrue(trace["allow_cross_session"])
+        self.assertFalse(trace["include_session"])
+        self.assertEqual(trace["session_filter_mode"], "current_session_plus_long_term")
 
-        cross_session = memory.search("Qdrant Atlas", scope_s2, options={"allow_cross_session": True})
-        self.assertTrue(any("Qdrant" in candidate.text for candidate in cross_session.candidates))
-        cross_trace = memory.debug_trace(cross_session.trace_id)
-        self.assertTrue(cross_trace["allow_cross_session"])
-        self.assertFalse(cross_trace["include_session"])
+        current_only = memory.search("Qdrant Atlas", scope_s2, options={"allow_cross_session": False})
+        self.assertFalse(any("this session" not in candidate.text and "Qdrant" in candidate.text for candidate in current_only.candidates))
+        current_only_trace = memory.debug_trace(current_only.trace_id)
+        self.assertFalse(current_only_trace["allow_cross_session"])
+        self.assertTrue(current_only_trace["include_session"])
+        self.assertEqual(current_only_trace["session_filter_mode"], "current_session_only")
 
     def test_history_and_timeline_default_to_session_isolation(self) -> None:
         memory = MemoryService()

@@ -439,7 +439,7 @@ class MemoryService:
     def _search_with_rule_hits(self, query: str, scope: Scope, options: dict[str, Any] | None, rule_hits) -> SearchResult:
         options = options or {}
         scope.validate_for_read()
-        allow_cross_session = bool(options.get("allow_cross_session", False))
+        allow_cross_session = bool(options.get("allow_cross_session", True))
         include_session = bool(scope.session_id and not allow_cross_session)
         self._authorize(
             "memory.search",
@@ -596,11 +596,11 @@ class MemoryService:
             )
             selected = record_filtered_delta(before, selected, "event_ordering_topic_scope_filter")
             before = selected
-            selected, preservation_restored = self._restore_required_event_ordering_candidates(annotated_candidates, before, limit)
+            selected, preservation_restored, preservation_dropped = self._restore_required_event_ordering_candidates(annotated_candidates, before, limit)
             selected = record_rescued_delta(before, selected, "runtime_required_preservation")
             dropped_high_signal = [
                 item
-                for item in [*topic_scope_dropped, *preservation_restored]
+                for item in [*topic_scope_dropped, *preservation_restored, *preservation_dropped]
                 if item.get("reason") == "budget_limit" or item.get("must_preserve_reasons")
             ]
             event_ordering_selection = {
@@ -612,12 +612,29 @@ class MemoryService:
                 ],
                 "topic_scope_dropped": topic_scope_dropped,
                 "preservation_restored": preservation_restored,
+                "preservation_dropped": preservation_dropped,
                 "topic_scope_filter_passes": 1,
             }
         else:
             before = selected
             selected, dropped_high_signal = preserve_required_candidates(annotated_candidates, before, limit)
             selected = record_rescued_delta(before, selected, "runtime_required_preservation")
+            before = selected
+            selected = record_rescued_delta(
+                before,
+                self._apply_default_session_priority(scope, scored_again, before, limit, allow_cross_session=allow_cross_session),
+                "current_session_priority",
+            )
+        selected = [self._enrich_candidate_from_source_span(candidate) for candidate in selected]
+        if plan.query_type != "event_ordering":
+            selected = sorted(
+                selected,
+                key=lambda candidate: (
+                    0 if self._candidate_session_id(candidate) == scope.session_id else 1,
+                    -(float(candidate.scores.get("utility_score", candidate.scores.get("score", 0.0)))),
+                    candidate.id,
+                ),
+            )
         for candidate in selected:
             lifecycle.record(candidate, "selected", "final_selection", contributed=True)
         for dropped in dropped_high_signal:
@@ -638,6 +655,8 @@ class MemoryService:
             "coverage_insufficient": quota_result.coverage_insufficient,
             "raw_quota_backfilled": quota_result.backfilled,
             "dropped_high_signal_candidates": dropped_high_signal,
+            "allow_cross_session": allow_cross_session,
+            "include_session": include_session,
         }
         if plan.query_type == "event_ordering":
             coverage["event_ordering_selection"] = event_ordering_selection or {
@@ -645,6 +664,7 @@ class MemoryService:
                 "timeline_representatives": [],
                 "topic_scope_dropped": [],
                 "preservation_restored": [],
+                "preservation_dropped": [],
                 "topic_scope_filter_passes": 1,
             }
             coverage.update(self._event_ordering_shadow_coverage(candidate_lists, selected))
@@ -690,6 +710,7 @@ class MemoryService:
             "enabled_sources": options.get("enabled_sources"),
             "allow_cross_session": allow_cross_session,
             "include_session": include_session,
+            "session_filter_mode": "current_session_plus_long_term" if allow_cross_session else "current_session_only",
             "rerank": {
                 "applied": rerank_applied,
                 "model_version": getattr(self.reranker, "version", "custom"),
@@ -776,7 +797,7 @@ class MemoryService:
             scope,
             {
                 "query": query,
-                "allow_cross_session": bool(budget.get("allow_cross_session", False)),
+                "allow_cross_session": bool(budget.get("allow_cross_session", True)),
                 "limit": limit,
                 "mode": mode,
                 "token_budget": token_budget,
@@ -790,13 +811,13 @@ class MemoryService:
                 "mode": mode,
                 "rerank_top_n": rerank_top_n,
                 "enabled_sources": budget.get("enabled_sources"),
-                "allow_cross_session": budget.get("allow_cross_session", False),
+                "allow_cross_session": budget.get("allow_cross_session", True),
                 "query_type_hint": budget.get("query_type_hint"),
                 "_plan": plan,
                 "_intent_telemetry": intent_telemetry,
             },
         )
-        trace = self.store.get_trace(result.trace_id, scope, include_session=bool(scope.session_id and not budget.get("allow_cross_session", False))) or {}
+        trace = self.store.get_trace(result.trace_id, scope, include_session=bool(scope.session_id and not budget.get("allow_cross_session", True))) or {}
         existing_rule_hits = list(trace.get("rule_hits") or [])
         pack = self.pack_builder.build(
             query,
@@ -3618,7 +3639,7 @@ class MemoryService:
         scored_candidates: list[Candidate],
         selected: list[Candidate],
         limit: int,
-    ) -> tuple[list[Candidate], list[dict[str, object]]]:
+    ) -> tuple[list[Candidate], list[dict[str, object]], list[dict[str, object]]]:
         selected_ids = {candidate.id for candidate in selected}
         preserved, dropped = preserve_required_candidates(scored_candidates, selected, limit=limit)
         restored = [
@@ -3632,18 +3653,128 @@ class MemoryService:
             for candidate in preserved
             if candidate.id not in selected_ids and must_preserve_reasons(candidate)
         ]
-        return preserved, [*restored, *dropped]
+        return preserved, restored, dropped
 
-    def _candidate_timeline_position(self, candidate: Candidate) -> tuple[tuple[tuple[int, int | str], ...], tuple[tuple[int, int | str], ...], str] | None:
+    def _candidate_session_id(self, candidate: Candidate) -> str | None:
+        session_id = candidate.metadata.get("session_id")
+        if session_id:
+            return str(session_id)
+        for span_id in candidate.source_span_ids:
+            span = self.store.get_span(span_id)
+            if span and span.scope.session_id:
+                return span.scope.session_id
+        return None
+
+    def _apply_default_session_priority(
+        self,
+        scope: Scope,
+        candidates: list[Candidate],
+        selected: list[Candidate],
+        limit: int,
+        *,
+        allow_cross_session: bool,
+    ) -> list[Candidate]:
+        if not allow_cross_session or not scope.session_id or limit <= 0:
+            return selected
+
+        def score(candidate: Candidate) -> float:
+            return float(candidate.scores.get("utility_score", candidate.scores.get("score", 0.0)))
+
+        current = [candidate for candidate in candidates if self._candidate_session_id(candidate) == scope.session_id]
+        long_term = [candidate for candidate in candidates if self._candidate_session_id(candidate) not in {None, scope.session_id}]
+        result = list(selected)
+
+        if current and not any(self._candidate_session_id(candidate) == scope.session_id for candidate in result):
+            best_current = max(current, key=score)
+            result.insert(0, best_current)
+        if long_term and limit > 1 and not any(self._candidate_session_id(candidate) not in {None, scope.session_id} for candidate in result):
+            best_long_term = max(long_term, key=score)
+            insert_at = 1 if result and self._candidate_session_id(result[0]) == scope.session_id else len(result)
+            result.insert(insert_at, best_long_term)
+
+        deduped: list[Candidate] = []
+        seen: set[tuple[str, str]] = set()
+        for candidate in result:
+            key = (candidate.type, candidate.id)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(candidate)
+            if len(deduped) >= limit:
+                break
+        deduped.sort(key=lambda candidate: (0 if self._candidate_session_id(candidate) == scope.session_id else 1, -score(candidate)))
+        return deduped[:limit]
+
+    def _enrich_candidate_from_source_span(self, candidate: Candidate) -> Candidate:
+        if not candidate.source_span_ids:
+            return candidate
+        span = self.store.get_span(candidate.source_span_ids[0])
+        if not span:
+            return candidate
+        metadata = dict(candidate.metadata)
+        metadata.setdefault("speaker", span.speaker)
+        metadata.setdefault("span_type", span.span_type)
+        metadata.setdefault("timestamp", span.timestamp.isoformat())
+        metadata.setdefault("session_id", span.scope.session_id)
+        metadata.setdefault("turn_id", span.turn_id)
+        metadata.setdefault("source_uri", span.source_uri)
+        for key in (
+            "message_index_in_turn",
+            "message_role",
+            "message_kind",
+            "importance_hint",
+            "state_change_hint",
+            "tool_name",
+        ):
+            if key not in metadata and key in span.metadata:
+                metadata[key] = span.metadata[key]
+        scores = dict(candidate.scores)
+        role_boost = self._candidate_role_importance_boost(metadata)
+        scores.setdefault("role_importance_boost", role_boost)
+        if role_boost and "role_importance_boost_applied" not in scores:
+            scores["score"] = float(scores.get("score", 0.0)) + role_boost
+            if "utility_score" in scores:
+                scores["utility_score"] = float(scores.get("utility_score", 0.0)) + role_boost
+            scores["role_importance_boost_applied"] = 1.0
+        return Candidate(
+            id=candidate.id,
+            type=candidate.type,
+            text=candidate.text,
+            source=candidate.source,
+            scores=scores,
+            source_span_ids=list(candidate.source_span_ids),
+            metadata=metadata,
+        )
+
+    def _candidate_role_importance_boost(self, metadata: dict[str, Any]) -> float:
+        hint = str(metadata.get("importance_hint") or "")
+        role = str(metadata.get("message_role") or metadata.get("speaker") or "")
+        boost = {"high": 0.20, "medium": 0.08, "low": -0.18}.get(hint, 0.0)
+        if role == "user":
+            boost += 0.05
+        if bool(metadata.get("state_change_hint")):
+            boost += 0.20
+        return boost
+
+    def _candidate_timeline_position(self, candidate: Candidate) -> tuple[tuple[tuple[int, int | str], ...], tuple[tuple[int, int | str], ...], str, int] | None:
         source_uri = candidate.metadata.get("source_uri")
         turn_id = candidate.metadata.get("turn_id")
         timestamp = candidate.metadata.get("timestamp") or candidate.metadata.get("time_start") or ""
+        message_index = candidate.metadata.get("message_index_in_turn")
+        try:
+            message_index_int = int(message_index)
+        except (TypeError, ValueError):
+            message_index_int = 0
         if source_uri or turn_id:
-            return (_natural_turn_key(source_uri), _natural_turn_key(turn_id), str(timestamp))
+            return (_natural_turn_key(source_uri), _natural_turn_key(turn_id), str(timestamp), message_index_int)
         for span_id in candidate.source_span_ids:
             span = self.store.get_span(span_id)
             if span:
-                return (_natural_turn_key(span.source_uri), _natural_turn_key(span.turn_id), span.timestamp.isoformat())
+                try:
+                    span_message_index = int(span.metadata.get("message_index_in_turn"))
+                except (TypeError, ValueError):
+                    span_message_index = 0
+                return (_natural_turn_key(span.source_uri), _natural_turn_key(span.turn_id), span.timestamp.isoformat(), span_message_index)
         return None
 
     def _apply_topic_scope_filter(self, query: str, plan: Any, candidates: list[Candidate], selected: list[Candidate], limit: int) -> list[Candidate]:
