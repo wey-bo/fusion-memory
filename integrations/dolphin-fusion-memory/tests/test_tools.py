@@ -183,3 +183,12 @@ async def test_system_prompt_mentions_three_tools() -> None:
     assert "memory_add" in prompt
     assert "memory_search" in prompt
     assert "memory_answer_context" in prompt
+
+
+@pytest.mark.anyio
+async def test_system_prompt_mentions_explicit_add_and_auto_persist() -> None:
+    prompt = await system.system_prompt_builder()
+    assert "memory_add" in prompt
+    assert "auto-persist" in prompt
+    assert "memory_search" in prompt
+    assert "memory_answer_context" in prompt
