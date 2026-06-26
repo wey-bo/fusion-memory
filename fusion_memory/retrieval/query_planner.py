@@ -192,7 +192,10 @@ class QueryPlanner:
         if any(w in lower for w in ["unknown", "not mentioned", "没有提到", "不知道", "cluster name"]):
             query_type = "abstention"
             must_include = ["raw_evidence"]
-        if any(w in lower for w in ["summarize", "summary", "总结"]):
+        if any(w in lower for w in ["summarize", "summary", "总结"]) and not (
+            query_type == "event_ordering"
+            and (_is_strict_event_ordering_query(lower) or _is_explicit_chronological_summary_query(lower))
+        ):
             query_type = "summarization"
             must_include = ["raw_evidence"]
         speaker_focus = "any"
@@ -307,6 +310,13 @@ def _is_strict_event_ordering_query(lower: str) -> bool:
             or re.search(r"按顺序|顺序|时间线|先后|依次", lower)
         )
         and not re.search(r"\b(?:how many|total|evolved|progress|compare|balance|optimize|summary|summarize|how well|how should)\b|多少|几个|总共|一共|总结|比较|如何", lower)
+    )
+
+
+def _is_explicit_chronological_summary_query(lower: str) -> bool:
+    return bool(
+        any(w in lower for w in ["summarize", "summary", "总结"])
+        and re.search(r"按(?:时间)?顺序|时间顺序|先后顺序|时间线|依次", lower)
     )
 
 

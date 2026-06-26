@@ -140,7 +140,7 @@ class EventOrderingGraphTests(unittest.TestCase):
         pack = memory.answer_context(
             "按时间顺序总结我的航班、酒店和签证事项。",
             scope,
-            budget={"limit": 6, "mode": "benchmark", "query_type_hint": "event_ordering"},
+            budget={"limit": 6, "mode": "benchmark"},
         )
 
         selection = pack.coverage["event_ordering_selection"]
