@@ -225,6 +225,29 @@ class MemoryService:
         except Exception:
             pass
 
+    def _turn_message_annotations(self, message: dict[str, Any]) -> dict[str, Any]:
+        role = str(message.get("role") or "user")
+        metadata = dict(message.get("metadata") or {})
+        content = str(message.get("content") or "")
+        lowered = content.lower()
+
+        if role == "user":
+            return {"message_kind": "user_message", "importance_hint": "high", "state_change_hint": False}
+        if role == "tool":
+            state_changed = bool(metadata.get("state_changed"))
+            return {
+                "message_kind": "tool_result",
+                "importance_hint": "medium" if state_changed else "low",
+                "state_change_hint": state_changed,
+            }
+
+        promoted = any(token in lowered for token in ("confirmed", "decided", "i will remember"))
+        return {
+            "message_kind": "assistant_message",
+            "importance_hint": "medium" if promoted else "low",
+            "state_change_hint": False,
+        }
+
     def ingest_turn(
         self,
         messages: list[dict[str, Any]],
@@ -240,9 +263,18 @@ class MemoryService:
         resolved_turn_id = turn_id or (f"turn_{turn_index}" if turn_index is not None else new_id("turn"))
         base_metadata = dict(metadata or {})
         payload_messages: list[dict[str, Any]] = []
+        role_breakdown: dict[str, int] = {}
+        promoted_assistant_count = 0
+        promoted_tool_count = 0
 
         for index, message in enumerate(messages):
             role = str(message.get("role") or "user")
+            annotations = self._turn_message_annotations(message)
+            role_breakdown[role] = role_breakdown.get(role, 0) + 1
+            if role == "assistant" and annotations["importance_hint"] in {"medium", "high"}:
+                promoted_assistant_count += 1
+            if role == "tool" and annotations["state_change_hint"]:
+                promoted_tool_count += 1
             payload_messages.append(
                 {
                     "role": role,
@@ -259,11 +291,23 @@ class MemoryService:
                         "message_role": role,
                         "tool_name": message.get("tool_name") or message.get("name"),
                         "tool_call_id": message.get("tool_call_id"),
+                        **annotations,
                     },
                 }
             )
 
-        return self.add({"messages": payload_messages}, scope, session_time=session_time)
+        result = self.add({"messages": payload_messages}, scope, session_time=session_time)
+        trace = self.store.get_trace(result.trace_id, scope, include_session=True) or {}
+        trace["turn_ingestion"] = {
+            "turn_id": resolved_turn_id,
+            "turn_index": turn_index,
+            "raw_message_count": len(messages),
+            "role_breakdown": role_breakdown,
+            "promoted_assistant_count": promoted_assistant_count,
+            "promoted_tool_count": promoted_tool_count,
+        }
+        self.store.save_trace(result.trace_id, trace, scope)
+        return result
 
     def add(self, input: Any, scope: Scope, session_time: datetime | None = None, metadata: dict[str, Any] | None = None) -> AddResult:
         with collect_rule_hits() as rule_hits:

@@ -213,6 +213,58 @@ class FusionMemoryTests(unittest.TestCase):
         self.assertEqual(len(spans), 1)
         self.assertEqual(spans[0].metadata["tool_name"], "rail_search")
 
+    def test_ingest_turn_marks_role_aware_importance(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="ws", user_id="u", agent_id="a", session_id="s")
+
+        memory.ingest_turn(
+            [
+                {"role": "user", "content": "remember that I prefer aisle seats"},
+                {"role": "assistant", "content": "Confirmed. I will remember your aisle-seat preference."},
+                {
+                    "role": "tool",
+                    "content": "booking preference updated in vendor system",
+                    "name": "booking_api",
+                    "metadata": {"state_changed": True},
+                },
+            ],
+            scope,
+            turn_id="turn-2",
+            turn_index=2,
+            session_time=ts("2026-06-26T10:00:00+00:00"),
+        )
+
+        spans = [
+            span
+            for span in memory.store.list_spans(scope, include_session=True)
+            if span.turn_id == "turn-2" and span.span_type in {"turn", "tool_result"}
+        ]
+
+        self.assertEqual(spans[0].metadata["message_kind"], "user_message")
+        self.assertEqual(spans[0].metadata["importance_hint"], "high")
+        self.assertEqual(spans[1].metadata["message_kind"], "assistant_message")
+        self.assertIn(spans[1].metadata["importance_hint"], {"medium", "high"})
+        self.assertEqual(spans[2].metadata["message_kind"], "tool_result")
+        self.assertTrue(spans[2].metadata["state_change_hint"])
+
+    def test_ingest_turn_trace_records_role_breakdown(self) -> None:
+        memory = MemoryService()
+        scope = Scope(workspace_id="ws", user_id="u", agent_id="a", session_id="s")
+
+        result = memory.ingest_turn(
+            [{"role": "user", "content": "hello"}],
+            scope,
+            turn_id="turn-3",
+            turn_index=3,
+            session_time=ts("2026-06-26T10:05:00+00:00"),
+        )
+
+        trace = memory.store.get_trace(result.trace_id, scope, include_session=True)
+
+        self.assertIsNotNone(trace)
+        self.assertEqual(trace["turn_ingestion"]["raw_message_count"], 1)
+        self.assertEqual(trace["turn_ingestion"]["role_breakdown"]["user"], 1)
+
     def test_exact_answer_candidates_rank_user_distance_location_fact(self) -> None:
         plan = QueryPlan(
             query="How far away did I say my parents live from me, and in which town?",
