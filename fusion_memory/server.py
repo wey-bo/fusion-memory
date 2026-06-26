@@ -54,6 +54,15 @@ def make_handler(state: MemoryServerState) -> type[BaseHTTPRequestHandler]:
                             _optional_datetime(payload.get("session_time")),
                             metadata=payload.get("metadata"),
                         )
+                    elif path == "/ingest-turn":
+                        result = state.service.ingest_turn(
+                            payload.get("messages") or [],
+                            _scope(payload),
+                            turn_id=payload.get("turn_id"),
+                            turn_index=payload.get("turn_index"),
+                            session_time=_optional_datetime(payload.get("session_time")),
+                            metadata=payload.get("metadata"),
+                        )
                     elif path == "/search":
                         result = state.service.search(
                             _required(payload, "query"),

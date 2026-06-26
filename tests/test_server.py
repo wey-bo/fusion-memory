@@ -155,6 +155,42 @@ class ServerTests(unittest.TestCase):
             server.shutdown()
             thread.join(timeout=2)
 
+    def test_ingest_turn_endpoint_roundtrip(self) -> None:
+        ready = threading.Event()
+        holder = {}
+
+        def run_server() -> None:
+            service = MemoryService()
+            server = serve(service, host="127.0.0.1", port=0)
+            holder["service"] = service
+            holder["server"] = server
+            ready.set()
+            try:
+                server.serve_forever()
+            finally:
+                server.server_close()
+                service.close()
+
+        thread = threading.Thread(target=run_server, daemon=True)
+        thread.start()
+        self.assertTrue(ready.wait(timeout=5))
+        server = holder["server"]
+        try:
+            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            body = _post_or_get(
+                f"{base_url}/ingest-turn",
+                {
+                    "messages": [{"role": "user", "content": "plan a trip to Suzhou"}],
+                    "scope": {"workspace_id": "ws", "user_id": "u", "agent_id": "a", "session_id": "s"},
+                    "turn_id": "turn-http",
+                    "turn_index": 4,
+                },
+            )
+            self.assertTrue(body["span_ids"])
+        finally:
+            server.shutdown()
+            thread.join(timeout=2)
+
     def test_post_errors_are_sanitized_for_beginner_clients(self) -> None:
         ready = threading.Event()
         holder = {}
