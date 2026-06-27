@@ -1,6 +1,6 @@
 import { registerFusionMemoryTools } from "./runtime.js";
 
-const baseUrl = String(process.env.FUSION_MEMORY_SMOKE_MEMORY_URL || process.env.FUSION_MEMORY_BASE_URL || "http://127.0.0.1:8765");
+const baseUrl = String(process.env.FUSION_MEMORY_SMOKE_MEMORY_URL || process.env.FUSION_MEMORY_BASE_URL || "http://127.0.0.1:8700");
 const token = `openclaw-smoke-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
 function smokeContext() {

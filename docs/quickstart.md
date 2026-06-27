@@ -45,9 +45,11 @@ fusion-memory doctor --json
 ```
 
 The default production setup uses PostgreSQL + pgvector and Qwen 0.6B
-embedding/reranker.
+embedding/reranker. If the Qwen embedding or reranker cannot be initialized at
+service startup, Fusion Memory falls back to the built-in deterministic embedder
+or lexical reranker so the service can still run with reduced retrieval quality.
 
-If Postgres or model dependencies are not ready, use local test mode:
+If Postgres is not ready, use local test mode:
 
 ```bash
 fusion-memory init --local-test --json
@@ -98,19 +100,19 @@ fusion-memory doctor
 Linux / macOS:
 
 ```bash
-export PSI_MEMORY_BASE_URL=http://127.0.0.1:8765
+export PSI_MEMORY_BASE_URL=http://127.0.0.1:8700
 ```
 
 Windows PowerShell:
 
 ```powershell
-$env:PSI_MEMORY_BASE_URL = "http://127.0.0.1:8765"
+$env:PSI_MEMORY_BASE_URL = "http://127.0.0.1:8700"
 ```
 
 Windows cmd:
 
 ```bat
-set PSI_MEMORY_BASE_URL=http://127.0.0.1:8765
+set PSI_MEMORY_BASE_URL=http://127.0.0.1:8700
 ```
 
 然后给 `psi-agent session` 加上 `--memory-enabled`。
@@ -120,7 +122,7 @@ set PSI_MEMORY_BASE_URL=http://127.0.0.1:8765
 - 启动失败：先运行 `fusion-memory doctor`
 - 端口被占用：修改本地配置文件里的端口
 - Postgres 不可用：启动 Postgres，确认 pgvector 已安装，再运行 `fusion-memory doctor`
-- Qwen 模型不可用：安装 Qwen 依赖或确认本地模型缓存/路径，再运行 `fusion-memory doctor`
+- Qwen 模型不可用：服务会先降级到内置向量/重排 fallback；为了最佳检索质量，安装 Qwen 依赖或确认本地模型缓存/路径，再运行 `fusion-memory doctor`
 - API 模型不可用：确认向导里填写的 API key 环境变量已经设置
 - 想备份：运行 `fusion-memory backup`
 - 升级前检查备份/回滚计划：运行 `fusion-memory upgrade --dry-run --json`

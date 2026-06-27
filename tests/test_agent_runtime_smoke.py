@@ -16,7 +16,7 @@ import tools.agent_runtime_smoke as smoke
 class AgentRuntimeSmokeTests(unittest.TestCase):
     def test_missing_openclaw_host_is_beginner_safe(self) -> None:
         with patch("tools.agent_runtime_smoke.shutil.which", return_value=None):
-            report = smoke.run_smoke("openclaw", memory_url="http://127.0.0.1:8765")
+            report = smoke.run_smoke("openclaw", memory_url="http://127.0.0.1:8700")
 
         self.assertFalse(report["ok"])
         self.assertFalse(report["host_available"])
@@ -29,7 +29,7 @@ class AgentRuntimeSmokeTests(unittest.TestCase):
             patch("tools.agent_runtime_smoke.run_smoke", return_value={"ok": True, "target": "hermes"}),
         ):
             out = Path(tmp) / "smoke.json"
-            code = smoke.main(["--target", "hermes", "--memory-url", "http://127.0.0.1:8765", "--output", str(out)])
+            code = smoke.main(["--target", "hermes", "--memory-url", "http://127.0.0.1:8700", "--output", str(out)])
 
             self.assertEqual(code, 0)
             self.assertEqual(json.loads(out.read_text(encoding="utf-8"))["target"], "hermes")
@@ -46,7 +46,7 @@ class AgentRuntimeSmokeTests(unittest.TestCase):
                     "--target",
                     "fusion-agent",
                     "--memory-url",
-                    "http://127.0.0.1:8765",
+                    "http://127.0.0.1:8700",
                     "--output",
                     str(out),
                 ],
@@ -72,7 +72,7 @@ class AgentRuntimeSmokeTests(unittest.TestCase):
             patch("tools.agent_runtime_smoke.shutil.which", return_value=None),
             patch.dict(os.environ, {}, clear=True),
         ):
-            report = smoke.run_smoke("openclaw", memory_url="http://127.0.0.1:8765")
+            report = smoke.run_smoke("openclaw", memory_url="http://127.0.0.1:8700")
 
         self.assertFalse(report["ok"])
         self.assertTrue(report["host_available"])
@@ -96,7 +96,7 @@ class AgentRuntimeSmokeTests(unittest.TestCase):
             ) as builtin,
             patch.dict(os.environ, {}, clear=True),
         ):
-            report = smoke.run_smoke("openclaw", memory_url="http://127.0.0.1:8765")
+            report = smoke.run_smoke("openclaw", memory_url="http://127.0.0.1:8700")
 
         self.assertTrue(report["ok"])
         self.assertTrue(report["write_smoke"])
@@ -116,7 +116,7 @@ class AgentRuntimeSmokeTests(unittest.TestCase):
             patch("tools.agent_runtime_smoke.subprocess.run", return_value=completed) as run,
             patch.dict(os.environ, {"FUSION_MEMORY_OPENCLAW_SMOKE_COMMAND": "fake-smoke"}, clear=True),
         ):
-            smoke.run_smoke("openclaw", memory_url="http://127.0.0.1:8765", timeout=12)
+            smoke.run_smoke("openclaw", memory_url="http://127.0.0.1:8700", timeout=12)
 
         self.assertEqual(run.call_args_list[0].kwargs["timeout"], 12)
 
@@ -126,7 +126,7 @@ class AgentRuntimeSmokeTests(unittest.TestCase):
             patch("tools.agent_runtime_smoke.shutil.which", return_value="/usr/bin/node"),
             patch("tools.agent_runtime_smoke._run_command_smoke") as command_smoke,
         ):
-            report = smoke._run_builtin_adapter_smoke("openclaw", memory_url="http://127.0.0.1:8765", timeout=5)
+            report = smoke._run_builtin_adapter_smoke("openclaw", memory_url="http://127.0.0.1:8700", timeout=5)
 
         self.assertFalse(report.get("ok", False))
         self.assertEqual(report["message"], "runtime missing")
@@ -169,7 +169,7 @@ class AgentRuntimeSmokeTests(unittest.TestCase):
             ) as builtin,
             patch.dict(os.environ, {}, clear=True),
         ):
-            report = smoke.run_smoke("hermes", memory_url="http://127.0.0.1:8765")
+            report = smoke.run_smoke("hermes", memory_url="http://127.0.0.1:8700")
 
         self.assertTrue(report["ok"])
         self.assertTrue(report["write_smoke"])
@@ -183,7 +183,7 @@ class AgentRuntimeSmokeTests(unittest.TestCase):
             patch("tools.agent_runtime_smoke.run_smoke", return_value={"ok": True, "target": "hermes"}),
         ):
             out = Path(tmp) / "smoke.json"
-            code = smoke.main(["--target", "hermes", "--memory-url", "http://127.0.0.1:8765", "--output", str(out)])
+            code = smoke.main(["--target", "hermes", "--memory-url", "http://127.0.0.1:8700", "--output", str(out)])
             report = json.loads(out.read_text(encoding="utf-8"))
 
         self.assertEqual(code, 0)
@@ -206,13 +206,13 @@ class AgentRuntimeSmokeTests(unittest.TestCase):
             patch("subprocess.run", return_value=completed) as run,
             patch.dict(os.environ, {"FUSION_MEMORY_OPENCLAW_SMOKE_COMMAND": "fake-smoke --json"}, clear=True),
         ):
-            report = smoke.run_smoke("openclaw", memory_url="http://127.0.0.1:8765")
+            report = smoke.run_smoke("openclaw", memory_url="http://127.0.0.1:8700")
 
         self.assertTrue(report["ok"])
         self.assertTrue(report["write_smoke"])
         self.assertTrue(report["retrieve_smoke"])
         self.assertEqual(report["message"], "adapter ok")
-        self.assertEqual(run.call_args.kwargs["env"]["FUSION_MEMORY_SMOKE_MEMORY_URL"], "http://127.0.0.1:8765")
+        self.assertEqual(run.call_args.kwargs["env"]["FUSION_MEMORY_SMOKE_MEMORY_URL"], "http://127.0.0.1:8700")
 
     def test_configured_adapter_smoke_command_exit_zero_without_json_is_unverified(self) -> None:
         completed = CompletedProcess(args=["fake-smoke"], returncode=0, stdout="ok\n", stderr="")
@@ -222,7 +222,7 @@ class AgentRuntimeSmokeTests(unittest.TestCase):
             patch("subprocess.run", return_value=completed),
             patch.dict(os.environ, {"FUSION_MEMORY_OPENCLAW_SMOKE_COMMAND": "fake-smoke"}, clear=True),
         ):
-            report = smoke.run_smoke("openclaw", memory_url="http://127.0.0.1:8765")
+            report = smoke.run_smoke("openclaw", memory_url="http://127.0.0.1:8700")
 
         self.assertFalse(report["ok"])
         self.assertFalse(report["write_smoke"])
@@ -242,7 +242,7 @@ class AgentRuntimeSmokeTests(unittest.TestCase):
             patch("subprocess.run", return_value=completed),
             patch.dict(os.environ, {"FUSION_MEMORY_OPENCLAW_SMOKE_COMMAND": "fake-smoke"}, clear=True),
         ):
-            report = smoke.run_smoke("openclaw", memory_url="http://127.0.0.1:8765")
+            report = smoke.run_smoke("openclaw", memory_url="http://127.0.0.1:8700")
 
         self.assertFalse(report["ok"])
         self.assertFalse(report["write_smoke"])
@@ -263,7 +263,7 @@ class AgentRuntimeSmokeTests(unittest.TestCase):
             patch("subprocess.run", return_value=completed),
             patch.dict(os.environ, {"FUSION_MEMORY_OPENCLAW_SMOKE_COMMAND": "fake-smoke"}, clear=True),
         ):
-            report = smoke.run_smoke("openclaw", memory_url="http://127.0.0.1:8765")
+            report = smoke.run_smoke("openclaw", memory_url="http://127.0.0.1:8700")
 
         self.assertFalse(report["ok"])
         self.assertFalse(report["write_smoke"])

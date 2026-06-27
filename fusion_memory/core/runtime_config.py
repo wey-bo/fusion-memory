@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from loguru import logger
+
 from fusion_memory.api.service import MemoryService
 from fusion_memory.core.config import DEFAULT_EMBEDDING_MODEL, DEFAULT_RERANKER_MODEL, MemoryConfig
 from fusion_memory.core.embedding import HTTPEmbeddingClient, Qwen3EmbeddingClient
@@ -61,13 +63,17 @@ def _build_embedder() -> Any | None:
     if not provider or provider == "deterministic":
         return None
     if provider == "qwen":
-        return Qwen3EmbeddingClient(
-            model=os.getenv("FUSION_MEMORY_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL),
-            output_dimension=_int_env("FUSION_MEMORY_EMBEDDING_DIMENSION", 1024),
-            device=_optional_env("FUSION_MEMORY_EMBEDDING_DEVICE"),
-            batch_size=_int_env("FUSION_MEMORY_EMBEDDING_BATCH_SIZE", 8),
-            model_kwargs=_model_kwargs(),
-        )
+        try:
+            return Qwen3EmbeddingClient(
+                model=os.getenv("FUSION_MEMORY_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL),
+                output_dimension=_int_env("FUSION_MEMORY_EMBEDDING_DIMENSION", 1024),
+                device=_optional_env("FUSION_MEMORY_EMBEDDING_DEVICE"),
+                batch_size=_int_env("FUSION_MEMORY_EMBEDDING_BATCH_SIZE", 8),
+                model_kwargs=_model_kwargs(),
+            )
+        except Exception as exc:
+            logger.warning(f"Qwen embedding unavailable; falling back to built-in deterministic embedder: {exc}")
+            return None
     if provider == "http":
         endpoint = _required_env("FUSION_MEMORY_EMBEDDING_ENDPOINT")
         return HTTPEmbeddingClient(
@@ -86,12 +92,16 @@ def _build_reranker() -> Any | None:
     if not provider or provider == "lexical":
         return None
     if provider == "qwen":
-        return Qwen3Reranker(
-            model=os.getenv("FUSION_MEMORY_RERANKER_MODEL", DEFAULT_RERANKER_MODEL),
-            device=_optional_env("FUSION_MEMORY_RERANKER_DEVICE"),
-            batch_size=_int_env("FUSION_MEMORY_RERANKER_BATCH_SIZE", 8),
-            model_kwargs=_model_kwargs(),
-        )
+        try:
+            return Qwen3Reranker(
+                model=os.getenv("FUSION_MEMORY_RERANKER_MODEL", DEFAULT_RERANKER_MODEL),
+                device=_optional_env("FUSION_MEMORY_RERANKER_DEVICE"),
+                batch_size=_int_env("FUSION_MEMORY_RERANKER_BATCH_SIZE", 8),
+                model_kwargs=_model_kwargs(),
+            )
+        except Exception as exc:
+            logger.warning(f"Qwen reranker unavailable; falling back to built-in lexical reranker: {exc}")
+            return None
     if provider == "http":
         endpoint = _required_env("FUSION_MEMORY_RERANKER_ENDPOINT")
         return HTTPReranker(

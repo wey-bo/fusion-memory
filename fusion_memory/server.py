@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 from fusion_memory import Scope
 from fusion_memory.api.service import MemoryService
 from fusion_memory.core.runtime_config import memory_service_from_env
-from fusion_memory.product import runtime_status_payload
+from fusion_memory.product import DEFAULT_HOST, DEFAULT_PORT, runtime_status_payload
 
 
 class MemoryServerState:
@@ -121,8 +121,8 @@ def make_handler(state: MemoryServerState) -> type[BaseHTTPRequestHandler]:
 def serve(
     service: MemoryService,
     *,
-    host: str = "127.0.0.1",
-    port: int = 8765,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
 ) -> HTTPServer:
     state = MemoryServerState(service)
     server = HTTPServer((host, port), make_handler(state))
@@ -132,8 +132,8 @@ def serve(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run Fusion Memory as a persistent local HTTP service")
-    parser.add_argument("--host", default=os.getenv("FUSION_MEMORY_SERVER_HOST", "127.0.0.1"))
-    parser.add_argument("--port", type=int, default=int(os.getenv("FUSION_MEMORY_SERVER_PORT", "8765")))
+    parser.add_argument("--host", default=os.getenv("FUSION_MEMORY_SERVER_HOST", DEFAULT_HOST))
+    parser.add_argument("--port", type=int, default=int(os.getenv("FUSION_MEMORY_SERVER_PORT", str(DEFAULT_PORT))))
     parser.add_argument("--db", default=os.getenv("FUSION_MEMORY_DB", "fusion-memory.sqlite3"))
     parser.add_argument("--storage-backend", default=os.getenv("FUSION_MEMORY_STORAGE_BACKEND"))
     args = parser.parse_args()

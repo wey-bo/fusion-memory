@@ -17,7 +17,7 @@
   "uiHints": {
     "baseUrl": {
       "label": "Fusion Memory URL",
-      "placeholder": "http://127.0.0.1:8765"
+      "placeholder": "http://127.0.0.1:8700"
     },
     "timeoutMs": {
       "label": "Timeout in milliseconds",

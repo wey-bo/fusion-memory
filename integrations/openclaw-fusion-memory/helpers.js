@@ -1,4 +1,4 @@
-export const DEFAULT_BASE_URL = "http://127.0.0.1:8765";
+export const DEFAULT_BASE_URL = "http://127.0.0.1:8700";
 export const DEFAULT_TIMEOUT_MS = 1500;
 const MIN_TIMEOUT_MS = 100;
 const MAX_TIMEOUT_MS = 2000;

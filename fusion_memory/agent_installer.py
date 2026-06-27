@@ -6,6 +6,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from fusion_memory.product import DEFAULT_HOST, DEFAULT_PORT
+
 VALID_TARGETS = ("openclaw", "hermes", "fusion-agent")
 ROOT = Path(__file__).resolve().parents[1]
 OPENCLAW_PLUGIN = ROOT / "integrations" / "openclaw-fusion-memory"
@@ -108,7 +110,7 @@ def _smoke_command(target: str) -> list[str]:
         "--target",
         target,
         "--memory-url",
-        "http://127.0.0.1:8765",
+        f"http://{DEFAULT_HOST}:{DEFAULT_PORT}",
         "--output",
         f".runtime/agent-smoke-{target}.json",
     ]

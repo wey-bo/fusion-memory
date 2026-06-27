@@ -40,6 +40,7 @@ class AgentInstallerTests(unittest.TestCase):
         self.assertEqual(action["smoke_command"][:2], ["python3", "tools/agent_runtime_smoke.py"])
         self.assertIn("--target", action["smoke_command"])
         self.assertIn("openclaw", action["smoke_command"])
+        self.assertIn("http://127.0.0.1:8700", action["smoke_command"])
 
     def test_hermes_copy_failure_preserves_existing_install(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

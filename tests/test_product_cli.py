@@ -186,6 +186,7 @@ class ProductCliTests(unittest.TestCase):
         self.assertEqual(config["reranker"]["provider"], "qwen")
         self.assertEqual(config["extractor"]["provider"], "rule")
         self.assertEqual(config["query_intent"]["provider"], "off")
+        self.assertEqual(config["port"], 8700)
 
     def test_init_home_local_test_fallback_uses_dependency_free_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -198,6 +199,7 @@ class ProductCliTests(unittest.TestCase):
         self.assertEqual(config["storage_backend"], "sqlite")
         self.assertEqual(config["embedding"]["provider"], "deterministic")
         self.assertEqual(config["reranker"]["provider"], "lexical")
+        self.assertEqual(config["port"], 8700)
 
     def test_doctor_local_test_reports_model_dependency_and_readiness_checks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

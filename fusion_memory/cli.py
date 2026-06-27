@@ -14,6 +14,7 @@ from fusion_memory.agent_installer import install_agent
 from fusion_memory.core.config import DEFAULT_CONFIG
 from fusion_memory.core.llm import OpenAICompatibleLLMClient
 from fusion_memory.product import (
+    DEFAULT_PORT,
     backup_data,
     configure_interactive,
     doctor,
@@ -64,7 +65,7 @@ def main() -> None:
     init_cmd = sub.add_parser("init", help="Set up the beginner-friendly local configuration")
     init_cmd.add_argument("--home", default=None, help="Fusion Memory data directory")
     init_cmd.add_argument("--host", default="127.0.0.1")
-    init_cmd.add_argument("--port", type=int, default=8765)
+    init_cmd.add_argument("--port", type=int, default=DEFAULT_PORT)
     init_cmd.add_argument("--wizard", action="store_true", help="Ask for database and model configuration")
     init_cmd.add_argument("--force", action="store_true", help="Overwrite existing local configuration")
     init_cmd.add_argument("--local-test", action="store_true", help="Use SQLite and built-in lightweight models for temporary local testing")

@@ -4,14 +4,14 @@ import { DEFAULT_TIMEOUT_MS, normalizeTimeoutMs, safeFailure, normalizeBaseUrl }
 import { registerFusionMemoryTools } from "../runtime.js";
 
 test("safeFailure hides raw errors", () => {
-  const result = safeFailure(new Error("connect ECONNREFUSED 127.0.0.1:8765"));
+  const result = safeFailure(new Error("connect ECONNREFUSED 127.0.0.1:8700"));
   assert.equal(result.content[0].type, "text");
   assert.match(result.content[0].text, /fusion-memory doctor/);
   assert.doesNotMatch(result.content[0].text, /ECONNREFUSED/);
 });
 
 test("normalizeBaseUrl trims trailing slash", () => {
-  assert.equal(normalizeBaseUrl("http://127.0.0.1:8765/"), "http://127.0.0.1:8765");
+  assert.equal(normalizeBaseUrl("http://127.0.0.1:8700/"), "http://127.0.0.1:8700");
 });
 
 test("normalizeTimeoutMs falls back for invalid values", () => {

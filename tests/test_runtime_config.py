@@ -53,6 +53,36 @@ class RuntimeRetrievalFlagTests(unittest.TestCase):
 
         self.assertEqual(captured_kwargs["query_intent_refiner_mode"], "off")
 
+    def test_qwen_embedding_init_failure_falls_back_to_builtin_embedder(self) -> None:
+        captured_kwargs: dict[str, object] = {}
+
+        class DummyMemoryService:
+            def __init__(self, *args, **kwargs) -> None:
+                captured_kwargs.update(kwargs)
+
+        with patch.dict(os.environ, {"FUSION_MEMORY_EMBEDDING_PROVIDER": "qwen"}, clear=True), patch(
+            "fusion_memory.core.runtime_config.Qwen3EmbeddingClient",
+            side_effect=RuntimeError("Qwen model install failed"),
+        ), patch("fusion_memory.core.runtime_config.MemoryService", DummyMemoryService):
+            memory_service_from_env()
+
+        self.assertIsNone(captured_kwargs["embedder"])
+
+    def test_qwen_reranker_init_failure_falls_back_to_builtin_reranker(self) -> None:
+        captured_kwargs: dict[str, object] = {}
+
+        class DummyMemoryService:
+            def __init__(self, *args, **kwargs) -> None:
+                captured_kwargs.update(kwargs)
+
+        with patch.dict(os.environ, {"FUSION_MEMORY_RERANKER_PROVIDER": "qwen"}, clear=True), patch(
+            "fusion_memory.core.runtime_config.Qwen3Reranker",
+            side_effect=RuntimeError("Qwen model install failed"),
+        ), patch("fusion_memory.core.runtime_config.MemoryService", DummyMemoryService):
+            memory_service_from_env()
+
+        self.assertIsNone(captured_kwargs["reranker"])
+
     def test_memory_service_from_env_raises_for_invalid_selector(self) -> None:
         with patch.dict(os.environ, {"FUSION_MEMORY_EVENT_ORDERING_SELECTOR": "graph"}, clear=True):
             with self.assertRaisesRegex(ValueError, "unsupported event ordering selector"):

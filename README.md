@@ -39,7 +39,7 @@ PYTHONDONTWRITEBYTECODE=1 python -m compileall -q fusion_memory tests
 
 ## 快速开始
 
-面向新手的默认 SQLite 本地服务：
+面向新手的默认生产初始化：
 
 ```bash
 cd /path/to/fusion-memory
@@ -48,7 +48,7 @@ fusion-memory start
 fusion-memory status
 ```
 
-`install.sh` / `install.ps1` 安装完成后会自动提示初始化数据库、embedding、reranker、extractor/router。默认一路回车即可使用 SQLite + 内置轻量模型；API key 只通过环境变量读取，不写入配置文件。
+`install.sh` / `install.ps1` 安装完成后会自动提示初始化数据库、embedding、reranker、extractor/router。默认一路回车会写入 Postgres/pgvector + Qwen3 embedding/reranker + 规则 extractor 的生产配置；API key 只通过环境变量读取，不写入配置文件。若 Qwen embedding 或 reranker 在服务启动时不可用，运行时会降级到内置 deterministic embedding 或 lexical reranker。
 
 常用维护命令：
 
@@ -186,11 +186,11 @@ python -m fusion_memory.server \
 
 | 模块 | 当前默认 | 已有适配器 | 缺少的生产配置 |
 |---|---|---|---|
-| Embedding | `DeterministicEmbedder(dimensions=1024)`，只适合本地测试 | `Qwen3EmbeddingClient`、`HTTPEmbeddingClient(endpoint, model, api_key)`，CLI/API 可通过 `memory_service_from_env` 读取 `FUSION_MEMORY_EMBEDDING_*` | 生产需要选择本地 Qwen 或 HTTP provider，并配置 timeout/retry、成本记录、历史 reindex/backfill |
+| Embedding | 生产配置默认 `Qwen/Qwen3-Embedding-0.6B`，启动失败时降级到 `DeterministicEmbedder(dimensions=1024)` | `Qwen3EmbeddingClient`、`HTTPEmbeddingClient(endpoint, model, api_key)`，CLI/API 可通过 `memory_service_from_env` 读取 `FUSION_MEMORY_EMBEDDING_*` | 生产需要确保本地 Qwen 或 HTTP provider 可用，并配置 timeout/retry、成本记录、历史 reindex/backfill |
 | SQLite 向量 | JSON text 存储 dense vector，维度随 embedder 输出 | 可注入自定义 embedder | 无需 schema 维度，但需要重算历史 embedding 的 reindex/backfill 工具 |
 | Postgres/pgvector | migration 固定 `vector(1024)` | `PostgresMemoryStore(..., embedder=...)` | 需要 live DSN 验证；如果未来换非 1024 维 embedding，必须改 pgvector 维度并重建 HNSW index |
 | LLM extractor | 默认 `RuleBasedExtractor` | `StructuredLLMExtractor(OpenAICompatibleLLMClient(...))`，支持 `FUSION_MEMORY_EXTRACTOR_BASE_URL` 或完整 `FUSION_MEMORY_EXTRACTOR_ENDPOINT` | 需要继续校准抽取 prompt/schema version、retry、成本/延迟预算 |
-| Reranker | 默认 `LexicalCrossEncoderReranker` | `Qwen3Reranker`、`HTTPReranker(endpoint, model, api_key)`，CLI/API 可通过 `memory_service_from_env` 读取 `FUSION_MEMORY_RERANKER_*` | 生产需要选择本地 Qwen 或 HTTP provider，并配置 timeout/fallback、top_n、成本/延迟策略 |
+| Reranker | 生产配置默认 `Qwen/Qwen3-Reranker-0.6B`，启动失败时降级到 `LexicalCrossEncoderReranker` | `Qwen3Reranker`、`HTTPReranker(endpoint, model, api_key)`，CLI/API 可通过 `memory_service_from_env` 读取 `FUSION_MEMORY_RERANKER_*` | 生产需要确保本地 Qwen 或 HTTP provider 可用，并配置 timeout/fallback、top_n、成本/延迟策略 |
 | Benchmark answer | 默认 `LocalExtractiveAnswerModel` | `OpenAICompatibleAnswerModel` | 需要 leaderboard-grade answer 模型配置，并在官方 BEAM/LongMemEval split 上验证 |
 | Benchmark judge | 默认 `LexicalContainsJudge` | `OpenAICompatibleJudgeModel` | 需要 semantic judge 模型和判分 prompt 配置；需要和 leaderboard 评测口径对齐 |
 | Utility scorer | 默认未训练，收集弱标签后可训练 | `LogisticUtilityScorer` | 需要真实 benchmark/dev/replay 标签校准，再决定是否从 shadow ranking 切到主排序 |

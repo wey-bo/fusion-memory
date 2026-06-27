@@ -19,7 +19,7 @@ from urllib import error, request
 APP_NAME = "Fusion Memory"
 CONFIG_VERSION = 1
 DEFAULT_HOST = "127.0.0.1"
-DEFAULT_PORT = 8765
+DEFAULT_PORT = 8700
 DEFAULT_POSTGRES_DSN = "postgresql://fusion:fusion@127.0.0.1:55433/fusion_memory"
 DEFAULT_QWEN_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 DEFAULT_QWEN_RERANKER_MODEL = "Qwen/Qwen3-Reranker-0.6B"

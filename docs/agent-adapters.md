@@ -20,9 +20,9 @@ Run a runtime smoke after installing an adapter and starting the local Fusion
 Memory service:
 
 ```bash
-python3 tools/agent_runtime_smoke.py --target openclaw --memory-url http://127.0.0.1:8765 --output .runtime/agent-smoke-openclaw.json
-python3 tools/agent_runtime_smoke.py --target hermes --memory-url http://127.0.0.1:8765 --output .runtime/agent-smoke-hermes.json
-python3 tools/agent_runtime_smoke.py --target fusion-agent --memory-url http://127.0.0.1:8765 --output .runtime/agent-smoke-fusion-agent.json
+python3 tools/agent_runtime_smoke.py --target openclaw --memory-url http://127.0.0.1:8700 --output .runtime/agent-smoke-openclaw.json
+python3 tools/agent_runtime_smoke.py --target hermes --memory-url http://127.0.0.1:8700 --output .runtime/agent-smoke-hermes.json
+python3 tools/agent_runtime_smoke.py --target fusion-agent --memory-url http://127.0.0.1:8700 --output .runtime/agent-smoke-fusion-agent.json
 ```
 
 The smoke report contains `target`, `host_available`, `plugin_available`,
@@ -65,19 +65,19 @@ Fusion-Agent uses its in-repo adapter. Start a session with memory enabled and:
 Linux / macOS:
 
 ```bash
-export PSI_MEMORY_BASE_URL=http://127.0.0.1:8765
+export PSI_MEMORY_BASE_URL=http://127.0.0.1:8700
 ```
 
 Windows PowerShell:
 
 ```powershell
-$env:PSI_MEMORY_BASE_URL = "http://127.0.0.1:8765"
+$env:PSI_MEMORY_BASE_URL = "http://127.0.0.1:8700"
 ```
 
 Windows cmd:
 
 ```bat
-set PSI_MEMORY_BASE_URL=http://127.0.0.1:8765
+set PSI_MEMORY_BASE_URL=http://127.0.0.1:8700
 ```
 
 Then pass the memory flag to the agent session:
